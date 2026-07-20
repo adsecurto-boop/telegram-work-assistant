@@ -20,9 +20,9 @@ logger = logging.getLogger(__name__)
 
 # Reminder schedule: (hour, minute, message)
 REMINDERS: List[Tuple[int, int, str]] = [
-    (9, 0, "Please submit Beginning of Shift update."),
-    (13, 0, "Please submit Pre Lunch update."),
-    (18, 0, "Please submit End Of Day update."),
+    (12, 0, "Please submit Beginning of Shift update."),
+    (15, 45, "Please submit Pre Lunch update."),
+    (20, 40, "Please submit End Of Day update."),
 ]
 
 

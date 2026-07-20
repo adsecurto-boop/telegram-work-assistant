@@ -29,8 +29,8 @@ HELP_TEXT = (
     "*/pending* — show pending tasks (alias)\n"
     "*/done <id>* — mark a task completed\n"
     "*/delete <id>* — remove a task\n\n"
-    "*/begin* — Beginning of Shift report\n"
-    "*/prelunch* — Pre Lunch report\n"
+    "*/bos* — Beginning of Shift report\n"
+    "*/pl* — Pre Lunch report\n"
     "*/eod* — End of Day report\n\n"
     "You'll receive daily reminders at 09:00, 13:00 and 18:00."
 )
