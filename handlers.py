@@ -24,17 +24,15 @@ SETTING_CHAT_ID = "reminder_chat_id"
 
 HELP_TEXT = (
     "*Work Assistant Bot*\n\n"
-    "*/add <task>* — add a new task\n"
-    "*/list* — show pending / in-progress tasks\n"
-    "*/progress <id>* — mark a task as in progress\n"
+    "*/task <text>* — add a new task\n"
+    "*/todo* — show all pending tasks\n"
+    "*/pending* — show pending tasks (alias)\n"
     "*/done <id>* — mark a task completed\n"
-    "*/block <id> <reason>* — mark a task blocked with a reason\n"
     "*/delete <id>* — remove a task\n\n"
-    "*/bos* — Beginning of Shift report\n"
+    "*/begin* — Beginning of Shift report\n"
     "*/prelunch* — Pre Lunch report\n"
     "*/eod* — End of Day report\n\n"
-    "You'll also get an automatic reminder of pending tasks every "
-    "few hours."
+    "You'll receive daily reminders at 09:00, 13:00 and 18:00."
 )
 
 
@@ -63,10 +61,25 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     title = join_args(context.args)
     if not title:
-        await update.message.reply_text("Usage: /add <task description>")
+        await update.message.reply_text("Usage: /task <task description>")
         return
     task = await asyncio.to_thread(_db(context).add_task, title)
     await update.message.reply_text(f"Added task #{task.id}: {task.title}")
+
+
+async def todo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show pending tasks only."""
+    tasks = await asyncio.to_thread(_db(context).list_tasks, TaskStatus.PENDING)
+    if not tasks:
+        await update.message.reply_text("No pending tasks. 🎉")
+        return
+    lines = [f"{t.id}. {t.title}" for t in tasks]
+    await update.message.reply_text("Pending Tasks\n\n" + "\n\n".join(lines))
+
+
+async def pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Alias for /todo."""
+    await todo(update, context)
 
 
 async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

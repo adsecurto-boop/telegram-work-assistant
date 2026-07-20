@@ -40,13 +40,13 @@ class Task:
 
     @classmethod
     def from_row(cls, row) -> "Task":
-        """Build a Task from a sqlite3.Row."""
+        """Build a Task from a mapping-like object (sqlite row or dict)."""
         return cls(
-            id=row["id"],
-            title=row["title"],
+            id=int(row["id"]),
+            title=row.get("title") if isinstance(row, dict) else row["title"],
             status=TaskStatus(row["status"]),
-            blocked_reason=row["blocked_reason"],
+            blocked_reason=row.get("blocked_reason") if isinstance(row, dict) else row["blocked_reason"],
             created_at=row["created_at"],
-            completed_at=row["completed_at"],
-            priority=row["priority"],
+            completed_at=row.get("completed_at") if isinstance(row, dict) else row["completed_at"],
+            priority=int(row.get("priority", 0)) if isinstance(row, dict) else row["priority"],
         )

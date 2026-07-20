@@ -1,1 +1,23 @@
-[]
+{
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Perform idle claim testing",
+      "status": "pending",
+      "blocked_reason": null,
+      "created_at": "2026-07-20T04:50:37+00:00",
+      "completed_at": null,
+      "priority": 0
+    },
+    {
+      "id": 2,
+      "title": "Test localization",
+      "status": "completed",
+      "blocked_reason": null,
+      "created_at": "2026-07-20T04:50:37+00:00",
+      "completed_at": "2026-07-20T04:50:37+00:00",
+      "priority": 0
+    }
+  ],
+  "settings": {}
+}

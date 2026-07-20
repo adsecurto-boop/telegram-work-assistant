@@ -20,10 +20,10 @@ def _bullet_list(items: List[str]) -> str:
 def generate_bos(tasks: List[Task]) -> str:
     """
     Beginning of Shift: a flat list of everything not yet finished
-    (pending + in-progress), i.e. today's plan.
+    Only Pending tasks (MVP requirement).
     """
-    titles = [t.title for t in tasks if t.status in (TaskStatus.PENDING, TaskStatus.IN_PROGRESS)]
-    lines = ["Beginning of Shift", _bullet_list(titles)]
+    titles = [t.title for t in tasks if t.status == TaskStatus.PENDING]
+    lines = ["Beginning of Shift", "Performing:", _bullet_list(titles)]
     return "\n".join(lines)
 
 
@@ -35,7 +35,7 @@ def generate_prelunch(tasks: List[Task]) -> str:
         Remaining   -> status == PENDING
     (Blocked tasks are intentionally omitted here; they surface in EOD.)
     """
-    completed = [t.title for t in tasks if t.status == TaskStatus.COMPLETED]
+    completed = [f"[x] {t.title}" for t in tasks if t.status == TaskStatus.COMPLETED]
     in_progress = [t.title for t in tasks if t.status == TaskStatus.IN_PROGRESS]
     remaining = [t.title for t in tasks if t.status == TaskStatus.PENDING]
 
@@ -43,9 +43,7 @@ def generate_prelunch(tasks: List[Task]) -> str:
         "Pre Lunch",
         "Completed",
         _bullet_list(completed),
-        "In Progress",
-        _bullet_list(in_progress),
-        "Remaining",
+        "Pending",
         _bullet_list(remaining),
     ]
     return "\n".join(lines)
@@ -64,20 +62,20 @@ def generate_eod(tasks: List[Task]) -> str:
     line here is rendered as "<title> — <reason>". Adjust
     `_blocked_lines` below if you need the literal reason-only format.
     """
-    completed = [t.title for t in tasks if t.status == TaskStatus.COMPLETED]
+    completed = [f"[x] {t.title}" for t in tasks if t.status == TaskStatus.COMPLETED]
     blocked = _blocked_lines(tasks)
     carry_forward = [
         t.title for t in tasks if t.status in (TaskStatus.PENDING, TaskStatus.IN_PROGRESS)
     ]
 
     lines = [
-        "End of Day",
+        "EOD",
         "Completed",
         _bullet_list(completed),
+        "Pending",
+        _bullet_list(carry_forward),
         "Blocked",
         _bullet_list(blocked),
-        "Carry Forward",
-        _bullet_list(carry_forward),
     ]
     return "\n".join(lines)
 

@@ -34,16 +34,15 @@ def build_application() -> Application:
     # handler can reach it via context.application.bot_data["db"].
     application.bot_data["db"] = Database(config.DB_PATH)
 
-    # -- command handlers --
+    # -- command handlers (MVP set) --
     application.add_handler(CommandHandler("start", handlers.start))
     application.add_handler(CommandHandler("help", handlers.help_command))
-    application.add_handler(CommandHandler("add", handlers.add_task))
-    application.add_handler(CommandHandler("list", handlers.list_tasks))
-    application.add_handler(CommandHandler("progress", handlers.mark_progress))
+    application.add_handler(CommandHandler("task", handlers.add_task))
+    application.add_handler(CommandHandler("todo", handlers.todo))
+    application.add_handler(CommandHandler("pending", handlers.pending))
     application.add_handler(CommandHandler("done", handlers.mark_done))
-    application.add_handler(CommandHandler("block", handlers.mark_blocked))
     application.add_handler(CommandHandler("delete", handlers.delete_task))
-    application.add_handler(CommandHandler("bos", handlers.bos_report))
+    application.add_handler(CommandHandler("begin", handlers.bos_report))
     application.add_handler(CommandHandler("prelunch", handlers.prelunch_report))
     application.add_handler(CommandHandler("eod", handlers.eod_report))
 
@@ -54,9 +53,10 @@ def build_application() -> Application:
 
 
 async def _on_startup(application: Application) -> None:
-    scheduler = create_scheduler(application)
-    scheduler.start()
-    application.bot_data["scheduler"] = scheduler
+    # Register scheduled reminders (JobQueue). The returned object is the
+    # application's job_queue; there's no explicit start required.
+    jq = create_scheduler(application)
+    application.bot_data["scheduler"] = jq
     logger.info("Bot startup complete.")
 
 

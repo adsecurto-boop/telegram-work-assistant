@@ -29,7 +29,8 @@ def _get_bool(name: str, default: bool) -> bool:
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
 
 # --- Database -------------------------------------------------------------
-DB_PATH: str = os.getenv("DB_PATH", str(BASE_DIR / "tasks.db"))
+# Use a JSON file in `storage/` for simple persistence (MVP requirement).
+DB_PATH: str = os.getenv("DB_PATH", str(BASE_DIR / "storage" / "tasks.json"))
 
 # --- Scheduler ------------------------------------------------------------
 # How often (in hours) pending-task reminders are sent.
