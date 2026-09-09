@@ -24,7 +24,7 @@ from telegram_import import redact
 
 logger = logging.getLogger(__name__)
 
-NL_PARSER_VERSION = 'nlp-v4.5'
+NL_PARSER_VERSION = 'nlp-v4.6'
 
 
 class NLIntent(str, Enum):
@@ -222,12 +222,23 @@ class DeterministicParser:
             r'(?:of|about|regarding|with)\s+(.+?)\s+for\s+'
             r'(?:(whatsapp|email|phone|teams|chat)\s+)?(?:client\s+(.+?)|(.+?)\s+client)[.!]?',
             raw, re.I)
-        if support:
+        client_first_support = re.fullmatch(
+            r'(?:i\s+)?(resolved|addressed|handled|investigated|escalated|discussed)\s+'
+            r'(?:client\s+(.+?)|(.+?)\s+client)\s+'
+            r'(?:(?:in|on|via|through|over)\s+(?:microsoft\s+)?(teams|whatsapp|email|phone|chat)\s+)?'
+            r'(?:for|about|regarding|with)\s+(.+?)[.!]?', raw, re.I)
+        if support or client_first_support:
+            verb = (support or client_first_support).group(1).lower()
             outcome = {'resolved': 'resolved', 'investigated': 'investigated',
-                       'escalated': 'escalated'}.get(support.group(1).lower(), 'assisted')
-            client = (support.group(4) or support.group(5)).strip()
+                       'escalated': 'escalated'}.get(verb, 'assisted')
+            if support:
+                client = (support.group(4) or support.group(5)).strip()
+                issue, channel = support.group(2).strip(), support.group(3)
+            else:
+                client = (client_first_support.group(2) or client_first_support.group(3)).strip()
+                issue, channel = client_first_support.group(5).strip(), client_first_support.group(4)
             return NLInterpretation(intent=NLIntent.LOG_SUPPORT, confidence=0.95,
-                entities=NLEntities(query=support.group(2).strip(), channel=(support.group(3) or '').lower() or None,
+                entities=NLEntities(query=issue, channel=channel.lower() if channel else None,
                                     client=client, status=outcome),
                 proposed_summary=f'Log {outcome} support interaction for {client}')
 

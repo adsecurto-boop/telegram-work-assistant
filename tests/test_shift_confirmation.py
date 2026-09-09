@@ -176,6 +176,42 @@ class ShiftConfirmationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(parsed.entities.client, 'Virtual Street Group')
                 self.assertEqual(parsed.entities.status, outcome)
 
+    async def test_client_first_resolution_preserves_issue_and_channel(self):
+        text = 'resolved cloud destinations client in teams for absent user issue in macos devices'
+        reply, parsed = await self.pipeline.process(text, self.original)
+        self.assertEqual(parsed.intent, NLIntent.LOG_SUPPORT)
+        self.assertIn('[resolved]', reply)
+        activity = self.db.activities(self.sid)[0]
+        self.assertEqual(activity['client'], 'cloud destinations')
+        self.assertEqual(activity['channel'], 'teams')
+        self.assertEqual(activity['detail'], 'absent user issue in macos devices')
+        self.assertEqual(activity['outcome'], 'resolved')
+        report = reports.generate_report('eod', self.original, [activity], [])
+        self.assertIn('resolved interactions: 1', report)
+        self.assertIn('absent user issue in macos devices', report)
+        self.db.undo_audit_record(self.db.get_last_reversible_audit()['id'])
+        self.assertFalse(self.db.activities(self.sid))
+
+    def test_client_first_support_variations(self):
+        for text, channel, outcome in [
+            ('Resolved Cloud Destinations client via Teams for absent users on macOS.', 'teams', 'resolved'),
+            ('I addressed client Cloud Destinations on Microsoft Teams regarding absent users', 'teams', 'assisted'),
+            ('investigated Cloud Destinations client about absent users', None, 'investigated'),
+            ('escalated Cloud Destinations client through email for absent users', 'email', 'escalated')]:
+            with self.subTest(text=text):
+                parsed = DeterministicParser.parse(text)
+                self.assertEqual(parsed.intent, NLIntent.LOG_SUPPORT)
+                self.assertEqual(parsed.entities.client, 'Cloud Destinations')
+                self.assertEqual(parsed.entities.channel, channel)
+                self.assertEqual(parsed.entities.status, outcome)
+
+    def test_client_first_support_requires_completed_action_and_issue(self):
+        for text in ('I have not resolved Cloud Destinations client in Teams for absent users',
+                     'Will resolve Cloud Destinations client in Teams for absent users',
+                     'resolved Cloud Destinations client in Teams'):
+            parsed = DeterministicParser.parse(text)
+            self.assertTrue(parsed is None or parsed.intent != NLIntent.LOG_SUPPORT)
+
     def test_negated_or_planned_resolution_is_not_logged_as_resolved(self):
         for prefix in ('have not resolved', 'will resolve', 'did not resolve'):
             parsed = DeterministicParser.parse(f'I {prefix} client query about hours for client Acme')
