@@ -149,6 +149,38 @@ class ShiftConfirmationTests(unittest.IsolatedAsyncioTestCase):
         with self.db.connect() as conn:
             self.assertEqual(conn.execute('SELECT COUNT(*) FROM support_interactions').fetchone()[0], 0)
 
+    async def test_addressed_concern_logs_assistance_without_claiming_resolution(self):
+        text = 'addressed client concern about exaggerated office hours for virtual street group client'
+        reply, parsed = await self.pipeline.process(text, self.original)
+        self.assertEqual(parsed.intent, NLIntent.LOG_SUPPORT)
+        self.assertIn('[assisted]', reply)
+        activity = self.db.activities(self.sid)[0]
+        self.assertEqual(activity['client'], 'virtual street group')
+        self.assertEqual(activity['detail'], 'exaggerated office hours')
+        self.assertEqual(activity['outcome'], 'assisted')
+        self.assertIsNone(activity['channel'])
+        report = reports.generate_report('eod', self.original, [activity], [])
+        self.assertIn('resolved interactions: 0', report)
+        self.db.undo_audit_record(self.db.get_last_reversible_audit()['id'])
+        self.assertFalse(self.db.activities(self.sid))
+
+    def test_support_variants_preserve_explicit_outcomes(self):
+        for text, outcome in [
+            ('I handled a client question regarding office hours for client Virtual Street Group.', 'assisted'),
+            ('investigated client issue about office hours for Virtual Street Group client', 'investigated'),
+            ('escalated client concern about office hours for teams client Virtual Street Group', 'escalated'),
+            ('resolved client concern about office hours for Virtual Street Group client', 'resolved')]:
+            with self.subTest(text=text):
+                parsed = DeterministicParser.parse(text)
+                self.assertEqual(parsed.intent, NLIntent.LOG_SUPPORT)
+                self.assertEqual(parsed.entities.client, 'Virtual Street Group')
+                self.assertEqual(parsed.entities.status, outcome)
+
+    def test_negated_or_planned_resolution_is_not_logged_as_resolved(self):
+        for prefix in ('have not resolved', 'will resolve', 'did not resolve'):
+            parsed = DeterministicParser.parse(f'I {prefix} client query about hours for client Acme')
+            self.assertTrue(parsed is None or parsed.intent != NLIntent.LOG_SUPPORT)
+
     async def test_testing_note_waits_for_explicit_result(self):
         text = 'tested and reported silah agent 3.0.2 for auto check out issue for request 2028'
         update = self.update(text)

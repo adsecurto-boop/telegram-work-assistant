@@ -24,7 +24,7 @@ from telegram_import import redact
 
 logger = logging.getLogger(__name__)
 
-NL_PARSER_VERSION = 'nlp-v4.4'
+NL_PARSER_VERSION = 'nlp-v4.5'
 
 
 class NLIntent(str, Enum):
@@ -216,12 +216,20 @@ class DeterministicParser:
                                     entities=NLEntities(shift_end=end),
                                     proposed_summary=f'Change the active shift end to {end}')
 
-        support = re.search(r'\bresolved\s+(?:a\s+|the\s+)?client\s+query\s+(?:of|about)\s+(.+?)\s+for\s+(?:(whatsapp|email|phone|teams|chat)\s+)?client\s+(.+?)[.!]?$', raw, re.I)
+        support = re.fullmatch(
+            r'(?:i\s+)?(resolved|addressed|handled|investigated|escalated|discussed)\s+'
+            r'(?:(?:a|the)\s+)?client\s+(?:query|concern|issue|question|request)\s+'
+            r'(?:of|about|regarding|with)\s+(.+?)\s+for\s+'
+            r'(?:(whatsapp|email|phone|teams|chat)\s+)?(?:client\s+(.+?)|(.+?)\s+client)[.!]?',
+            raw, re.I)
         if support:
+            outcome = {'resolved': 'resolved', 'investigated': 'investigated',
+                       'escalated': 'escalated'}.get(support.group(1).lower(), 'assisted')
+            client = (support.group(4) or support.group(5)).strip()
             return NLInterpretation(intent=NLIntent.LOG_SUPPORT, confidence=0.95,
-                entities=NLEntities(query=support.group(1).strip(), channel=(support.group(2) or '').lower() or None,
-                                    client=support.group(3).strip(), status='resolved'),
-                proposed_summary=f'Log resolved support query for {support.group(3).strip()}')
+                entities=NLEntities(query=support.group(2).strip(), channel=(support.group(3) or '').lower() or None,
+                                    client=client, status=outcome),
+                proposed_summary=f'Log {outcome} support interaction for {client}')
 
         # Keep report reminders out of report generation and case follow-ups.
         time_token = r'\d{1,2}(?::\d{2})?\s*(?:am|pm)?'
@@ -819,9 +827,11 @@ class NLActionExecutor:
             current = self.db.active_shift()
             if not current:
                 return 'Start a shift before logging a client support query.', None
+            if not entities.client or not entities.query or entities.status not in OUTCOMES:
+                return 'Please specify the client, concern, and support outcome before saving.', None
             activity_id = self.db.add_support(current['id'], entities.query, client=entities.client,
                 channel=entities.channel, outcome=entities.status, correlation_id=correlation_id)
-            return f'Logged resolved support #{activity_id} for {entities.client}: {entities.query}. Undo: /undo', correlation_id
+            return f'Logged support #{activity_id} for {entities.client} [{entities.status}]: {entities.query}. Undo: /undo', correlation_id
 
         if intent == NLIntent.UNDO_LAST_ACTION:
             last = self.db.get_last_reversible_audit()
