@@ -14,9 +14,12 @@ try:
     task_count = connection.execute('SELECT COUNT(*) FROM tasks').fetchone()[0]
     required = {'clients', 'support_interactions', 'testing_records', 'learning_records', 'ai_events',
                 'source_imports', 'source_messages', 'work_cases', 'case_events', 'test_sessions',
-                'evidence', 'followups', 'connector_state'}
+                'evidence', 'followups', 'connector_state', 'nl_interactions', 'conversation_context',
+                'audit_log', 'client_aliases', 'history_clusters', 'cluster_items', 'bulk_operations',
+                'shift_templates', 'shift_calendar', 'report_provenance'}
     tables = {row[0] for row in connection.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
+
 finally:
     connection.close()
 

@@ -12,6 +12,14 @@ from scheduler import create_scheduler
 from utils import setup_logging
 from runtime import instance_lock
 
+CALLBACK_PATTERN = (
+    r'^(final|ai|close|organize|apply|dismiss):\d+$|^drop:\d+:\d+$|'
+    r'^task:[a-z_]+:\d+$|^src:(accept|ignore):\d+$|'
+    r'^case:[a-z_]+:\d+$|^follow:(done|snooze):\d+$|'
+    r'^audit:undo:\d+$|^nl:choose:\d+:[a-z_]+$|'
+    r'^prop:(accept|cancel):prop_[a-f0-9]+$|^prop:choose:prop_[a-f0-9]+:\d+$'
+)
+
 async def gate(update,context):
     if not handlers.authorized(update):
         raise ApplicationHandlerStop
@@ -32,6 +40,11 @@ async def startup(application):
     await application.bot.set_my_commands([
         BotCommand('shift','Start a flexible shift'), BotCommand('task','Plan a rich task'),
         BotCommand('todo','Show open tasks'), BotCommand('today','Show this shift plans'),
+        BotCommand('undo','Undo last mutation safely'), BotCommand('understand','Preview NL intent'),
+        BotCommand('casesummary','Factual case summary'), BotCommand('nextaction','Recommended action'),
+        BotCommand('draftclient','Draft client reply'), BotCommand('draftescalation','Draft technical escalation'),
+        BotCommand('analyzetest','Analyze testing findings'), BotCommand('shiftcalendar','7-day rotational shift'),
+        BotCommand('shifttemplate','List shift templates'), BotCommand('clusters','Historical cluster suggestions'),
         BotCommand('support','Log a client interaction'), BotCommand('testing','Log testing'),
         BotCommand('learning','Log learning or KT'), BotCommand('tod','Create TOD report'),
         BotCommand('pl','Create pre-lunch report'), BotCommand('eod','Create EOD report'),
@@ -58,11 +71,7 @@ def build_application():
                  .post_shutdown(shutdown).build())
     application.bot_data['db']=database
     application.add_handler(TypeHandler(Update,gate),group=-1)
-    application.add_handler(CallbackQueryHandler(
-        handlers.handle,
-        pattern=(r'^(final|ai|close|organize|apply|dismiss):\d+$|^drop:\d+:\d+$|'
-                 r'^task:[a-z_]+:\d+$|^src:(accept|ignore):\d+$|'
-                 r'^case:[a-z_]+:\d+$|^follow:(done|snooze):\d+$')))
+    application.add_handler(CallbackQueryHandler(handlers.handle, pattern=CALLBACK_PATTERN))
     supported = filters.TEXT | filters.VOICE | filters.PHOTO | filters.Document.ALL | filters.VIDEO
     application.add_handler(MessageHandler(supported & ~filters.UpdateType.EDITED_MESSAGE,handlers.handle))
     application.add_error_handler(handlers.error_handler)

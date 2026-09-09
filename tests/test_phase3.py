@@ -133,7 +133,8 @@ class MigrationTests(unittest.TestCase):
                 connection.close()
             db = Database(path)
             with db.connect() as connection:
-                self.assertEqual(connection.execute('PRAGMA user_version').fetchone()[0], 3)
+                from database import SCHEMA_VERSION
+                self.assertEqual(connection.execute('PRAGMA user_version').fetchone()[0], SCHEMA_VERSION)
                 self.assertIsNotNone(connection.execute(
                     "SELECT name FROM sqlite_master WHERE name='work_cases'").fetchone())
             self.assertEqual(len(list((path.parent/'backups').glob('pre-migration-v2-*.sqlite3'))), 1)

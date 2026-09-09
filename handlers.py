@@ -23,36 +23,41 @@ MENU = ReplyKeyboardMarkup(
     [['Start Shift', 'My Tasks'], ['TOD', 'Pre-lunch', 'EOD'], ['End Shift', 'Help']],
     resize_keyboard=True)
 
-HELP = '''Work Assistant
-/shift [start] [end] — start now or use 08:00 17:00, 10:00 19:00, 12:00 21:00
-/schedule END [LUNCH|none], /status, /default START END, /preset
-/task title | priority | due | project | client | ticket | next action | tags
-/todo, /today, /overdue, /taskdetails ID
-/done ID | completion note, /progress ID, /reopen ID, /block ID reason
-/edittask ID | field | value, /delete ID
-/support client | channel | outcome | action | product | category | follow-up | ticket | query count | issue key
-/testing scenario | result | product | environment | build | defects | ticket | retest
-/case title | client | channel | status | participation | product | platform | ticket | priority | next action | waiting on | follow-up
-/cases, /caseinfo ID, /caseevent ID | type | detail | outcome, /casestatus ID STATUS | note
-/clientupdated ID | note, /mergecases SOURCE TARGET
-/testsession case ID | scenario | result | environment | build | expected | actual | defects | retest | developer notified | preconditions | steps
-/tests [CASE_ID], /inbox, /acceptmsg MESSAGE_ID [CASE_ID], /ignoremsg MESSAGE_ID
-/followup CASE_ID | due | waiting on | note, /followups, /followupdone ID, /snooze ID MINUTES
-/sync freshdesk|freshchat, /dashboard, /imports, /rollbackimport ID
-/learning topic | type | product | takeaway | follow-up
-/note text, /activity, /editlog ID text, /undo ID
-/organize NOTE_ID — preview AI categorization
-/proposal ID, /edititem PROPOSAL ITEM | field | value, /dropitem PROPOSAL ITEM
-/accept PROPOSAL, /dismiss PROPOSAL
-/tod [style], /pl [style], /eod [style] — styles: short, standard, detailed
-/reportstyle STYLE, /privacy clients on|off, /section REPORT_KIND SECTION
-/ai REPORT_ID [style], /report ID, /editreport ID replacement, /history
-/summary, /week, /search text, /client name, /findtesting text
-/export csv|markdown, /backup, /health, /endshift
+HELP = '''Work Assistant · Phase 4
+You can speak or type naturally! For example:
+• "My shift today is 10 to 7 and I'll take lunch around 2"
+• "Today I need to test idle time and follow up with Rahul"
+• "Acme reported incorrect productive hours"
+• "Checked it on Windows 11 and reproduced the issue"
+• "Mark Acme case resolved"
+• "Remind me tomorrow at 11 to ask Rahul for fresh logs"
+• "What is still pending today?"
+• "Prepare my lunch update", "Generate my EOD"
+• "Undo"
 
-Plain and forwarded messages are saved as notes first. Voice notes are transcribed;
-photos, videos, and documents become local evidence. AI suggestions and imported work
-require acceptance and never change an existing task status. Use ? or - for an unknown optional field.'''
+Phase 4 Commands:
+/undo [ID] — Revert recent database mutation safely
+/understand TEXT — Preview natural language interpretation
+/casesummary [CASE_ID] — Factual case summary
+/nextaction [CASE_ID] — Recommended next operational step
+/draftclient [CASE_ID] [instruction] — Draft professional client reply (never sent automatically)
+/draftescalation [CASE_ID] — Draft technical engineering escalation
+/analyzetest [CASE_ID] — Analyze test sessions and findings
+/shiftcalendar — 7-day upcoming rotational schedule
+/shifttemplate — List shift templates
+/clusters — Historical message cluster suggestions
+/bulkhelp — Bulk inbox and clustering help
+
+Existing Slash Commands:
+/shift [start] [end], /schedule END [LUNCH], /status, /default START END, /preset
+/task title | priority | due | project | client | ticket | next action | tags
+/todo, /today, /overdue, /taskdetails ID, /done ID, /progress ID, /block ID
+/case title | client | channel | status ..., /cases, /caseinfo ID, /caseevent ID
+/testsession case ID | scenario | result ..., /tests [CASE_ID]
+/followup CASE_ID | due | waiting on | note, /followups, /followupdone ID
+/tod [style], /pl [style], /eod [style], /reportstyle, /dashboard, /export, /health
+'''
+
 
 
 def db(context):
@@ -169,40 +174,51 @@ async def capture_voice(update, context):
     await asyncio.to_thread(db(context).add_evidence, 'voice', shift['id'], None, None,
                             voice_path, telegram_file_id, 'Transcribed voice update',
                             voice_hash, mime_type)
-    await reply(update, f'Transcript saved as note #{activity_id}:\n\n{transcript}',
-        InlineKeyboardMarkup([[InlineKeyboardButton(
-            'Organize with AI', callback_data=f'organize:{activity_id}')]]))
+    await reply(update, f'🎙️ Transcript: "{transcript}"')
+    await save_plain_message(update, context, transcript)
 
 
 async def capture_evidence(update, context):
+    import re
     from media_capture import save_evidence
-    shift = await active(context)
+    shift = await asyncio.to_thread(db(context).active_shift)
     caption = (update.effective_message.caption or '').strip()
     case_id = None
     test_session_id = None
     if caption.startswith('/attach'):
         head = caption.split('|', 1)[0].split()
-        if len(head) >= 2:
+        if len(head) >= 2 and head[1].isdigit():
             case_id = int(head[1])
-        if len(head) >= 3:
+        if len(head) >= 3 and head[2].isdigit():
             test_session_id = int(head[2])
+    elif caption:
+        m = re.search(r'\b(?:case|case-)\s*#?(\d+)\b', caption, re.I)
+        if m:
+            case_id = int(m.group(1))
+
+    if not case_id:
+        ctx = await asyncio.to_thread(db(context).get_conversation_context, 'owner')
+        if ctx and ctx.get('active_case_id'):
+            case_id = ctx['active_case_id']
+
     if case_id and not await asyncio.to_thread(db(context).case, case_id):
-        raise ValueError('Case not found.')
+        case_id = None
+
     saved = await save_evidence(update.effective_message, config.BASE_DIR / 'storage' / 'evidence')
     evidence_id = await asyncio.to_thread(db(context).add_evidence,
-        saved['kind'], shift['id'], case_id, test_session_id, saved['path'],
+        saved['kind'], shift['id'] if shift else None, case_id, test_session_id, saved['path'],
         saved['telegram_file_id'], saved['caption'], saved['sha256'], saved['mime_type'])
     if case_id:
         await asyncio.to_thread(db(context).add_case_event, case_id, 'evidence',
                                 caption.split('|', 1)[-1].strip() or f'{saved["kind"]} evidence added',
-                                shift['id'])
+                                shift['id'] if shift else None)
     await reply(update, f'Evidence #{evidence_id} saved locally' +
-                (f' for CASE-{case_id}.' if case_id else '. Use /attach CASE_ID as the media caption next time.'))
+                (f' for CASE-{case_id}.' if case_id else '. To link it, reply with "/attach CASE_ID" or name the case.'))
 
 
 async def save_plain_message(update, context, text):
-    shift = await active(context)
     if getattr(update.effective_message, 'forward_origin', None):
+        shift = await active(context)
         from telegram_import import classify, extract_metadata, redact
         category, confidence = classify(text)
         key = hashlib.sha256(f'telegram_forward|{update.update_id}'.encode()).hexdigest()
@@ -215,10 +231,56 @@ async def save_plain_message(update, context, text):
         await reply(update, f'Forwarded message saved to review inbox #{source["id"]}.',
                     source_keyboard(source))
         return
-    activity_id = await asyncio.to_thread(db(context).add_activity, shift['id'], 'note', text)
-    await reply(update, f'Saved note #{activity_id}. Review it or organize it with AI.',
-        InlineKeyboardMarkup([[InlineKeyboardButton(
-            'Organize with AI', callback_data=f'organize:{activity_id}')]]))
+
+    # Phase 4 Natural Language Engine
+    from nlp import GeminiNLParser, NaturalLanguagePipeline
+    database = db(context)
+    shift = await asyncio.to_thread(database.active_shift)
+
+    ai_client = None
+    if config.AI_KEY and config.AI_MODEL:
+        ai_client = GeminiNLParser(config.AI_KEY, config.AI_MODEL, config.AI_FALLBACK_MODEL)
+    pipeline = NaturalLanguagePipeline(database, ai_client=ai_client)
+
+    reply_text, interp = await pipeline.process(text, shift, source_update_id=update.update_id)
+
+    markup = None
+    if interp.needs_confirmation or (0.6 <= interp.confidence < 0.85):
+        prop_id = None
+        with database.connect() as conn:
+            r = conn.execute("SELECT applied_ops_json FROM nl_interactions WHERE source_update_id=? ORDER BY id DESC LIMIT 1", (update.update_id,)).fetchone()
+            if r and r['applied_ops_json']:
+                try:
+                    ops = json.loads(r['applied_ops_json'])
+                    prop_id = ops.get('proposal_id')
+                except Exception:
+                    pass
+        if prop_id:
+            if interp.choices:
+                buttons = []
+                for idx, ch in enumerate(interp.choices[:4]):
+                    cb = f"prop:choose:{prop_id}:{idx}"
+                    buttons.append([InlineKeyboardButton(ch.get('label', 'Option'), callback_data=cb)])
+                buttons.append([InlineKeyboardButton('Cancel', callback_data=f"prop:cancel:{prop_id}")])
+                markup = InlineKeyboardMarkup(buttons)
+            else:
+                markup = InlineKeyboardMarkup([[
+                    InlineKeyboardButton('Confirm', callback_data=f"prop:accept:{prop_id}"),
+                    InlineKeyboardButton('Cancel', callback_data=f"prop:cancel:{prop_id}")
+                ]])
+    elif interp.choices:
+        buttons = []
+        for ch in interp.choices[:4]:
+            cb = f"nl:choose:{ch.get('case_id')}:{interp.intent.value}"
+            buttons.append([InlineKeyboardButton(ch.get('label', 'Option'), callback_data=cb)])
+        markup = InlineKeyboardMarkup(buttons)
+    elif interp.intent.value in ('set_shift', 'create_task', 'complete_task', 'change_case_status',
+                                 'create_test_session', 'add_learning', 'create_followup'):
+        last_audit = await asyncio.to_thread(database.get_last_reversible_audit)
+        if last_audit:
+            markup = InlineKeyboardMarkup([[InlineKeyboardButton('Undo action', callback_data=f"audit:undo:{last_audit['id']}") ]])
+
+    await reply(update, reply_text, markup=markup)
 
 
 async def report_preferences(context, requested=None):
@@ -233,16 +295,29 @@ async def make_report(update, context, kind, requested_style=None):
     shift = await active(context)
     style, mask = await report_preferences(context, requested_style)
     activities = await asyncio.to_thread(db(context).activities, shift['id'])
-    tasks = await asyncio.to_thread(db(context).list_tasks)
+    tasks = await asyncio.to_thread(db(context).tasks_for_shift, shift['id'])
     cases = await asyncio.to_thread(db(context).cases_for_shift, shift['id'])
     sessions = await asyncio.to_thread(db(context).test_sessions, shift['id'])
+    followups = await asyncio.to_thread(db(context).list_followups, 50)
     text = reports.generate_report(kind, shift, activities, tasks, style, mask, cases, sessions)
     report_id = await asyncio.to_thread(db(context).save_report, shift['id'], kind, text, style)
     await asyncio.to_thread(db(context).record_delivery, shift['id'], kind)
+
+    # Validate report quality and record provenance
+    from report_validator import ReportValidator
+    validation = ReportValidator.validate(kind, text, shift, activities, tasks, cases, sessions, followups)
+    await asyncio.to_thread(db(context).save_report_validation, report_id, validation.is_valid, [w.__dict__ for w in validation.warnings], validation.verified_metrics)
+    for p in validation.provenance_links:
+        await asyncio.to_thread(db(context).record_report_provenance, report_id, p['section_name'], p['record_type'], p['record_id'], p.get('detail'))
+
+    warning_text = ''
+    if validation.warnings:
+        warning_text = '\n\n⚠️ Report Validation:\n' + '\n'.join(f"• [{w.severity.upper()}] {w.message}" for w in validation.warnings[:3])
+
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton('Finalize', callback_data=f'final:{report_id}'),
         InlineKeyboardButton('AI draft', callback_data=f'ai:{report_id}')]])
-    await reply(update, f'Draft #{report_id} ({style})\n\n{text}', keyboard)
+    await reply(update, f'Draft #{report_id} ({style}){warning_text}\n\n{text}', keyboard)
     return report_id
 
 
@@ -250,6 +325,31 @@ async def reserve_ai(context):
     day = datetime.now(ZoneInfo(config.TIMEZONE)).date().isoformat()
     if not await asyncio.to_thread(db(context).reserve_ai, day, config.AI_DAILY_LIMIT):
         raise ValueError('Daily AI operation limit reached. Saved template reports remain available.')
+
+
+async def optional_copilot_ai(context, feature, prompt_version, ai_call, fallback_call):
+    """Runs one metered Gemini operation and records its outcome; returns factual fallback on failure/quota."""
+    if not (config.AI_KEY and config.AI_MODEL):
+        return fallback_call()
+    day = datetime.now(ZoneInfo(config.TIMEZONE)).date().isoformat()
+    if not await asyncio.to_thread(db(context).reserve_ai, day, config.AI_DAILY_LIMIT):
+        return fallback_call()
+    from ai import writer
+    engine = writer(config.AI_PROVIDER, config.AI_KEY, config.AI_MODEL, config.AI_FALLBACK_MODEL)
+    mask = (await asyncio.to_thread(db(context).get_setting, 'mask_client_names')) == 'true'
+    try:
+        result = await ai_call(engine, mask)
+    except Exception as exc:
+        await asyncio.to_thread(
+            db(context).record_ai_event, feature, config.AI_PROVIDER,
+            getattr(engine, 'last_model', None) or config.AI_MODEL,
+            prompt_version, 'failed', type(exc).__name__)
+        return fallback_call()
+    await asyncio.to_thread(
+        db(context).record_ai_event, feature, config.AI_PROVIDER,
+        getattr(engine, 'last_model', None) or config.AI_MODEL,
+        prompt_version, 'success')
+    return result
 
 
 async def ai_report(update, context, report_id, requested_style=None):
@@ -274,8 +374,26 @@ async def ai_report(update, context, report_id, requested_style=None):
     new_id = await asyncio.to_thread(
         db(context).save_report, report['shift_id'], report['kind'], text, style,
         config.AI_PROVIDER, used_model, REPORT_PROMPT_VERSION, report_id)
+
+    # Validate AI draft
+    shift = await asyncio.to_thread(db(context).shift, report['shift_id'])
+    activities = await asyncio.to_thread(db(context).activities, report['shift_id'])
+    tasks = await asyncio.to_thread(db(context).tasks_for_shift, report['shift_id'])
+    cases = await asyncio.to_thread(db(context).cases_for_shift, report['shift_id'])
+    sessions = await asyncio.to_thread(db(context).test_sessions, report['shift_id'])
+    followups = await asyncio.to_thread(db(context).list_followups, 50)
+    from report_validator import ReportValidator
+    validation = ReportValidator.validate(report['kind'], text, shift or {}, activities, tasks, cases, sessions, followups)
+    await asyncio.to_thread(db(context).save_report_validation, new_id, validation.is_valid, [w.__dict__ for w in validation.warnings], validation.verified_metrics)
+    for p in validation.provenance_links:
+        await asyncio.to_thread(db(context).record_report_provenance, new_id, p['section_name'], p['record_type'], p['record_id'], p.get('detail'))
+
+    warning_text = ''
+    if validation.warnings:
+        warning_text = '\n\n⚠️ AI Validation Note:\n' + '\n'.join(f"• [{w.severity.upper()}] {w.message}" for w in validation.warnings[:3])
+
     await reply(update,
-        f'AI draft #{new_id} ({style}, {used_model}) — verify outcomes and counts.\n\n{text}',
+        f'AI draft #{new_id} ({style}, {used_model}) — verify outcomes and counts.{warning_text}\n\n{text}',
         InlineKeyboardMarkup([[InlineKeyboardButton('Finalize', callback_data=f'final:{new_id}')]]))
 
 
@@ -399,12 +517,12 @@ async def handle_callback(update, context):
         report_id = int(parts[1])
         if not await asyncio.to_thread(db(context).report, report_id):
             raise ValueError('Report not found.')
-        await asyncio.to_thread(db(context).finalize, report_id)
+        await asyncio.to_thread(db(context).finalize, report_id, False, True)
         await reply(update, f'Report #{report_id} finalized.')
     elif action == 'close':
         report_id = int(parts[1])
         shift = await active(context)
-        await asyncio.to_thread(db(context).finalize_and_close, report_id, shift['id'])
+        await asyncio.to_thread(db(context).finalize_and_close, report_id, shift['id'], False, True)
         await reply(update, 'Shift closed. Unfinished tasks carry forward.', MENU)
     elif action == 'task':
         task_action, task_id = parts[1], int(parts[2])
@@ -421,6 +539,65 @@ async def handle_callback(update, context):
         if not task:
             raise ValueError('Task not found.')
         await reply(update, task_line(task, True), task_keyboard(task))
+    elif action == 'audit' and parts[1] == 'undo':
+        undone = await asyncio.to_thread(db(context).undo_audit_record, int(parts[2]))
+        details = f" {undone['details']}" if undone.get('details') else ''
+        await reply(update, f"Undid action #{undone['id']} ({undone['operation_type']} on {undone['affected_table']} #{undone['record_id']}).{details}")
+    elif action == 'prop':
+        prop_action = parts[1]
+        prop_id = parts[2]
+        callback_user = getattr(query, 'from_user', None)
+        owner_id = callback_user.id if callback_user else None
+        proposal = await asyncio.to_thread(db(context).get_nl_proposal, prop_id)
+        if not proposal:
+            await reply(update, 'Proposal not found or expired.')
+            return
+        if proposal['status'] != 'pending':
+            await reply(update, f"Proposal is already {proposal['status']}.")
+            return
+        if prop_action == 'cancel':
+            await asyncio.to_thread(db(context).cancel_nl_proposal, prop_id, owner_id)
+            await reply(update, 'Proposed action cancelled.')
+            return
+        try:
+            accepted = await asyncio.to_thread(db(context).claim_nl_proposal, prop_id, owner_id)
+        except Exception as exc:
+            await reply(update, f'Could not accept proposal: {exc}')
+            return
+        from nlp import NLInterpretation, NLActionExecutor
+        saved_interp = NLInterpretation.model_validate(accepted['proposal'])
+        if prop_action == 'choose' and len(parts) > 3:
+            choice_idx = int(parts[3])
+            if choice_idx < len(saved_interp.choices):
+                choice = saved_interp.choices[choice_idx]
+                if choice.get('case_id'):
+                    saved_interp.entities.case_id = choice['case_id']
+        saved_interp.needs_confirmation = False
+        saved_interp.clarification_question = None
+        executor = NLActionExecutor(db(context))
+        shift = await asyncio.to_thread(db(context).active_shift)
+        try:
+            reply_txt, _ = await executor.execute(saved_interp, shift)
+        except Exception:
+            await asyncio.to_thread(db(context).finish_nl_proposal, prop_id, 'failed')
+            raise
+        await asyncio.to_thread(db(context).finish_nl_proposal, prop_id, 'accepted')
+        await reply(update, reply_txt)
+    elif action == 'nl' and parts[1] == 'choose':
+        case_id = int(parts[2])
+        intent_str = parts[3]
+        from nlp import NLActionExecutor, NLEntities, NLIntent, NLInterpretation
+        interp = NLInterpretation(
+            intent=NLIntent(intent_str),
+            confidence=1.0,
+            entities=NLEntities(case_id=case_id),
+            proposed_summary=f"Disambiguated action on CASE-{case_id}"
+        )
+        executor = NLActionExecutor(db(context))
+        shift = await asyncio.to_thread(db(context).active_shift)
+        reply_txt, _ = await executor.execute(interp, shift)
+        await reply(update, reply_txt)
+
 
 
 async def health_text(context):
@@ -756,10 +933,10 @@ async def handle(update, context):
         elif command == 'dismiss':
             await asyncio.to_thread(db(context).dismiss_proposal, int(argument))
             await reply(update, 'Suggestion dismissed; original note retained.')
-        elif command in ('editlog', 'undo'):
+        elif command == 'editlog':
             shift = await active(context)
             first, _, replacement = argument.partition(' ')
-            if command == 'editlog' and not replacement:
+            if not replacement:
                 raise ValueError('Usage: /editlog ID replacement text')
             await asyncio.to_thread(db(context).correct_activity, shift['id'], int(first),
                                     replacement if command == 'editlog' else None)
@@ -880,13 +1057,199 @@ async def handle(update, context):
             with path.open('rb') as handle:
                 await update.effective_message.reply_document(handle, filename=path.name,
                     caption='Private work export. Store it securely.')
-        elif command == 'backup':
-            name = datetime.now().strftime('%Y%m%d-%H%M%S%f') + '.sqlite3'
-            path = await asyncio.to_thread(db(context).backup,
-                                           config.BASE_DIR / 'storage' / 'backups' / name)
-            await reply(update, f'Backup saved locally: {path.name}')
+        elif command == 'undo':
+            if argument and argument.isdigit():
+                undone = await asyncio.to_thread(db(context).undo_audit_record, int(argument))
+            else:
+                last_rev = await asyncio.to_thread(db(context).get_last_reversible_audit)
+                if not last_rev:
+                    raise ValueError('No reversible actions found to undo.')
+                undone = await asyncio.to_thread(db(context).undo_audit_record, last_rev['id'])
+            details = f" {undone['details']}" if undone.get('details') else ''
+            await reply(update, f"Undid action #{undone['id']} ({undone['operation_type']} on {undone['affected_table']} #{undone['record_id']}).{details}")
+        elif command == 'understand':
+            if not argument:
+                raise ValueError('Usage: /understand your natural language message')
+            from nlp import DeterministicParser, GeminiNLParser
+            interp = DeterministicParser.parse(argument)
+            if (not interp or interp.confidence < 0.7) and config.AI_KEY and config.AI_MODEL:
+                day = datetime.now(ZoneInfo(config.TIMEZONE)).date().isoformat()
+                if await asyncio.to_thread(db(context).reserve_ai, day, config.AI_DAILY_LIMIT):
+                    parser = GeminiNLParser(config.AI_KEY, config.AI_MODEL, config.AI_FALLBACK_MODEL)
+                    ctx = await asyncio.to_thread(db(context).get_conversation_context, 'owner')
+                    gemini_res = await parser.interpret(argument, ctx)
+                    succeeded = bool(gemini_res and gemini_res.provider == 'gemini')
+                    await asyncio.to_thread(
+                        db(context).record_ai_event, 'nl_understand', config.AI_PROVIDER,
+                        gemini_res.model if succeeded else config.AI_MODEL,
+                        parser.PROMPT_VERSION, 'success' if succeeded else 'failed',
+                        None if succeeded else 'InterpretationError')
+                    if gemini_res and gemini_res.confidence > (interp.confidence if interp else 0.0):
+                        interp = gemini_res
+            if not interp:
+                await reply(update, 'Could not understand this input with confidence.')
+            else:
+                entities_str = json.dumps(interp.entities.model_dump(exclude_none=True), indent=2)
+                await reply(update, f"Intent: {interp.intent.value} (Confidence: {round(interp.confidence*100)}%)\n"
+                                    f"Provider: {interp.provider}\n"
+                                    f"Summary: {interp.proposed_summary}\n"
+                                    f"Entities:\n{entities_str}")
+        elif command == 'casesummary':
+            case_id = int(argument) if argument.isdigit() else None
+            if not case_id:
+                ctx = await asyncio.to_thread(db(context).get_conversation_context, 'owner')
+                case_id = ctx.get('active_case_id')
+            if not case_id:
+                raise ValueError('Specify a Case ID or activate a case first: /casesummary CASE_ID')
+            c_item = await asyncio.to_thread(db(context).case, case_id)
+            if not c_item:
+                raise ValueError(f'Case #{case_id} not found.')
+            events = await asyncio.to_thread(db(context).case_events, case_id)
+            tasks = [t for t in await asyncio.to_thread(db(context).list_tasks) if t.ticket == c_item.get('ticket')]
+            test_sess = await asyncio.to_thread(db(context).test_sessions, case_id=case_id)
+            followups = [f for f in await asyncio.to_thread(db(context).list_followups, 50) if f.get('case_id') == case_id]
+            from ai import fallback_case_summary
+            summary = await optional_copilot_ai(
+                context, 'case_summary', 'case-summary-v1',
+                lambda engine, mask: engine.summarize_case(
+                    c_item, events, tasks, test_sess, followups, mask_client=mask),
+                lambda: fallback_case_summary(c_item, events, tasks, test_sess, followups))
+            timeline_str = '\n'.join(f"• {t}" for t in summary.timeline) or '• None recorded'
+            await reply(update, f"📋 Case #{case_id} Summary: {c_item['title']}\n\n"
+                                f"• Client Impact: {summary.client_impact}\n"
+                                f"• Status: {summary.current_status}\n"
+                                f"• Investigation: {summary.investigation}\n"
+                                f"• Evidence: {summary.evidence}\n"
+                                f"• Next Action: {summary.next_action or 'None'}\n"
+                                f"• Waiting On: {summary.waiting_on or 'None'}\n\n"
+                                f"Timeline:\n{timeline_str}")
+        elif command == 'nextaction':
+            case_id = int(argument) if argument.isdigit() else None
+            if not case_id:
+                ctx = await asyncio.to_thread(db(context).get_conversation_context, 'owner')
+                case_id = ctx.get('active_case_id')
+            if not case_id:
+                raise ValueError('Specify a Case ID: /nextaction CASE_ID')
+            c_item = await asyncio.to_thread(db(context).case, case_id)
+            if not c_item:
+                raise ValueError('Case not found.')
+            events = await asyncio.to_thread(db(context).case_events, case_id)
+            followups = [f for f in await asyncio.to_thread(db(context).list_followups, 50) if f.get('case_id') == case_id]
+            from ai import fallback_next_action
+            na = await optional_copilot_ai(
+                context, 'next_action', 'next-action-v1',
+                lambda engine, mask: engine.suggest_next_action(
+                    c_item, events, followups, mask_client=mask),
+                lambda: fallback_next_action(c_item, events, followups))
+            await reply(update, f"🎯 Next Action for CASE-{case_id} [{na.category}]:\n\n"
+                                f"👉 {na.action}\n\n"
+                                f"Reasoning: {na.explanation}")
+        elif command == 'draftclient':
+            parts = argument.split(maxsplit=1)
+            case_id = int(parts[0]) if parts and parts[0].isdigit() else None
+            user_inst = parts[1] if len(parts) > 1 else ''
+            if not case_id:
+                ctx = await asyncio.to_thread(db(context).get_conversation_context, 'owner')
+                case_id = ctx.get('active_case_id')
+                user_inst = argument
+            if not case_id:
+                raise ValueError('Specify a Case ID: /draftclient CASE_ID [instruction]')
+            c_item = await asyncio.to_thread(db(context).case, case_id)
+            if not c_item:
+                raise ValueError('Case not found.')
+            events = await asyncio.to_thread(db(context).case_events, case_id)
+            from ai import fallback_draft_client_reply
+            draft_msg = await optional_copilot_ai(
+                context, 'draft_client_reply', 'client-reply-v1',
+                lambda engine, mask: engine.draft_client_reply(
+                    c_item, events, user_inst, mask_client=mask),
+                lambda: fallback_draft_client_reply(c_item, events, user_inst))
+            await reply(update, f"✉️ Client Reply Draft for CASE-{case_id} (Never sent automatically):\n\n{draft_msg}")
+        elif command == 'draftescalation':
+            case_id = int(argument) if argument.isdigit() else None
+            if not case_id:
+                ctx = await asyncio.to_thread(db(context).get_conversation_context, 'owner')
+                case_id = ctx.get('active_case_id')
+            if not case_id:
+                raise ValueError('Specify a Case ID: /draftescalation CASE_ID')
+            c_item = await asyncio.to_thread(db(context).case, case_id)
+            if not c_item:
+                raise ValueError('Case not found.')
+            events = await asyncio.to_thread(db(context).case_events, case_id)
+            tests = await asyncio.to_thread(db(context).test_sessions, case_id=case_id)
+            from ai import fallback_draft_escalation
+            esc_msg = await optional_copilot_ai(
+                context, 'draft_escalation', 'escalation-v1',
+                lambda engine, mask: engine.draft_escalation(
+                    c_item, events, tests, mask_client=mask),
+                lambda: fallback_draft_escalation(c_item, events, tests))
+            await reply(update, f"🚨 Technical Escalation Draft for CASE-{case_id}:\n\n{esc_msg}")
+        elif command == 'analyzetest':
+            case_id = int(argument) if argument.isdigit() else None
+            if not case_id:
+                ctx = await asyncio.to_thread(db(context).get_conversation_context, 'owner')
+                case_id = ctx.get('active_case_id')
+            tests = await asyncio.to_thread(db(context).test_sessions, case_id=case_id) if case_id else await asyncio.to_thread(db(context).test_sessions, limit=10)
+            if not tests:
+                raise ValueError('No test sessions found.')
+            evidence = await asyncio.to_thread(db(context).evidence, case_id=case_id) if case_id else []
+            from ai import fallback_analyze_test
+            analysis = await optional_copilot_ai(
+                context, 'analyze_test', 'test-analysis-v1',
+                lambda engine, mask: engine.analyze_test(tests, evidence),
+                lambda: fallback_analyze_test(tests, evidence))
+            conflicts = '; '.join(analysis.conflicting_results) or 'None'
+            missing = '; '.join(analysis.missing_variables) or 'None'
+            await reply(update, f"🧪 Test Analysis ({len(tests)} sessions):\n\n"
+                                f"• Result: {analysis.result}\n"
+                                f"• What was tested: {analysis.what_was_tested}\n"
+                                f"• Missing variables: {missing}\n"
+                                f"• Conflicting results: {conflicts}\n"
+                                f"• Evidence supported: {'Yes' if analysis.evidence_supports_conclusion else 'No'}\n"
+                                f"• Next suggested test: {analysis.suggested_next_test or 'None'}\n\n"
+                                f"Summary: {analysis.summary}")
+        elif command == 'shiftcalendar':
+            from shifts import check_missing_shift_assignments, format_shift_preview, preview_calendar_week
+            preview_data = await asyncio.to_thread(preview_calendar_week, db(context))
+            calendar_text = format_shift_preview(preview_data)
+            missing = await asyncio.to_thread(check_missing_shift_assignments, db(context))
+            if missing:
+                calendar_text += '\n\n⚠️ Unassigned days in upcoming week:\n• ' + '\n• '.join(missing)
+            await reply(update, calendar_text)
+        elif command == 'shifttemplate':
+            from database import Database
+            templates = await asyncio.to_thread(db(context).list_shift_templates)
+            lines = ['📋 Configured Shift Templates:']
+            for t in templates:
+                lunch = t['lunch_time'] or 'Flexible'
+                lines.append(f"• #{t['id']} {t['name']}: {t['start_time']}–{t['end_time']} (Lunch: {lunch}, Tz: {t['timezone']})")
+            await reply(update, '\n'.join(lines))
+        elif command == 'clusters':
+            clusters = await asyncio.to_thread(db(context).get_clusters)
+            if not clusters:
+                await reply(update, 'No cluster suggestions generated yet. Run scripts/cluster_history.py --apply-suggestions to generate.')
+            else:
+                lines = ['🗂️ Historical Message Clusters:']
+                for c in clusters[:10]:
+                    lines.append(f"• Cluster #{c['id']} [{c['status']}]: {c['title']} ({c.get('message_count',0)} msgs, {round(c.get('confidence',0)*100)}% conf)")
+                await reply(update, '\n'.join(lines))
+        elif command == 'bulkhelp':
+            await reply(update, (
+                '📦 Phase 4 Bulk Review & Clustering Help:\n\n'
+                '1. Web Dashboard Bulk Review:\n'
+                '   Open /dashboard and click "Review Inbox".\n'
+                '   Filter by client, product, ticket, media.\n'
+                '   Select multiple messages and click "Accept as Tasks" or "Attach as Case Events".\n\n'
+                '2. Historical Clustering CLI:\n'
+                '   python scripts/cluster_history.py --dry-run\n'
+                '   python scripts/cluster_history.py --apply-suggestions\n\n'
+                '3. Safe Undo:\n'
+                '   Use /undo to revert the most recent mutation.\n'
+                '   Bulk actions can also be undone from the dashboard Audit tab.'
+            ))
         elif command == 'health':
             await reply(update, await health_text(context))
+
         else:
             await reply(update, 'Unknown command. Use /help.')
     except (ValueError, OverflowError) as exc:

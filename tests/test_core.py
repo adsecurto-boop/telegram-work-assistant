@@ -139,7 +139,8 @@ class RuntimeTests(unittest.TestCase):
             database=Database(path)
             self.assertEqual(database.get_task(1).title,'Legacy task')
             with database.connect() as connection:
-                self.assertEqual(connection.execute('PRAGMA user_version').fetchone()[0],3)
+                from database import SCHEMA_VERSION
+                self.assertEqual(connection.execute('PRAGMA user_version').fetchone()[0], SCHEMA_VERSION)
                 columns={row['name'] for row in connection.execute('PRAGMA table_info(tasks)')}
                 self.assertIn('due_date',columns)
             backups=list((path.parent/'backups').glob('pre-migration-v1-*.sqlite3'))

@@ -1,266 +1,301 @@
 # Telegram Work Assistant
 
-A personal Windows Telegram bot for flexible shifts, task plans, support work,
+A private Windows Telegram bot for flexible shifts, task plans, support work,
 testing, learning, and TOD / pre-lunch / EOD reports. SQLite is the source of
-truth; Gemini drafts and categorization are optional.
+truth; Gemini drafts and natural-language categorization are optional.
 
-## Setup on this PC
+---
 
-The project virtual environment and dependencies have been installed during development.
-In PowerShell, from this project directory:
+## Feature Matrix
 
+| Feature Area | Status | Notes / Pre-requisites |
+|---|---|---|
+| **Shift Management & Overrides** | **Implemented & Tested** | Daily shifts (08:00–17:00, 10:00–19:00, 12:00–21:00, custom). Future shifts stored in `shift_calendar` without activating today. Day-off markers. |
+| **Shift Templates & Rotational Schedule** | **Implemented & Tested** | Named templates (`Morning`, `General`, `Evening`). Date-range assignments enforce `active_weekdays`. Daily overrides take priority. |
+| **Task Lifecycle & Tracking** | **Implemented & Tested** | Create, update, complete, reopen, carry forward. Scoped to shift/date. |
+| **Case Management & Evidence** | **Implemented & Tested** | Full lifecycle: new, investigating, waiting_client, waiting_internal, testing, resolved, closed. Attached photos, videos, documents with SHA-256 deduplication. |
+| **Test Sessions & Learning Records** | **Implemented & Tested** | Captures scenarios, builds, environments, defect IDs, retest states, and learning takeaways. |
+| **Report Generation & Validation** | **Implemented & Tested** | Shift-scoped TOD, Pre-Lunch (PL), and EOD reports. Error-level validation findings block finalization unless explicitly acknowledged in the dashboard. |
+| **Natural Language Interaction** | **Implemented & Tested** | 27 intents supported via deterministic rules and shared domain services. Bounded fallback to Gemini structured interpreter. |
+| **Confidence Policy & Proposals** | **Implemented & Tested** | High confidence: direct execution. Medium confidence: stored proposal in `nl_proposals` with 1-click confirmation or interactive choices. Low confidence: zero mutations. |
+| **Atomic & Compound Undo** | **Implemented & Tested** | `/undo`, Telegram undo buttons, natural-language "undo", dashboard audit undo. Correlation-based multi-record atomic rollback with tamper detection. |
+| **Historical Clustering** | **Implemented & Tested** | CLI & Dashboard. SHA-256 fingerprint (`cluster-v1:...`) prevents duplicate suggestions. Supports Accept, Reject, Split, Merge, Attach to case. |
+| **Bulk Review Inbox** | **Implemented & Tested** | 12 filters in web dashboard. Two-phase preview and confirm with one-time tokens, atomic execution, and single-correlation undo. |
+| **Localhost Web Dashboard** | **Implemented & Tested** | Bound strictly to `127.0.0.1`. Token exchange for session cookie, per-session CSRF tokens, secure headers, button-based Kanban column movement, full audit log. |
+| **Gemini Copilot Tools** | **Requires Credentials** | Optional `/casesummary`, `/nextaction`, `/draftclient`, `/draftescalation`, `/analyzetest`, and report polishing. Works with fallback deterministic text when offline. |
+| **Voice Transcription** | **Requires Credentials** | Voice messages transcribed via Gemini API and routed to NLP pipeline. Captured and stored locally when offline. |
+| **Read-Only Connectors** | **Requires Credentials** | Optional Freshdesk and Freshchat pollers. CSV sync via CLI. Strictly read-only; records enter review inbox. |
+| **Multi-User / Public Cloud** | **Planned or Unavailable** | Designed exclusively as a private, single-owner assistant on a local Windows PC. Access is restricted to `OWNER_ID` in private chats. |
+
+---
+
+## Setup & Runtime on Windows
+
+### Prerequisites
+- Windows 10/11 64-bit
+- Python 3.12 (e.g. 3.12.9)
+- Telegram account with a Bot token from `@BotFather`
+- (Optional) Google Gemini API Key from Google AI Studio
+
+### Configuration
+Secrets stay in `.env` (or Windows Credential Manager). Copy `.env.example` to `.env`:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+Key environment variables:
+- `BOT_TOKEN`: Telegram bot token from `@BotFather`.
+- `OWNER_ID`: Numeric Telegram user ID (from `@userinfobot`). Not your phone number.
+- `SHIFT_TIMEZONE`: Timezone for shift scheduling (e.g. `Asia/Kolkata`).
+- `SQLITE_PATH`: Path to SQLite database (default: `storage/work.sqlite3`).
+- `GEMINI_API_KEY`: Google Gemini API key.
+- `AI_MODEL`: Primary Gemini model identifier (the current installation uses `gemini-3.6-flash`).
+- `AI_FALLBACK_MODEL`: Fallback Gemini model (default: `gemini-3.5-flash-lite`).
+- `AI_DAILY_LIMIT`: Maximum daily Gemini calls (default: `30`).
+- `DASHBOARD_PORT`: Localhost port for dashboard (default: `8765`).
+
+Run the interactive setup wizard:
 ```powershell
 .\.venv\Scripts\python.exe scripts\configure.py
-.\scripts\run.ps1
 ```
 
-The local wizard asks for your bot token, numeric Telegram **user** ID, Gemini
-API key, and a model ID available to that key. Secret inputs are hidden. It
-preserves existing environment values when you press Enter. Do not send API
-keys to the Telegram bot. Your existing `.env` has not been modified by the build.
-Use right-click to paste into hidden Windows prompts; Ctrl+V can insert a hidden
-control character. Get your Telegram user ID from `@userinfobot` in Telegram.
-It is an account ID such as `123456789`, not your phone number.
+### Windows Scheduled Task Management
+The bot runs automatically in the background on your Windows PC via Windows Task Scheduler.
 
-Send `/start` to your bot from the configured owner's private Telegram account.
-Other users and groups are ignored. Access fails closed when OWNER_ID is absent.
-`.env.example` lists settings. `SHIFT_TIMEZONE` defaults to Asia/Kolkata and
-supersedes the old scheduler TIMEZONE setting. Existing DB_PATH is the legacy
-JSON source; SQLITE_PATH configures the new database and must be a different path.
+- **Task Name**: `Telegram Work Assistant`
+- **Target Executable**: `C:\Projects\TELEBOT\telegram-work-assistant\.venv\Scripts\pythonw.exe`
+- **Start the Task**:
+  ```powershell
+  Start-ScheduledTask -TaskName 'Telegram Work Assistant'
+  ```
+- **Stop the Task**:
+  ```powershell
+  Stop-ScheduledTask -TaskName 'Telegram Work Assistant'
+  ```
+- **Check Task Status**:
+  ```powershell
+  Get-ScheduledTask -TaskName 'Telegram Work Assistant'
+  ```
 
-For a fresh installation, install Python 3.12, then:
+---
+
+## Natural-Language Interface
+
+You can interact with the bot in plain conversational English. The system uses a fast deterministic parser backed by a structured Gemini interpreter when ambiguous.
+
+### Conversational Examples
+- **Shifts**:
+  - `"My shift today is 10 to 7 and I'll take lunch around 2"`
+  - `"Tomorrow I'm working 8 to 5"` (schedules tomorrow in `shift_calendar` without activating today)
+  - `"Friday is a day off"` (creates a day-off override)
+  - `"Lunch today is at 3"`
+- **Tasks**:
+  - `"Today I need to test idle time and follow up with Rahul"` (creates two tasks)
+  - `"Mark that task as done"`
+  - `"Move the remaining task to tomorrow"`
+- **Cases & Support**:
+  - `"Create a case for Acme's attendance issue"`
+  - `"Mark that case waiting for client"`
+  - `"The client confirmed it is working"`
+  - `"I shared the logs with the development team"`
+- **Testing & Learning**:
+  - `"Checked it on Windows 11 and reproduced the issue"`
+  - `"I learned how idle-time calculation works"`
+- **Follow-ups**:
+  - `"Remind me tomorrow at 11 to ask Rahul for fresh logs"`
+  - `"Complete the follow-up"`
+  - `"Snooze the follow-up to 4pm"`
+- **Reports & Queries**:
+  - `"Generate my TOD."`
+  - `"Prepare my lunch update."`
+  - `"Generate my EOD in a professional format."`
+  - `"What is still pending today?"`
+  - `"Show my cases."`
+- **Copilot Tools**:
+  - `"Summarize that case."`
+  - `"Draft a reply asking for fresh logs."`
+  - `"Analyze the last test."`
+- **Undo**:
+  - `"Undo"` or `"Undo last action"`
+
+### Confidence Policy & Proposals
+1. **High Confidence (>= 0.80)**: Low-risk operations execute immediately with an audit record and a 1-click `/undo` button.
+2. **Medium Confidence (0.60 – 0.79)**: A proposal is stored in `nl_proposals`. The bot explains the proposed action and presents **Confirm** / **Cancel** or choice buttons. The target record is **not mutated** until you tap Confirm. Proposals expire after 15 minutes, are bound to your user ID, and cannot be replayed.
+3. **Low Confidence (< 0.60)**: No mutations occur. The bot asks for clarification or shows likely options.
+
+---
+
+## Shift Planning & Templates
+
+The assistant accommodates rotational schedules with strict time validation:
+- **Valid Times**: Hours 0–23, minutes 0–59. Invalid tokens like `99:80` or `25:00` are strictly rejected.
+- **Cross-Midnight**: Shifts crossing midnight (e.g. 22:00 to 07:00) are recognized as a continuous workday.
+- **Configured Templates**:
+  - `Morning`: 08:00–17:00 (Lunch: 12:30)
+  - `General`: 10:00–19:00 (Lunch: 14:00)
+  - `Evening`: 12:00–21:00 (Lunch: 16:00)
+- **Rotational Range Assignment**: Assign templates across date ranges (e.g. "Use 12 to 9 for the rest of September"). Requested hours override template hours while the template still controls eligible weekdays.
+- **Explicit Overrides**: Explicit single-day schedules or day-off markers always override template assignments.
+- **Future Shifts**: Scheduling a shift for tomorrow or a future date writes an entry into `shift_calendar` and does **not** open an active shift today.
+- **Calendar Preview**: Use `/shiftcalendar` to view the next 7 days and see any unassigned dates.
+
+---
+
+## Safe Transactional Undo & Auditing
+
+Every mutation that advertises undo produces an atomic audit correlation:
+- **Reversible Operations**: Task creation, task completion, shift creation, lunch updates, case creation, case status changes, case events, test sessions, follow-ups, shift calendar overrides, bulk review actions, and cluster acceptance.
+- **Compound Undo**: Actions that create multiple records (e.g. creating two tasks, creating a test session with a linked case event, or accepting messages as tasks) share a single `correlation_id`. Undoing via `/undo`, a Telegram button, or the dashboard reverts **all records in the correlation batch atomically**.
+- **Tamper Protection**: Every audit record stores before-state and after-state JSON snapshots. If a record has been modified by a subsequent action, undo is blocked and rolled back entirely.
+- **No False Undo**: The bot never displays `"Undo: /undo"` unless a reversible audit record was created.
+
+---
+
+## Historical Clustering & Bulk Review
+
+### Historical Message Clustering
+Clusters historical messages into coherent issue groups based on Telegram reply chains, ticket identifiers, and temporal proximity.
+- **Dry-Run Analysis**:
+  ```powershell
+  .\.venv\Scripts\python.exe scripts\cluster_history.py --dry-run
+  ```
+- **Apply Suggestions**:
+  ```powershell
+  .\.venv\Scripts\python.exe scripts\cluster_history.py --apply-suggestions
+  ```
+- **Idempotency**: Suggestions use a SHA-256 fingerprint (`cluster-v1:<hash>`) based on sorted source message IDs and the algorithm version. Repeated execution against unchanged messages produces zero duplicate clusters and leaves existing clusters intact.
+- **Cluster Management**: In Telegram via `/clusters` or on the dashboard **Clusters** tab, you can **Accept as Case**, **Reject**, **Split**, **Merge**, or **Attach to Existing Case**. Clusters are never accepted automatically.
+
+### Bulk Inbox Review
+The web dashboard Review tab supports high-throughput review with 12 filters:
+- Filter by date range, import source, client, product, classification, confidence, cluster, review status, media presence, ticket presence, owner authored, and text query.
+- **Two-Phase Preview & Confirm**: Selecting messages and clicking an action (e.g. Accept as Tasks, Attach as Case Events, Assign Client) displays a **Preview Screen** with the affected record count and requires an explicit confirmation click backed by a one-time token. Direct mutations without preview are disallowed.
+- **Atomic Rollback**: Bulk operations run in a single transaction with a single correlation ID. Undoing a bulk action restores all source messages and removes all generated items.
+
+---
+
+## Automated Report Validation
+
+When generating Beginning of Day (`/tod`), Pre-Lunch (`/pl`), or End of Day (`/eod`) reports, `ReportValidator` inspects the text against database records:
+- **Shift Scoping**: Validates strictly against records within the report's shift window or date.
+- **Factual Discrepancies Caught**:
+  - Unsupported unique-client count vs structured support records.
+  - Duplicate client entries in client lists.
+  - Completed tasks reported as pending, or pending tasks reported as completed.
+  - Omitted open high-priority cases.
+  - Overdue follow-ups omitted.
+  - Claims of testing or resolution without supporting records or case events.
+  - Pass/Fail conflicts between report claims and test session outcomes.
+  - Hallucinated ticket numbers or client names not found in reference data.
+- **Validation Storage**: Validation results, verified metrics, and warnings are saved in `report_validations` and linked via `report_provenance`.
+
+---
+
+## AI Privacy, Reliability & Quota Management
+
+- **Strict Redaction**: `AIPayloadBuilder` strips bearer tokens, API keys, passwords, email addresses, and phone numbers before text is sent to Gemini.
+- **Allowlists & Outbound Views**: Case summaries and client reply drafts use an explicit field allowlist. Internal notes and private events are excluded from client draft payloads.
+- **Client Name Masking**: When `mask_client_names` is enabled, client identifiers are masked as `Client {id}` across report and copilot requests. Task, test, follow-up, case, and event strings are redacted before external AI calls.
+- **Unified Metering**: Natural-language interpretation, `/understand`, reports, transcription, organization, and copilot features share the configured daily quota and record success/failure events.
+- **Untrusted Data Boundary**: All imported content and notes are wrapped in `<untrusted_data>` delimiters with strict system instructions that untrusted data must never be treated as system commands.
+- **Quota Accounting**: Every AI call (NLP interpretation, case summaries, drafts, report polishes, transcription) logs metadata in `ai_usage` and `ai_events`. Prompts and client message contents are **never** logged.
+- **Bounded Exponential Backoff**: Retries up to 2 times with exponential delay for transient errors (429 rate limit, 503 service unavailable, timeouts). Authentication (401) and permission (403) errors fail immediately without retry.
+- **Offline Functionality**: The bot functions fully without Gemini. If AI is disabled or offline, deterministic templates and rules provide complete operational capability.
+
+---
+
+## Localhost Web Dashboard
+
+Access the private dashboard in your browser:
+- Bound strictly to loopback: `http://127.0.0.1:8765/?token=...`
+- **Authentication**: The dashboard access token is exchanged for an HTTP-only local session cookie (`dashboard_session`) that expires after eight hours.
+- **CSRF Protection**: Every state-changing form includes a per-session CSRF token. Unauthenticated requests or missing CSRF tokens return HTTP 403.
+- **Bulk Confirmation**: Preview tokens expire after ten minutes, are single-use, and are bound to the session that created them.
+- **Secure Headers**: Responses include `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, and `SameSite=Lax`.
+- **Pages**:
+  - **Overview**: Today's active shift status, open cases, inbox count, and follow-ups.
+  - **Kanban Board**: Column-based workflow (`New`, `Investigating`, `Waiting Client`, `Waiting Internal`, `Testing`, `Resolved`, `Closed`) with status movement buttons.
+  - **Review Inbox**: Filterable multi-select triage with two-phase preview and confirm.
+  - **Clusters**: View historical cluster suggestions with confidence scores, message links, and 1-click case creation.
+  - **Shifts & Calendar**: 7-day rotational schedule preview, template range assigner, and daily override editor.
+  - **Reports**: View drafts, provenance links, and structured validation warnings.
+  - **Audit Log**: Complete history of database mutations with 1-click safe undo.
+  - **Health**: Real-time database integrity, backup count, AI quota usage, and connector health.
+
+---
+
+## Backup, Restore & Migration
+
+- **Automated Backups**: Backups are created automatically every 6 hours and before any database schema migration using SQLite's online backup API in `storage/backups/`.
+- **Manual Backup**:
+  ```powershell
+  .\.venv\Scripts\python.exe scripts\backup.py
+  ```
+- **Integrity Verification**:
+  Every backup and migration step is verified using `PRAGMA integrity_check`.
+- **Transactional Migration**:
+  The migration runner executes schema updates statement-by-statement inside an explicit immediate transaction (`BEGIN IMMEDIATE`), updating `user_version` only after all tables, columns, indexes, and foreign keys pass validation. Injected failures automatically roll back to the clean previous state.
+- **Restore from Backup**:
+  ```powershell
+  Stop-ScheduledTask -TaskName 'Telegram Work Assistant'
+  .\.venv\Scripts\python.exe scripts\restore.py storage\backups\<backup_file>.sqlite3
+  Start-ScheduledTask -TaskName 'Telegram Work Assistant'
+  ```
+
+---
+
+## Virtual Environment Recovery Procedure
+
+If the Python environment is damaged (e.g. `.venv\pyvenv.cfg` points to a missing runtime):
+1. Locate a compatible Python 3.12 installation:
+   ```powershell
+   py -3.12 --version
+   ```
+2. Archive the broken environment to a timestamped backup:
+   ```powershell
+   Rename-Item .venv ".venv-broken-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+   ```
+3. Create a fresh virtual environment:
+   ```powershell
+   py -3.12 -m venv .venv
+   ```
+4. Install locked dependencies:
+   ```powershell
+   .\.venv\Scripts\python.exe -m pip install -r requirements.lock.txt
+   ```
+5. Verify package integrity:
+   ```powershell
+   .\.venv\Scripts\python.exe -m pip check
+   ```
+6. Verify Task Scheduler uses the repaired path (`.venv\Scripts\pythonw.exe`).
+
+---
+
+## Verification & Automated Testing
+
+The complete test suite runs against temporary databases using mocked Telegram and Gemini interfaces:
 
 ```powershell
-py -3.12 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.lock.txt
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-`requirements.lock.txt` records the dependency versions tested on Windows/Python 3.12.
-`requirements.txt` expresses upgrade ranges. Re-test after upgrading.
+The suite contains 104 unit and integration tests, including production-path regressions for:
+- **Telegram Handlers**: Plain natural language, voice routing, `/understand`, `/undo`, and callbacks.
+- **Undo & Cascades**: Multi-task correlation undo, compound test sessions, standalone follow-ups, cluster acceptance undo, and atomic rollback on tamper.
+- **Shift Engine**: Schedule validation, invalid time rejection (`99:80`), future shifts, day-off overrides, template range weekday enforcement, and cross-midnight shifts.
+- **Natural Language Dispatch**: Conversational TOD, PL, EOD generation, Copilot dispatch, medium-confidence proposals, and low-confidence no-mutation safety.
+- **Dashboard Security**: Authenticated routes, unauthenticated 403 rejection, CSRF rejection, cluster acceptance POST, and bulk preview/confirm.
+- **Clustering**: SHA-256 fingerprint idempotency, duplicate prevention, and repeated suggestion replay.
+- **Report Validation**: Shift scoping, duplicate client warnings, hallucinated ticket/client detection, and task status consistency.
+- **AI Privacy & Reliability**: Sensitive data redaction, client masking, untrusted data boundaries, quota tracking, exponential backoff, and AI-disabled fallbacks.
+- **Database Migrations**: Transactional v4-to-v5 migration and automatic rollback on injected failure.
 
-## A typical shift
+---
 
-```text
-/shift
-/schedule 21:00 16:00
-/task Test Linux web blocking | urgent | today | EmpMonitor | - | BUG-42 | Retest failures | linux,web
-/task Follow up on deployment | high | tomorrow | EmpMonitor | Pace | REQ-7 | Request logs | deployment
-/tod
-/progress 1
-/support Pace | Teams | investigated | Investigated installation | EmpMonitor | installation | Await logs | SUP-1 | 1 | pace-install
-/testing Linux web blocking | failed | EmpMonitor | Rocky Linux | 4.2 | Two defects | BUG-42 | required
-/learning Silent installation | KT | EmpMonitor | Use deployment flags | Practise tomorrow
-/case Login issue | Pace | Teams | investigating | handled | EmpMonitor | Windows | SUP-8 | high | Check logs | client | tomorrow 10:00
-/testsession 1 | Login retest | failed | Windows 11 | 4.3 | Login succeeds | Bad request | BUG-8 | yes | yes | Fresh install | Install and sign in
-/followup 1 | tomorrow 10:00 | client | Request fresh logs
-/pl
-/done 1
-/eod
-/endshift
-```
+## Known Limitations
 
-`/shift` records the actual start now and suggests nine hours later as the end.
-`/shift 08:00 17:00`, `/shift 10:00 19:00`, and `/shift 12:00 21:00` are explicit
-presets. `/default 12:00 21:00` sets the saved default; `/preset` starts it.
-A default does not automatically start a shift or create reminders on days off.
-
-Lunch is optional. `/schedule 19:00 14:00` changes end and lunch; use `none` to
-remove lunch. Clock times after midnight belong to the same shift when appropriate.
-Use an explicit start such as `/shift 2026-09-08T23:00 08:00` for earlier or overnight
-work. Only one shift is active at once. `/endshift` drafts EOD and presents a close
-button; scheduled end time alone does not close the shift.
-
-Tasks carry forward without duplication. Every status change within a shift is
-recorded. Old completions are not counted as current accomplishments. `/reopen ID`
-clears the completion timestamp. `/delete ID` archives rather than erases a task.
-Task priorities are low, normal, high, and urgent. Due dates accept `today`,
-`tomorrow`, or `YYYY-MM-DD`. `/todo`, `/today`, and `/overdue` include inline actions.
-`/taskdetails ID` shows metadata and `/edittask ID | field | value` changes one field.
-
-## Logging and AI
-
-Plain messages are saved verbatim as notes first. Tap **Organize with AI** or use
-`/organize NOTE_ID` to preview proposed plans, support entries, testing, learning,
-and notes. Only **Accept entries** applies the suggestion, transactionally. Original
-notes remain in audit history. AI categorization never changes existing task status;
-use `/done` or `/progress` explicitly. Edit a mistaken note before re-organizing it.
-Suggestions display confidence and clarification questions. Use `/proposal ID`,
-`/edititem PROPOSAL ITEM | field | value`, `/dropitem`, `/accept`, or `/dismiss` to
-review them. Acceptance is transactional, preventing partially saved suggestions.
-
-`/support client | channel | outcome | details` records one interaction. Outcomes
-are resolved, investigated, escalated, pending, or assisted. Use `?` for unknown
-clients. Keep the same client alias across channels for meaningful unique-client
-counts. A resolved interaction is not necessarily one resolved query; exact query
-counts cannot be reconstructed from vague or combined notes. The report deliberately
-labels this measure **resolved interactions**. Unnamed clients make client totals incomplete.
-Extended support fields record product, category, follow-up, ticket, query count, and
-an issue key. Reusing an issue key prevents repeated updates about one issue from
-being counted repeatedly in explicit resolved-query totals.
-
-Testing records can store result, product, environment, build, defects, ticket, and
-retest requirement. Learning records can store session type, product, takeaway, and
-follow-up. Use `-` or `?` when optional information is unknown.
-
-`/activity` lists IDs. `/editlog ID text` corrects details; `/undo ID` removes a mistaken
-log from reports while retaining audit history. To correct a support client/channel/
-outcome, undo that entry and log the corrected one. Task changes use task commands.
-
-`/tod` (`/bos`), `/pl` (`/prelunch`), and `/eod` save template reports. `/ai REPORT_ID`
-asks Gemini to polish one report, retaining the original. AI drafts require review:
-model instructions cannot guarantee factual accuracy. `/editreport ID text` saves a
-new version. `/history` and `/report ID` retrieve past reports. Finalized snapshots
-are never overwritten by later task updates. Finalize does not send a report to HR
-or other chats; copy it yourself.
-
-Reports support `short`, `standard`, and `detailed`, for example `/eod detailed`.
-`/reportstyle detailed` changes the default. `/privacy clients on` masks client names
-in newly generated reports. `/section eod testing` rebuilds one current section.
-`/summary` previews the current shift and `/week` summarizes the last seven days.
-`/search`, `/client`, and `/findtesting` search locally. `/export csv` and
-`/export markdown` send owner-only exports; spreadsheet-formula cells are escaped.
-
-Only the chosen note or report is sent to Gemini, not the entire database or reference
-file. Use client aliases if you prefer not to send names. The first provider adapter
-is Gemini; other providers need an adapter implementing the writer interface. Set
-AI_MODEL explicitly to avoid silently selecting an unavailable or undesired model.
-`AI_FALLBACK_MODEL` defaults to `gemini-3.5-flash-lite` and is tried only when the
-primary endpoint is retired, rate-limited, overloaded, or has a transient server
-failure. Authentication, permission, and malformed-request errors fail immediately.
-The application caps operations per local day with AI_DAILY_LIMIT (default 30),
-including failed attempts. This is not a monetary budget. A fallback can produce two
-provider calls for one operation when the primary fails. Timeouts preserve original
-content and template reports remain usable offline.
-
-## Cases, evidence, voice, and follow-ups
-
-Cases connect fragmented support messages, calls, testing, handoffs, resolutions, and
-client updates. `/case` creates one; `/cases` and `/caseinfo ID` show it. Use
-`/caseevent`, `/casestatus`, and `/clientupdated` to build an evidence-backed timeline.
-A fix is not treated as communicated until the client-update step is recorded.
-
-`/testsession` captures environment, build, expected and actual behavior, defects,
-retest state, and developer notification. Send a photo, document, or video with
-`/attach CASE_ID TEST_ID | caption` as its Telegram caption. Evidence is stored under
-`storage/evidence`; media files are pruned after `MEDIA_RETENTION_DAYS`, while their
-audit metadata remains. Voice notes are transcribed with the configured Gemini model,
-saved as reviewable notes, and deleted after transcription by default. Set
-`DELETE_VOICE_AFTER_TRANSCRIPTION=false` to retain local audio.
-
-`/followup CASE_ID | tomorrow 10:00 | client | Request fresh logs` schedules a case
-follow-up. `/followups`, `/followupdone`, and `/snooze` manage it. Near shift end the
-bot gives one combined reminder for open cases; reminder timing follows the current
-day's flexible shift.
-
-## Telegram history and review inbox
-
-Analyze Telegram Desktop HTML exports without changing the database:
-
-```powershell
-.\scripts\import_telegram.ps1 'C:\path\to\ChatExport'
-```
-
-Add `-Apply` to import. The importer reconstructs joined messages and replies, masks
-emails, phone numbers, links, mentions, tokens, and passwords, fingerprints messages,
-and makes repeat imports idempotent. Owner-attributed work enters `/inbox`; other group
-activity is retained as ignored context and never counts as personal work. Use
-`/acceptmsg MESSAGE_ID [CASE_ID]` or `/ignoremsg MESSAGE_ID`. Inspect batches with
-`/imports`; `/rollbackimport ID` removes an unaccepted batch without changing its source
-files. Historical events keep their original timestamps and do not enter the
-current shift unless they were forwarded live to the private bot.
-
-## Local dashboard and connectors
-
-The bot starts a token-protected dashboard on `127.0.0.1:8765`. Send `/dashboard` to
-receive the private local link. It shows cases, the review inbox, test sessions, and
-follow-ups, and supports review and status changes. It is not exposed to the LAN or
-internet. `scripts\launcher.ps1` opens a small Windows control panel for the dashboard,
-scheduled task, and backups.
-
-Freshdesk and Freshchat connectors are read-only and only import records assigned to
-the configured agent ID. Run `scripts\configure_connectors.py`, then `/sync freshdesk`
-or `/sync freshchat`. CSV is available through `scripts\sync_connector.py csv
---csv-path PATH`. Teams and WhatsApp messages can be forwarded to the private bot until
-an organization-approved API connection is available. Set `ENABLED_CONNECTORS` to a
-comma-separated list such as `freshdesk,freshchat` to sync configured connectors every
-`CONNECTOR_SYNC_MINUTES`; all results still require review.
-
-New secrets use Windows Credential Manager when the interactive Windows session permits
-it and fall back to the local ignored `.env` file otherwise. Existing `.env` secrets can
-be moved with `scripts\migrate_secrets.py`; non-secret settings remain in `.env`.
-
-## Windows autostart and recovery
-
-After local configuration and one successful manual run, stop that manual run and:
-
-```powershell
-.\scripts\run.ps1 -InstallAutostart
-Start-ScheduledTask -TaskName 'Telegram Work Assistant'
-```
-
-The task runs as your signed-in Windows user, starts at login, allows battery power,
-and attempts up to ten restarts at one-minute intervals. A database-specific OS lock
-prevents running two copies against the same database. The task has not been
-registered automatically by the build.
-
-The PC must be awake, signed in, and online. Sleep/offline periods pause service.
-On reconnect, one reminder combines due TOD/lunch/EOD prompts; delivered prompts
-are remembered across restarts. Reminders do not require pending tasks. A successful
-manual report suppresses its corresponding reminder. Missed Telegram updates are
-subject to Telegram retention; the bot cannot promise recovery of arbitrarily old
-messages. You can log missing work manually in an active shift.
-
-Telegram delivery and local SQLite cannot be one atomic transaction: a crash just
-after sending a reminder can cause one duplicate. Incoming update IDs are claimed
-before processing to prevent repeated mutations; a crash in that narrow interval
-can require checking `/activity` and resending the operation as a new message.
-
-Stop the background bot with:
-
-```powershell
-Stop-ScheduledTask -TaskName 'Telegram Work Assistant'
-```
-
-## Storage, migration, backup, restore
-
-On the first configured startup, legacy JSON tasks are validated and copied to a
-separate timestamped `.bak` before importing into SQLite. The JSON stays unchanged;
-legacy reminder chat IDs are not trusted or imported. Invalid JSON stops migration
-instead of replacing data with an empty database. An already populated new database
-is not silently merged. Legacy tasks have no fabricated shift history.
-
-Startup backups, six-hour automatic backups, and `/backup` use SQLite's backup API
-under `storage/backups`. `BACKUP_RETENTION` defaults to the newest 30 local backups.
-Copy important backups to another drive; local backups do not protect against disk
-failure. Backups are retained until you manage them; they may contain private work.
-
-Stop the bot before restoring:
-
-```powershell
-.\scripts\restore.ps1 -BackupPath 'C:\path\to\backup.sqlite3'
-```
-
-Restore checks SQLite integrity and required tables, locks out the running bot,
-and backs up the current database before replacement. Restart after restore.
-Source control ignores secrets, virtual environments, new databases, logs, and backups.
-The original `storage/tasks.json` was already tracked; migration leaves it alone.
-Do not publish that legacy file if it contains private work data.
-
-## Verification and current scope
-
-```powershell
-.\.venv\Scripts\python.exe smoke_test.py
-.\.venv\Scripts\python.exe -m pip check
-```
-
-Tests use temporary storage and mocked Telegram/AI calls. They cover authorization,
-concurrent writes, migration, backup/restore, overnight scheduling, correction audit,
-report scope and counts, duplicate updates, reminder recovery, AI failure, proposal
-acceptance/editing, rich records, search, exports, backup retention, and long Unicode
-messages. `/health` reports schema, database integrity, active shift, background jobs,
-backups, AI configuration, and AI event totals without exposing secrets.
-
-Microsoft Teams and WhatsApp direct connectors, automated monthly rotations, OCR, and
-additional AI provider adapters remain future extensions. Legacy `bot/` and
-`utils/` placeholder folders are not imported; the supported entry point is `bot.py`
-(also available through `main.py`).
+1. **Local Host Only**: The bot and dashboard are designed for a private Windows PC without an always-on public server. If the PC is in sleep mode or powered off, processing is paused until wake.
+2. **Owner-Only Security**: Only messages from `OWNER_ID` in private chats are processed. Group chats and non-owner interactions are intentionally ignored.
+3. **Read-Only External Connectors**: Freshdesk and Freshchat connectors are strictly read-only and import data into the review inbox. The bot never sends outbound messages to external clients.
+4. **Voice Transcription Requires Gemini**: When offline or without API credentials, voice messages are captured and preserved in storage as reviewable audio items rather than transcribed.
