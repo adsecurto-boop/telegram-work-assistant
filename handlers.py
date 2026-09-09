@@ -232,6 +232,15 @@ async def save_plain_message(update, context, text):
                     source_keyboard(source))
         return
 
+    if text.strip().casefold().rstrip('.!') in (
+            'end it', 'end shift', 'end my shift', 'end the shift', 'close my shift',
+            'finish my shift', 'please end my shift'):
+        report_id = await make_report(update, context, 'eod')
+        await reply(update, 'Review the EOD, then confirm whether to close this shift.',
+                    InlineKeyboardMarkup([[InlineKeyboardButton(
+                        'Finalize EOD & close shift', callback_data=f'close:{report_id}')]]))
+        return
+
     # Phase 4 Natural Language Engine
     from nlp import GeminiNLParser, NaturalLanguagePipeline
     database = db(context)
@@ -601,6 +610,8 @@ async def handle_callback(update, context):
 
 
 async def health_text(context):
+    import os
+    from nlp import NL_PARSER_VERSION
     database = db(context)
     integrity = await asyncio.to_thread(database.integrity)
     shift = await asyncio.to_thread(database.active_shift)
@@ -611,6 +622,8 @@ async def health_text(context):
     jobs = context.application.job_queue.jobs() if context.application.job_queue else ()
     return '\n'.join((
         'Work Assistant Health',
+        f'Runtime: {NL_PARSER_VERSION}; process: {os.getpid()}',
+        f'Project: {config.BASE_DIR}',
         f'Database schema: v{SCHEMA_VERSION}; integrity: {integrity}',
         f'Active shift: {shift["id"] if shift else "none"}',
         f'Reminder/maintenance jobs: {len(jobs)}',

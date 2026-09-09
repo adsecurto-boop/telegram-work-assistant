@@ -284,7 +284,7 @@ The complete test suite runs against temporary databases using mocked Telegram a
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-The suite contains 117 unit and integration tests, including production-path regressions for:
+The suite contains 122 unit and integration tests, including production-path regressions for:
 - **Telegram Handlers**: Plain natural language, voice routing, `/understand`, `/undo`, and callbacks.
 - **Undo & Cascades**: Multi-task correlation undo, compound test sessions, standalone follow-ups, cluster acceptance undo, and atomic rollback on tamper.
 - **Shift Engine**: Schedule validation, invalid time rejection (`99:80`), future shifts, day-off overrides, template range weekday enforcement, and cross-midnight shifts.

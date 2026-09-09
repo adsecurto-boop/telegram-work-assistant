@@ -12,7 +12,7 @@ import handlers
 import reports
 import scheduler
 from database import Database, SCHEMA_VERSION
-from nlp import DeterministicParser, NaturalLanguagePipeline, NLIntent
+from nlp import DeterministicParser, NaturalLanguagePipeline, NLIntent, NLInterpretation, NLEntities
 from report_validator import ReportValidator
 
 
@@ -47,7 +47,10 @@ class ShiftConfirmationTests(unittest.IsolatedAsyncioTestCase):
         return markup.inline_keyboard[0]
 
     def test_shift_phrasings(self):
-        for text in ['today my shift is from 10 am to 7 pm',
+        for text in ['hello my todays shift is from 10 am to 7 pm',
+                     "hello my today's shift is from 10 am to 7 pm",
+                     'my shift today is from 10 am to 7 pm',
+                     'today my shift is from 10 am to 7 pm',
                      'my shift started at 10 am and ends at 7 pm',
                      'my shift today is 10 to 7',
                      'my shift starts at 10 am and will end at 7 pm']:
@@ -55,6 +58,49 @@ class ShiftConfirmationTests(unittest.IsolatedAsyncioTestCase):
                 parsed = DeterministicParser.parse(text)
                 self.assertEqual(parsed.intent, NLIntent.SET_SHIFT)
                 self.assertEqual((parsed.entities.shift_start, parsed.entities.shift_end), ('10:00', '19:00'))
+
+    async def test_exact_greeting_shift_request_displays_confirmation(self):
+        buttons = await self.propose('hello my todays shift is from 10 am to 7 pm')
+        self.assertEqual([b.text for b in buttons], ['Confirm', 'Cancel'])
+        self.assertEqual(self.db.active_shift(), self.original)
+
+    async def test_ai_am_pm_times_normalized_before_confirmation_and_execution(self):
+        ai = SimpleNamespace(interpret=AsyncMock(return_value=NLInterpretation(
+            intent=NLIntent.SET_SHIFT, confidence=0.96, provider='gemini',
+            entities=NLEntities(shift_start='10:00 AM', shift_end='07:00 PM'))))
+        pipeline = NaturalLanguagePipeline(self.db, ai)
+        reply, interpretation = await pipeline.process('adjust the hours I worked', self.original)
+        self.assertTrue(interpretation.needs_confirmation)
+        self.assertIn('10:00 to 19:00', reply)
+        self.assertEqual(self.db.active_shift(), self.original)
+        interpretation.needs_confirmation = False
+        interpretation.clarification_question = None
+        await pipeline.executor.execute(interpretation, self.original)
+        self.assertEqual(self.db.active_shift()['end'][11:16], '19:00')
+
+    async def test_ai_invalid_time_does_not_mutate(self):
+        interpretation = NLInterpretation(intent=NLIntent.SET_SHIFT, confidence=0.96,
+            entities=NLEntities(shift_start='25:00 AM', shift_end='7 pm'))
+        with self.assertRaisesRegex(ValueError, 'Please give valid shift times'):
+            await self.pipeline.executor.execute(interpretation, self.original)
+        self.assertEqual(self.db.active_shift(), self.original)
+
+    async def test_end_it_prepares_eod_without_closing_shift(self):
+        update = self.update('end it')
+        await handlers.save_plain_message(update, self.context, 'end it')
+        self.assertEqual(self.db.active_shift(), self.original)
+        markup = update.effective_message.reply_text.call_args.kwargs['reply_markup']
+        self.assertTrue(markup.inline_keyboard[0][0].callback_data.startswith('close:'))
+        self.assertEqual(len(self.db.history()), 1)
+
+    def test_utc_activity_is_compared_in_shift_timezone(self):
+        shift = dict(self.original, start='2026-09-09T00:15:00+05:30', end='2026-09-09T09:15:00+05:30')
+        activity = dict(id=1, category='note', detail='Work', created_at='2026-09-08T19:00:00+00:00')
+        result = ReportValidator.validate('eod', 'Work', shift, [activity], [])
+        self.assertNotIn('RECORD_OUTSIDE_SHIFT', [w.code for w in result.warnings])
+        activity['created_at'] = '2026-09-08T10:00:00+00:00'
+        result = ReportValidator.validate('eod', 'Work', shift, [activity], [])
+        self.assertIn('RECORD_OUTSIDE_SHIFT', [w.code for w in result.warnings])
 
     async def test_confirm_preserves_work_and_undo_restores_times(self):
         task = self.db.add_task('Existing work', shift_id=self.sid)

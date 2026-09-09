@@ -24,7 +24,7 @@ from telegram_import import redact
 
 logger = logging.getLogger(__name__)
 
-NL_PARSER_VERSION = 'nlp-v4.1'
+NL_PARSER_VERSION = 'nlp-v4.2'
 
 
 class NLIntent(str, Enum):
@@ -123,6 +123,23 @@ class NLInterpretation(BaseModel):
     choices: list[NLChoice] = Field(default_factory=list)
     provider: str = 'deterministic'
     model: str | None = None
+
+
+def normalize_shift_times(entities):
+    """Accept conversational AI times while preserving canonical 24-hour values."""
+    for field in ('shift_start', 'shift_end', 'shift_lunch', 'eod_reminder'):
+        value = getattr(entities, field)
+        if value is None:
+            continue
+        value = value.strip().casefold()
+        try:
+            if re.fullmatch(r'\d{1,2}:\d{2}', value):
+                normalized = datetime.strptime(value, '%H:%M').strftime('%H:%M')
+            else:
+                normalized = parse_time_token(value)
+        except ValueError:
+            raise ValueError('Please give valid shift times, such as 10 am to 7 pm or 10:00 to 19:00. No timing changes made.') from None
+        setattr(entities, field, normalized)
 
 
 def parse_time_token(token: str) -> str:
@@ -744,6 +761,8 @@ class NLActionExecutor:
     async def execute(self, interpretation: NLInterpretation, shift: dict | None) -> tuple[str, str | None]:
         intent = interpretation.intent
         entities = interpretation.entities
+        if intent == NLIntent.SET_SHIFT:
+            normalize_shift_times(entities)
         correlation_id = f'nl-{uuid.uuid4().hex[:12]}'
         tz = ZoneInfo(config.TIMEZONE)
         today_date = datetime.now(tz).date().isoformat()
@@ -1396,6 +1415,8 @@ class NaturalLanguagePipeline:
         # Bind timing proposals to persisted state; model confidence never authorizes an edit.
         interpretation.expected_shift = None
         entities = interpretation.entities
+        if interpretation.intent == NLIntent.SET_SHIFT:
+            normalize_shift_times(entities)
         current_shift = self.db.active_shift()
         today = datetime.now(ZoneInfo(config.TIMEZONE)).date().isoformat()
         if (interpretation.intent == NLIntent.SET_SHIFT and current_shift

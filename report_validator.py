@@ -293,12 +293,21 @@ class ReportValidator:
 
         # 12. Record Outside Shift (Rule 13)
         if shift_start and shift_end:
+            start_dt = datetime.fromisoformat(shift_start)
+            end_dt = datetime.fromisoformat(shift_end)
             for a in activities:
                 occurred = a.get('occurred_at') or a.get('created_at') or ''
-                if occurred and (occurred < shift_start[:10] or occurred[:10] > shift_end[:10]):
+                if not occurred:
+                    continue
+                occurred_dt = datetime.fromisoformat(occurred)
+                # Legacy timestamps without offsets are interpreted in shift-local time.
+                if occurred_dt.tzinfo is None:
+                    occurred_dt = occurred_dt.replace(tzinfo=start_dt.tzinfo)
+                local_day = occurred_dt.astimezone(start_dt.tzinfo).date() if start_dt.tzinfo else occurred_dt.date()
+                if not start_dt.date() <= local_day <= end_dt.date():
                     warnings.append(ReportWarning(
                         code='RECORD_OUTSIDE_SHIFT',
-                        message=f"Activity #{a.get('id')} occurred on {occurred[:10]}, outside the shift date window.",
+                        message=f"Activity #{a.get('id')} occurred on {local_day}, outside the shift date window.",
                         severity='info',
                         record_ref=f"activity:{a.get('id')}"
                     ))
