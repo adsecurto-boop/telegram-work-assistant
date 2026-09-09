@@ -48,6 +48,9 @@ class ShiftConfirmationTests(unittest.IsolatedAsyncioTestCase):
 
     def test_shift_phrasings(self):
         for text in ['hello my todays shift is from 10 am to 7 pm',
+                     "change the today's shift timing to 10 am to 7 pm",
+                     'change the todays shift timing to 10 am to 7 pm',
+                     'update my shift hours to 10 am to 7 pm',
                      "hello my today's shift is from 10 am to 7 pm",
                      'my shift today is from 10 am to 7 pm',
                      'today my shift is from 10 am to 7 pm',
@@ -63,6 +66,25 @@ class ShiftConfirmationTests(unittest.IsolatedAsyncioTestCase):
         buttons = await self.propose('hello my todays shift is from 10 am to 7 pm')
         self.assertEqual([b.text for b in buttons], ['Confirm', 'Cancel'])
         self.assertEqual(self.db.active_shift(), self.original)
+
+    async def test_timing_edit_wording_asks_before_changing_shift(self):
+        buttons = await self.propose("change the today's shift timing to 10 am to 7 pm")
+        self.assertEqual(self.db.active_shift(), self.original)
+        await handlers.handle_callback(self.update(callback=buttons[0].callback_data), self.context)
+        self.assertEqual(self.db.active_shift()['start'][11:16], '10:00')
+        self.assertEqual(self.db.active_shift()['end'][11:16], '19:00')
+
+    async def test_polling_conflict_is_visible_in_health(self):
+        from telegram.error import Conflict
+        self.context.error = Conflict('Another getUpdates request')
+        self.context.application.job_queue = None
+        await handlers.error_handler(None, self.context)
+        self.assertIn('last_polling_conflict', self.context.application.bot_data)
+        health = await handlers.health_text(self.context)
+        from nlp import NL_PARSER_VERSION
+        self.assertIn(NL_PARSER_VERSION, health)
+        self.assertIn(str(self.db.path.resolve()), health)
+        self.assertNotIn('none in this process', health)
 
     async def test_ai_am_pm_times_normalized_before_confirmation_and_execution(self):
         ai = SimpleNamespace(interpret=AsyncMock(return_value=NLInterpretation(
@@ -84,6 +106,62 @@ class ShiftConfirmationTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, 'Please give valid shift times'):
             await self.pipeline.executor.execute(interpretation, self.original)
         self.assertEqual(self.db.active_shift(), self.original)
+
+    async def test_shift_time_question_is_read_only(self):
+        for phrase in ('whats my shift time', "what's my shift time", 'show my shift hours'):
+            reply, parsed = await self.pipeline.process(phrase, self.original)
+            self.assertEqual(parsed.intent, NLIntent.SHOW_SHIFT)
+            self.assertIn('05:00 PM', reply)
+            self.assertIn('11:00 PM', reply)
+        self.assertEqual(self.db.active_shift(), self.original)
+        self.assertFalse(self.db.get_audit_log())
+
+    async def test_extension_confirms_and_preserves_start(self):
+        self.db.schedule(self.sid, f'{self.day}T19:00:00+05:30', None)
+        before = self.db.active_shift()
+        buttons = await self.propose('my shift has been extended to 8 pm')
+        self.assertEqual(self.db.active_shift(), before)
+        await handlers.handle_callback(self.update(callback=buttons[0].callback_data), self.context)
+        self.assertEqual(self.db.active_shift()['start'], before['start'])
+        self.assertEqual(self.db.active_shift()['end'][11:16], '20:00')
+        self.db.undo_audit_record(self.db.get_last_reversible_audit()['id'])
+        self.assertEqual(self.db.active_shift(), before)
+
+    async def test_extension_without_active_shift_does_not_invent_start(self):
+        self.db.close_shift(self.sid)
+        reply, parsed = await self.pipeline.process('my shift has been extended to 8 pm', None)
+        self.assertIn('No shift is active', reply)
+        self.assertIsNone(self.db.active_shift())
+
+    async def test_resolved_support_is_structured_and_undoable(self):
+        text = 'Resolved client query of agent not tracking for whatsapp client Vikram India Limited'
+        reply, parsed = await self.pipeline.process(text, self.original)
+        self.assertEqual(parsed.intent, NLIntent.LOG_SUPPORT)
+        activity = self.db.activities(self.sid)[0]
+        self.assertEqual(activity['client'], 'Vikram India Limited')
+        self.assertEqual(activity['channel'], 'whatsapp')
+        self.assertEqual(activity['outcome'], 'resolved')
+        self.assertEqual(activity['detail'], 'agent not tracking')
+        report = reports.generate_report('eod', self.original, self.db.activities(self.sid), [])
+        self.assertIn('Vikram India Limited', report)
+        self.db.undo_audit_record(self.db.get_last_reversible_audit()['id'])
+        self.assertFalse(self.db.activities(self.sid))
+        with self.db.connect() as conn:
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM support_interactions').fetchone()[0], 0)
+
+    async def test_testing_note_waits_for_explicit_result(self):
+        text = 'tested and reported silah agent 3.0.2 for auto check out issue for request 2028'
+        update = self.update(text)
+        await handlers.save_plain_message(update, self.context, text)
+        markup = update.effective_message.reply_text.call_args.kwargs['reply_markup']
+        buttons = [row[0] for row in markup.inline_keyboard]
+        self.assertFalse(self.db.test_sessions(self.sid))
+        self.assertEqual([b.text for b in buttons[:4]], ['Passed', 'Failed', 'Partial', 'Blocked'])
+        await handlers.handle_callback(self.update(callback=buttons[1].callback_data), self.context)
+        sessions = self.db.test_sessions(self.sid)
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(sessions[0]['scenario'], text)
+        self.assertEqual(sessions[0]['result'], 'failed')
 
     async def test_end_it_prepares_eod_without_closing_shift(self):
         update = self.update('end it')

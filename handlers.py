@@ -8,6 +8,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+from telegram.error import Conflict
 
 import config
 import reports
@@ -581,6 +582,8 @@ async def handle_callback(update, context):
                 choice = saved_interp.choices[choice_idx]
                 if choice.get('case_id'):
                     saved_interp.entities.case_id = choice['case_id']
+                if choice.get('test_result'):
+                    saved_interp.entities.test_result = choice['test_result']
         saved_interp.needs_confirmation = False
         saved_interp.clarification_question = None
         executor = NLActionExecutor(db(context))
@@ -624,6 +627,8 @@ async def health_text(context):
         'Work Assistant Health',
         f'Runtime: {NL_PARSER_VERSION}; process: {os.getpid()}',
         f'Project: {config.BASE_DIR}',
+        f'Database file: {database.path.resolve()}',
+        f'Last Telegram polling conflict: {context.application.bot_data.get("last_polling_conflict", "none in this process")}',
         f'Database schema: v{SCHEMA_VERSION}; integrity: {integrity}',
         f'Active shift: {shift["id"] if shift else "none"}',
         f'Reminder/maintenance jobs: {len(jobs)}',
@@ -1277,6 +1282,11 @@ def authorized(update):
 
 
 async def error_handler(update, context):
+    if isinstance(context.error, Conflict):
+        context.application.bot_data['last_polling_conflict'] = datetime.now(ZoneInfo(config.TIMEZONE)).isoformat()
+        logging.getLogger(__name__).error(
+            'Telegram polling Conflict: check for another runner using this bot token or a configured webhook.')
+        return
     logging.getLogger(__name__).error('Update failed (%s)', type(context.error).__name__)
     if update and authorized(update):
         await reply(update, 'The operation failed. Check /health and /activity before retrying.')

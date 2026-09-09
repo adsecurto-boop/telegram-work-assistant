@@ -709,7 +709,7 @@ class Database:
 
     def add_support(self, shift_id, detail, client=None, channel=None, outcome=None,
                     product=None, query_category=None, follow_up=None, ticket=None,
-                    query_count=1, issue_key=None):
+                    query_count=1, issue_key=None, correlation_id=None):
         with self.connect() as connection:
             activity_id = self._activity(connection, shift_id, 'support', detail, client, channel, outcome)
             client_id = self._client_id(connection, client)
@@ -718,6 +718,10 @@ class Database:
                 VALUES (?,?,?,?,?,?,?,?,?,?)''',
                 (activity_id, client_id, channel, product, query_category, outcome,
                  follow_up, ticket, query_count, issue_key))
+            if correlation_id:
+                row = connection.execute('SELECT * FROM activities WHERE id=?', (activity_id,)).fetchone()
+                self._record_audit_in_connection(connection, correlation_id, 'log_support', 'nl_engine',
+                                                 'activities', activity_id, None, dict(row))
             return activity_id
 
     def add_testing(self, shift_id, scenario, result=None, product=None, environment=None,

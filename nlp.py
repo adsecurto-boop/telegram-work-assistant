@@ -24,10 +24,12 @@ from telegram_import import redact
 
 logger = logging.getLogger(__name__)
 
-NL_PARSER_VERSION = 'nlp-v4.2'
+NL_PARSER_VERSION = 'nlp-v4.4'
 
 
 class NLIntent(str, Enum):
+    SHOW_SHIFT = 'show_shift'
+    LOG_SUPPORT = 'log_support'
     SET_SHIFT = 'set_shift'
     CREATE_TASK = 'create_task'
     UPDATE_TASK = 'update_task'
@@ -73,6 +75,7 @@ class NLEntities(BaseModel):
     task_title: str | None = None
     task_titles: list[str] = Field(default_factory=list)
     client: str | None = None
+    channel: str | None = None
     product: str | None = None
     platform: str | None = None
     ticket: str | None = None
@@ -99,6 +102,7 @@ class NLEntities(BaseModel):
 
 
 class NLChoice(BaseModel):
+    test_result: str | None = None
     label: str = ''
     case_id: int | None = None
     choice_index: int | None = None
@@ -191,7 +195,33 @@ class DeterministicParser:
         raw = text.strip()
         cleaned = re.sub(r'\s+', ' ', raw)
         lowered = cleaned.casefold()
+        # Normalize timing-edit wording before the ordinary shift-range parser.
+        lowered = re.sub(
+            r"\b(?:change|update|adjust|correct|set)\s+(?:the\s+)?(?:my\s+)?"
+            r"(?:(today(?:['’]?s)?|tomorrow(?:['’]?s)?)\s+)?shift\s+(?:timings?|hours?)\s+to\s+",
+            lambda match: 'my shift ' + ('tomorrow ' if (match.group(1) or '').startswith('tomorrow') else 'today ') + 'is ',
+            lowered)
         ref = reference_time or datetime.now(ZoneInfo(config.TIMEZONE))
+
+        if re.search(r"\b(?:what(?:['’]?s|\s+is|\s+are)?|show|tell\s+me|when)\b.*\b(?:my\s+)?shift\s+(?:time|timing|hours|start|end)", lowered):
+            return NLInterpretation(intent=NLIntent.SHOW_SHIFT, confidence=1.0,
+                                    proposed_summary='Show the current shift times.')
+        extension = re.search(r'\b(?:my\s+)?shift\s+(?:has\s+been\s+|is\s+)?extended\s+(?:to|until|till)\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b', lowered)
+        if extension:
+            try:
+                end = parse_time_token(extension.group(1))
+            except ValueError:
+                return NLInterpretation(explanation='Invalid shift end time.')
+            return NLInterpretation(intent=NLIntent.SET_SHIFT, confidence=0.95,
+                                    entities=NLEntities(shift_end=end),
+                                    proposed_summary=f'Change the active shift end to {end}')
+
+        support = re.search(r'\bresolved\s+(?:a\s+|the\s+)?client\s+query\s+(?:of|about)\s+(.+?)\s+for\s+(?:(whatsapp|email|phone|teams|chat)\s+)?client\s+(.+?)[.!]?$', raw, re.I)
+        if support:
+            return NLInterpretation(intent=NLIntent.LOG_SUPPORT, confidence=0.95,
+                entities=NLEntities(query=support.group(1).strip(), channel=(support.group(2) or '').lower() or None,
+                                    client=support.group(3).strip(), status='resolved'),
+                proposed_summary=f'Log resolved support query for {support.group(3).strip()}')
 
         # Keep report reminders out of report generation and case follow-ups.
         time_token = r'\d{1,2}(?::\d{2})?\s*(?:am|pm)?'
@@ -537,7 +567,10 @@ class DeterministicParser:
 
         # 17. Testing: e.g. "I checked it on Windows 11 and reproduced the issue"
         if re.search(r'\b(tested|testing|reproduced|checked\s+it|verified)\b', lowered):
-            res = 'passed' if 'passed' in lowered or 'working' in lowered else ('failed' if 'reproduced' in lowered or 'failed' in lowered else 'partial')
+            res = ('failed' if re.search(r'\b(?:failed|reproduced|not working)\b', lowered) else
+                   'passed' if re.search(r'\bpassed\b', lowered) else
+                   'blocked' if re.search(r'\bblocked\b', lowered) else
+                   'partial' if re.search(r'\bpartial(?:ly)?\b', lowered) else None)
             env = None
             env_match = re.search(r'\bon\s+(windows\s*\d+|mac(?:os)?|linux|android|ios|web)\b', lowered)
             if env_match:
@@ -545,6 +578,9 @@ class DeterministicParser:
             return NLInterpretation(
                 intent=NLIntent.CREATE_TEST_SESSION,
                 confidence=0.85,
+                needs_confirmation=res is None,
+                clarification_question='What was the test result? Select a result to save this testing note.' if res is None else None,
+                choices=[NLChoice(label=value.title(), test_result=value) for value in ('passed', 'failed', 'partial', 'blocked')] if res is None else [],
                 entities=NLEntities(
                     test_scenario=raw,
                     test_result=res,
@@ -694,7 +730,7 @@ class GeminiStructuredInterpreter:
         sys_inst = (
             "You are a structured natural language interpreter for a private workplace assistant bot. "
             "Analyze the text inside <untrusted_data> and output structured JSON conforming to NLInterpretation. "
-            "Allowed intents: set_shift, create_task, update_task, complete_task, carry_task_forward, "
+            "Allowed intents: set_shift, show_shift, log_support, create_task, update_task, complete_task, carry_task_forward, "
             "create_case, update_case, add_case_event, change_case_status, add_client_update, "
             "create_test_session, update_test_session, attach_evidence, add_learning, create_followup, "
             "complete_followup, snooze_followup, show_today, show_pending, show_cases, show_case_summary, "
@@ -772,6 +808,21 @@ class NLActionExecutor:
             return interpretation.clarification_question, None
 
         # 1. UNDO
+        if intent == NLIntent.SHOW_SHIFT:
+            current = self.db.active_shift()
+            if not current:
+                return 'No shift is active. Tell me your shift start and end times to start one.', None
+            start, end = (datetime.fromisoformat(current[key]).astimezone(tz) for key in ('start', 'end'))
+            return f'Your active Shift #{current["id"]}: {start:%d %b %I:%M %p} to {end:%d %b %I:%M %p} ({config.TIMEZONE}).', None
+
+        if intent == NLIntent.LOG_SUPPORT:
+            current = self.db.active_shift()
+            if not current:
+                return 'Start a shift before logging a client support query.', None
+            activity_id = self.db.add_support(current['id'], entities.query, client=entities.client,
+                channel=entities.channel, outcome=entities.status, correlation_id=correlation_id)
+            return f'Logged resolved support #{activity_id} for {entities.client}: {entities.query}. Undo: /undo', correlation_id
+
         if intent == NLIntent.UNDO_LAST_ACTION:
             last = self.db.get_last_reversible_audit()
             if not last:
@@ -865,6 +916,8 @@ class NLActionExecutor:
             # 2f. Start active shift for today
             if shift:
                 raise ValueError('Changing an active shift requires a fresh timing confirmation.')
+            if entities.shift_end and not entities.shift_start:
+                return 'No shift is active. Give both the shift start and end times first.', None
             if not entities.shift_start and entities.eod_reminder:
                 return 'No shift is active. Tell me your shift start and end times with the EOD reminder.', None
             start_str = entities.shift_start or '10:00'
@@ -1075,7 +1128,9 @@ class NLActionExecutor:
         # 11. CREATE TEST SESSION
         if intent == NLIntent.CREATE_TEST_SESSION:
             scenario = entities.test_scenario or 'Functional test'
-            res = entities.test_result or 'passed'
+            res = entities.test_result
+            if not res:
+                return 'Please specify the test result before saving the testing note.', None
             c_id = entities.case_id or self.db.get_conversation_context('owner').get('active_case_id')
             ts_id = self.db.add_test_session(
                 scenario=scenario,
@@ -1420,7 +1475,7 @@ class NaturalLanguagePipeline:
         current_shift = self.db.active_shift()
         today = datetime.now(ZoneInfo(config.TIMEZONE)).date().isoformat()
         if (interpretation.intent == NLIntent.SET_SHIFT and current_shift
-                and (entities.shift_start or entities.eod_reminder)
+                and (entities.shift_start or entities.shift_end or entities.eod_reminder)
                 and not entities.start_date and not entities.is_day_off
                 and (entities.date or today) <= today):
             interpretation.expected_shift = {key: current_shift.get(key) for key in
