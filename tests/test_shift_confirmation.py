@@ -62,6 +62,21 @@ class ShiftConfirmationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(parsed.intent, NLIntent.SET_SHIFT)
                 self.assertEqual((parsed.entities.shift_start, parsed.entities.shift_end), ('10:00', '19:00'))
 
+    async def test_understand_future_shift_with_can_be_from_wording(self):
+        text = 'my shift tomorrow can be from 12 to 9 pm'
+        parsed = DeterministicParser.parse(text)
+        tomorrow = (datetime.now(ZoneInfo(config.TIMEZONE)).date() + timedelta(days=1)).isoformat()
+        self.assertEqual(parsed.intent, NLIntent.SET_SHIFT)
+        self.assertEqual(parsed.entities.date, tomorrow)
+        self.assertEqual((parsed.entities.shift_start, parsed.entities.shift_end), ('12:00', '21:00'))
+
+        update = self.update(f'/understand {text}')
+        await handlers.handle(update, self.context)
+        output = update.effective_message.reply_text.call_args.args[0]
+        self.assertIn('Intent: set_shift', output)
+        self.assertIn('12:00', output)
+        self.assertIn('21:00', output)
+
     async def test_exact_greeting_shift_request_displays_confirmation(self):
         buttons = await self.propose('hello my todays shift is from 10 am to 7 pm')
         self.assertEqual([b.text for b in buttons], ['Confirm', 'Cancel'])

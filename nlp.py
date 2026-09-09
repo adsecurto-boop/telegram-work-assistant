@@ -379,7 +379,7 @@ class DeterministicParser:
         # or "Tomorrow I'm working 8 to 5", "shift 10:00 to 19:00"
         shift_match = re.search(
             r'(?:tomorrow\s+(?:i\'m|i\s+am)\s+working|working|(?:my\s+)?shift\s+(?:today\s+|tomorrow\s+)?'
-            r'(?:(?:is|was)\s+(?:from\s+)?|(?:started|starts|start)\s+(?:at\s+)?|from\s+)?)\s*'
+            r'(?:(?:is|was|can\s+be|could\s+be|may\s+be|might\s+be|should\s+be|will\s+be)\s+(?:from\s+)?|(?:started|starts|start)\s+(?:at\s+)?|from\s+)?)\s*'
             r'(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s*(?:to|-|and\s+(?:(?:it|my\s+shift)\s+)?(?:ends|end|ended|will\s+end)\s+(?:at\s+)?)\s*(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)'
             r'(?:.*?(?:lunch\s+(?:around|at|is)?\s*(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)))?',
             lowered
