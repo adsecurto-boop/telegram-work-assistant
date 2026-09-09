@@ -37,6 +37,8 @@ def setup_logging() -> None:
     # Quiet down noisy third-party loggers.
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("apscheduler").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("google_genai").setLevel(logging.WARNING)
 
 
 def parse_int_arg(args: List[str], index: int = 0) -> Optional[int]:

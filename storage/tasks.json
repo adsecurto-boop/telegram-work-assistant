@@ -3,10 +3,10 @@
     {
       "id": 1,
       "title": "Perform idle claim testing",
-      "status": "pending",
+      "status": "completed",
       "blocked_reason": null,
       "created_at": "2026-07-20T04:50:37+00:00",
-      "completed_at": null,
+      "completed_at": "2026-07-20T10:41:13+00:00",
       "priority": 0
     },
     {
@@ -15,24 +15,33 @@
       "status": "completed",
       "blocked_reason": null,
       "created_at": "2026-07-20T04:50:37+00:00",
-      "completed_at": "2026-07-20T04:50:37+00:00",
+      "completed_at": "2026-07-20T10:41:36+00:00",
       "priority": 0
     },
     {
       "id": 3,
       "title": "Report dev for Silah's request for cutsomization on agent auto checkout feature to be made available for enable/disable at dashboard settings",
-      "status": "pending",
+      "status": "completed",
       "blocked_reason": null,
       "created_at": "2026-07-20T05:13:13+00:00",
-      "completed_at": null,
+      "completed_at": "2026-07-20T12:47:15+00:00",
       "priority": 0
     },
     {
       "id": 4,
-      "title": "Beginning of shift To Check and Resolve queries of client in support chat in freshchat,whatsapp,teams,freshdesk. To Provide Pace client, Updated Reinstallation script to help resolve absent issue. To perform test for silah's request 2028 and generate data for testing",
+      "title": "To Check and Resolve queries of client in support chat in freshchat,whatsapp,teams,freshdesk. To assist pace client with deployment of agent via Endpoint central To check for Silah's request's status",
       "status": "pending",
       "blocked_reason": null,
-      "created_at": "2026-07-20T05:17:26+00:00",
+      "created_at": "2026-08-03T04:41:58+00:00",
+      "completed_at": null,
+      "priority": 0
+    },
+    {
+      "id": 5,
+      "title": "To attend support meeting with whatsapp client Al Tasnim Enterprise at 11:30 am",
+      "status": "pending",
+      "blocked_reason": null,
+      "created_at": "2026-08-03T04:48:43+00:00",
       "completed_at": null,
       "priority": 0
     }

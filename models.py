@@ -26,6 +26,7 @@ class TaskStatus(str, Enum):
     IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
     BLOCKED = "blocked"
+    CANCELLED = "cancelled"
 
 
 @dataclass
@@ -37,16 +38,33 @@ class Task:
     created_at: str          # ISO-8601 string
     completed_at: Optional[str]
     priority: int = 0
+    planned_shift_id: Optional[int] = None
+    due_date: Optional[str] = None
+    project: Optional[str] = None
+    client: Optional[str] = None
+    ticket: Optional[str] = None
+    next_action: Optional[str] = None
+    tags: Optional[str] = None
+    completion_note: Optional[str] = None
 
     @classmethod
     def from_row(cls, row) -> "Task":
         """Build a Task from a mapping-like object (sqlite row or dict)."""
+        data = dict(row)
         return cls(
-            id=int(row["id"]),
-            title=row.get("title") if isinstance(row, dict) else row["title"],
-            status=TaskStatus(row["status"]),
-            blocked_reason=row.get("blocked_reason") if isinstance(row, dict) else row["blocked_reason"],
-            created_at=row["created_at"],
-            completed_at=row.get("completed_at") if isinstance(row, dict) else row["completed_at"],
-            priority=int(row.get("priority", 0)) if isinstance(row, dict) else row["priority"],
+            id=int(data["id"]),
+            title=data["title"],
+            status=TaskStatus(data["status"]),
+            blocked_reason=data.get("blocked_reason"),
+            created_at=data["created_at"],
+            completed_at=data.get("completed_at"),
+            priority=int(data.get("priority", 0)),
+            planned_shift_id=data.get("planned_shift_id"),
+            due_date=data.get("due_date"),
+            project=data.get("project"),
+            client=data.get("client"),
+            ticket=data.get("ticket"),
+            next_action=data.get("next_action"),
+            tags=data.get("tags"),
+            completion_note=data.get("completion_note"),
         )

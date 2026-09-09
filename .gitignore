@@ -27,3 +27,13 @@ venv/
 
 # Logs
 *.log
+.venv/
+.venv-*/
+*.sqlite3
+*.sqlite3-*
+*.bak
+storage/backups/
+storage/evidence/
+storage/exports/
+!.env.example
+storage/*.lock
