@@ -1,0 +1,168 @@
+"""Regressions for mid-shift corrections and report reminders."""
+import tempfile
+import unittest
+from datetime import datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+from zoneinfo import ZoneInfo
+
+import config
+import handlers
+import reports
+import scheduler
+from database import Database, SCHEMA_VERSION
+from nlp import DeterministicParser, NaturalLanguagePipeline, NLIntent
+from report_validator import ReportValidator
+
+
+class ShiftConfirmationTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.db = Database(Path(tmp.name) / 'work.sqlite3')
+        self.day = datetime.now(ZoneInfo(config.TIMEZONE)).date().isoformat()
+        self.sid = self.db.start_shift(f'{self.day}T17:00:00+05:30',
+                                       f'{self.day}T23:00:00+05:30')
+        self.original = self.db.active_shift()
+        self.pipeline = NaturalLanguagePipeline(self.db)
+        self.context = SimpleNamespace(application=SimpleNamespace(bot_data={'db': self.db}),
+                                       bot=SimpleNamespace(send_message=AsyncMock()))
+        for name, value in [('OWNER_ID', 123), ('AI_KEY', '')]:
+            p = patch.object(config, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def update(self, text='', callback=None):
+        msg = SimpleNamespace(text=text, reply_text=AsyncMock())
+        return SimpleNamespace(effective_user=SimpleNamespace(id=123),
+            effective_chat=SimpleNamespace(id=123, type='private'), update_id=101,
+            effective_message=msg, callback_query=SimpleNamespace(
+                data=callback, answer=AsyncMock(), message=msg) if callback else None)
+
+    async def propose(self, text):
+        update = self.update(text)
+        await handlers.save_plain_message(update, self.context, text)
+        markup = update.effective_message.reply_text.call_args.kwargs['reply_markup']
+        return markup.inline_keyboard[0]
+
+    def test_shift_phrasings(self):
+        for text in ['today my shift is from 10 am to 7 pm',
+                     'my shift started at 10 am and ends at 7 pm',
+                     'my shift today is 10 to 7',
+                     'my shift starts at 10 am and will end at 7 pm']:
+            with self.subTest(text=text):
+                parsed = DeterministicParser.parse(text)
+                self.assertEqual(parsed.intent, NLIntent.SET_SHIFT)
+                self.assertEqual((parsed.entities.shift_start, parsed.entities.shift_end), ('10:00', '19:00'))
+
+    async def test_confirm_preserves_work_and_undo_restores_times(self):
+        task = self.db.add_task('Existing work', shift_id=self.sid)
+        buttons = await self.propose('my shift started at 10 am and ends at 7 pm')
+        self.assertEqual(self.db.active_shift(), self.original)
+        self.assertEqual([b.text for b in buttons], ['Confirm', 'Cancel'])
+        await handlers.handle_callback(self.update(callback=buttons[0].callback_data), self.context)
+        changed = self.db.active_shift()
+        self.assertEqual(changed['id'], self.sid)
+        self.assertEqual(changed['start'][11:16], '10:00')
+        self.assertEqual(changed['end'][11:16], '19:00')
+        self.assertEqual(self.db.get_task(task.id).planned_shift_id, self.sid)
+        await handlers.handle_callback(self.update(callback=buttons[0].callback_data), self.context)
+        self.assertEqual(len(self.db.get_audit_log()), 1)
+        self.db.undo_audit_record(self.db.get_last_reversible_audit()['id'])
+        self.assertEqual(self.db.active_shift(), self.original)
+
+    async def test_cancel_keeps_schedule(self):
+        buttons = await self.propose('my shift is from 10 am to 7 pm')
+        await handlers.handle_callback(self.update(callback=buttons[1].callback_data), self.context)
+        self.assertEqual(self.db.active_shift(), self.original)
+        self.assertFalse(self.db.get_audit_log())
+
+    async def test_same_times_still_require_reconfirmation(self):
+        reply, parsed = await self.pipeline.process('my shift is 5 pm to 11 pm', self.original)
+        self.assertTrue(parsed.needs_confirmation)
+        self.assertIn('reconfirm', reply)
+        self.assertEqual(self.db.active_shift(), self.original)
+
+    async def test_stale_confirmation_is_rejected(self):
+        buttons = await self.propose('my shift is from 10 am to 7 pm')
+        self.db.schedule(self.sid, f'{self.day}T22:00:00+05:30', None)
+        with self.assertRaisesRegex(ValueError, 'changed since'):
+            await handlers.handle_callback(self.update(callback=buttons[0].callback_data), self.context)
+        self.assertEqual(self.db.active_shift()['end'][11:16], '22:00')
+
+    async def test_closed_shift_proposal_cannot_change_replacement(self):
+        buttons = await self.propose('my shift is from 10 am to 7 pm')
+        self.db.close_shift(self.sid)
+        self.db.start_shift(f'{self.day}T18:00:00+05:30', f'{self.day}T23:00:00+05:30')
+        replacement = self.db.active_shift()
+        with self.assertRaisesRegex(ValueError, 'active shift changed'):
+            await handlers.handle_callback(self.update(callback=buttons[0].callback_data), self.context)
+        self.assertEqual(self.db.active_shift(), replacement)
+
+    async def test_combined_shift_reminder_is_atomic_and_undoable(self):
+        buttons = await self.propose('today my shift is from 10 am to 8 pm, remind me for eod at 7 pm')
+        self.assertEqual(self.db.active_shift(), self.original)
+        await handlers.handle_callback(self.update(callback=buttons[0].callback_data), self.context)
+        changed = self.db.active_shift()
+        self.assertEqual(changed['end'][11:16], '20:00')
+        self.assertEqual(changed['eod_reminder'][11:16], '19:00')
+        self.assertFalse(self.db.list_followups())
+        with self.db.connect() as conn:
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM work_cases').fetchone()[0], 0)
+        self.db.undo_audit_record(self.db.get_last_reversible_audit()['id'])
+        self.assertEqual(self.db.active_shift(), self.original)
+
+    async def test_out_of_shift_reminder_does_not_partially_change_shift(self):
+        buttons = await self.propose('my shift is 10 am to 7 pm, remind me for eod at 9 pm')
+        with self.assertRaisesRegex(ValueError, 'within the shift'):
+            await handlers.handle_callback(self.update(callback=buttons[0].callback_data), self.context)
+        self.assertEqual(self.db.active_shift(), self.original)
+
+    async def test_combined_request_starts_shift_without_case(self):
+        self.db.close_shift(self.sid)
+        reply, parsed = await self.pipeline.process(
+            'today my shift is from 10 am to 8 pm, remind me for eod at 7 pm', None)
+        self.assertEqual(parsed.intent, NLIntent.SET_SHIFT)
+        self.assertIn('EOD reminder 19:00', reply)
+        self.assertEqual(self.db.active_shift()['eod_reminder'][11:16], '19:00')
+        self.assertFalse(self.db.list_followups())
+
+    async def test_overnight_confirmation_keeps_shift_date(self):
+        buttons = await self.propose('my shift is 10 pm to 7 am')
+        await handlers.handle_callback(self.update(callback=buttons[0].callback_data), self.context)
+        shift = self.db.active_shift()
+        self.assertEqual(shift['start'][:10], self.day)
+        self.assertEqual(datetime.fromisoformat(shift['end']) - datetime.fromisoformat(shift['start']),
+                         timedelta(hours=9))
+
+    async def test_reminder_uses_custom_time_and_delivers_once(self):
+        buttons = await self.propose('my shift is 10 am to 8 pm, remind me for eod at 7 pm')
+        await handlers.handle_callback(self.update(callback=buttons[0].callback_data), self.context)
+        self.db.record_delivery(self.sid, 'tod')
+        with patch.object(scheduler, 'datetime', wraps=datetime) as clock, patch.object(config, 'REMINDERS_ENABLED', True):
+            clock.now.return_value = datetime.fromisoformat(f'{self.day}T18:59:00+05:30')
+            await scheduler.tick(self.context)
+            self.context.bot.send_message.assert_not_awaited()
+            clock.now.return_value = datetime.fromisoformat(f'{self.day}T19:00:00+05:30')
+            await scheduler.tick(self.context)
+            self.assertIn('/eod', self.context.bot.send_message.call_args.kwargs['text'])
+            await scheduler.tick(self.context)
+            self.context.bot.send_message.assert_awaited_once()
+
+    def test_empty_report_does_not_claim_testing(self):
+        text = reports.generate_report('eod', self.original, [], [])
+        result = ReportValidator.validate('eod', text, self.original, [], [])
+        self.assertNotIn('UNVERIFIED_TEST_CLAIM', [w.code for w in result.warnings])
+        result = ReportValidator.validate('eod', 'Testing done. Reproduced the bug.', self.original, [], [])
+        self.assertIn('UNVERIFIED_TEST_CLAIM', [w.code for w in result.warnings])
+
+    def test_v5_upgrade_preserves_shift_and_creates_backup(self):
+        with self.db.connect() as conn:
+            conn.execute('ALTER TABLE shifts DROP COLUMN eod_reminder')
+            conn.execute('PRAGMA user_version=5')
+        upgraded = Database(self.db.path)
+        self.assertEqual(upgraded.active_shift(), self.original)
+        self.assertTrue(list((self.db.path.parent / 'backups').glob('pre-migration-v5-*.sqlite3')))
+        with upgraded.connect() as conn:
+            self.assertEqual(conn.execute('PRAGMA user_version').fetchone()[0], SCHEMA_VERSION)

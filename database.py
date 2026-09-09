@@ -10,7 +10,7 @@ from pathlib import Path
 from models import Task, TaskStatus
 import config
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 _last_iso_time = 0.0
@@ -363,6 +363,7 @@ class Database:
 
     def _ensure_columns(self, connection):
         additions = {
+            'shifts': {'eod_reminder': 'TEXT'},
             'tasks': {
                 'planned_shift_id': 'INTEGER', 'due_date': 'TEXT', 'project': 'TEXT',
                 'client': 'TEXT', 'ticket': 'TEXT', 'next_action': 'TEXT',
@@ -511,17 +512,39 @@ class Database:
             return [dict(row) for row in connection.execute(
                 'SELECT * FROM shifts WHERE start>=? ORDER BY start', (start_iso,))]
 
-    def start_shift(self, start, end, lunch=None, correlation_id=None, actor='system'):
+    def start_shift(self, start, end, lunch=None, correlation_id=None, actor='system', eod_reminder=None):
         with self.connect() as connection:
             if connection.execute('SELECT 1 FROM shifts WHERE closed_at IS NULL').fetchone():
                 raise ValueError('A shift is already active. End it before starting another.')
-            shift_id = connection.execute('INSERT INTO shifts(start,end,lunch) VALUES (?,?,?)',
-                                          (start, end, lunch)).lastrowid
+            shift_id = connection.execute('INSERT INTO shifts(start,end,lunch,eod_reminder) VALUES (?,?,?,?)',
+                                          (start, end, lunch, eod_reminder)).lastrowid
             if correlation_id:
                 self._record_audit_in_connection(
                     connection, correlation_id, 'start_shift', actor, 'shifts', shift_id,
-                    None, {'start': start, 'end': end, 'lunch': lunch})
+                    None, {'start': start, 'end': end, 'lunch': lunch, 'eod_reminder': eod_reminder})
             return shift_id
+
+    def revise_shift(self, expected, start, end, lunch, eod_reminder, correlation_id):
+        """Apply confirmed timing changes only to the unchanged active shift."""
+        from shifts import validate_schedule
+        start_dt, end_dt = datetime.fromisoformat(start), datetime.fromisoformat(end)
+        validate_schedule(start_dt, end_dt, datetime.fromisoformat(lunch) if lunch else None)
+        if not start_dt < end_dt or (lunch and not start_dt < datetime.fromisoformat(lunch) < end_dt):
+            raise ValueError('The proposed times conflict with the existing schedule. Include a lunch time within the new shift.')
+        if eod_reminder and not start_dt <= datetime.fromisoformat(eod_reminder) <= end_dt:
+            raise ValueError('EOD reminder must fall within the shift.')
+        fields = ('id', 'start', 'end', 'lunch', 'eod_reminder', 'closed_at')
+        with self.connect() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            row = connection.execute('SELECT * FROM shifts WHERE id=?', (expected['id'],)).fetchone()
+            if not row or row['closed_at'] or any(row[key] != expected.get(key) for key in fields):
+                raise ValueError('The shift changed since this proposal. Please send the timing request again.')
+            before = {key: row[key] for key in fields if key != 'id'}
+            after = dict(start=start, end=end, lunch=lunch, eod_reminder=eod_reminder, closed_at=None)
+            connection.execute('UPDATE shifts SET start=?,end=?,lunch=?,eod_reminder=? WHERE id=?',
+                               (start, end, lunch, eod_reminder, expected['id']))
+            self._record_audit_in_connection(connection, correlation_id, 'revise_shift', 'nl_engine',
+                                             'shifts', expected['id'], before, after)
 
     def schedule(self, shift_id, end, lunch, correlation_id=None, actor='system'):
         with self.connect() as connection:

@@ -13,7 +13,7 @@ async def tick(context):
         return
     current = datetime.now(timezone.utc)
     due = []
-    for kind,stamp in [('tod',shift['start']),('pl',shift['lunch']),('eod',shift['end'])]:
+    for kind,stamp in [('tod',shift['start']),('pl',shift['lunch']),('eod',shift.get('eod_reminder') or shift['end'])]:
         if stamp and datetime.fromisoformat(stamp) <= current and not await asyncio.to_thread(db.delivered,shift['id'],kind):
             due.append(kind)
     followups = await asyncio.to_thread(

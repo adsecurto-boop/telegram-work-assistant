@@ -248,10 +248,10 @@ async def save_plain_message(update, context, text):
     if interp.needs_confirmation or (0.6 <= interp.confidence < 0.85):
         prop_id = None
         with database.connect() as conn:
-            r = conn.execute("SELECT applied_ops_json FROM nl_interactions WHERE source_update_id=? ORDER BY id DESC LIMIT 1", (update.update_id,)).fetchone()
-            if r and r['applied_ops_json']:
+            r = conn.execute("SELECT applied_operations_json FROM nl_interactions WHERE source_update_id=? ORDER BY id DESC LIMIT 1", (update.update_id,)).fetchone()
+            if r and r['applied_operations_json']:
                 try:
-                    ops = json.loads(r['applied_ops_json'])
+                    ops = json.loads(r['applied_operations_json'])
                     prop_id = ops.get('proposal_id')
                 except Exception:
                     pass

@@ -24,7 +24,7 @@ from telegram_import import redact
 
 logger = logging.getLogger(__name__)
 
-NL_PARSER_VERSION = 'nlp-v4.0'
+NL_PARSER_VERSION = 'nlp-v4.1'
 
 
 class NLIntent(str, Enum):
@@ -67,6 +67,7 @@ class NLEntities(BaseModel):
     shift_start: str | None = None
     shift_end: str | None = None
     shift_lunch: str | None = None
+    eod_reminder: str | None = None
     is_day_off: bool = False
     template_name: str | None = None
     task_title: str | None = None
@@ -117,6 +118,7 @@ class NLInterpretation(BaseModel):
     explanation: str = ''
     proposed_summary: str = ''
     needs_confirmation: bool = False
+    expected_shift: dict | None = None
     clarification_question: str | None = None
     choices: list[NLChoice] = Field(default_factory=list)
     provider: str = 'deterministic'
@@ -173,6 +175,26 @@ class DeterministicParser:
         cleaned = re.sub(r'\s+', ' ', raw)
         lowered = cleaned.casefold()
         ref = reference_time or datetime.now(ZoneInfo(config.TIMEZONE))
+
+        # Keep report reminders out of report generation and case follow-ups.
+        time_token = r'\d{1,2}(?::\d{2})?\s*(?:am|pm)?'
+        reminder_match = re.search(
+            rf'\bremind\s+me\s+(?:(?:for|about|to\s+(?:generate|prepare))\s+)?'
+            rf'(?:eod|end\s+of\s+day)\s+(?:today\s+)?at\s+({time_token})\b', lowered)
+        if reminder_match:
+            remaining = (lowered[:reminder_match.start()] + lowered[reminder_match.end():]).strip(' ,.')
+            remaining = re.sub(r'\s+and$', '', remaining)
+            base = DeterministicParser.parse(remaining, ref) if remaining else NLInterpretation(
+                intent=NLIntent.SET_SHIFT, confidence=0.95,
+                entities=NLEntities(date=ref.date().isoformat()))
+            if not base or base.intent != NLIntent.SET_SHIFT:
+                return NLInterpretation(explanation='Please state shift times and the EOD reminder clearly.')
+            try:
+                base.entities.eod_reminder = parse_time_token(reminder_match.group(1))
+            except ValueError:
+                return NLInterpretation(explanation='Invalid EOD reminder time.')
+            base.proposed_summary += f'; remind me for EOD at {base.entities.eod_reminder}'
+            return base
 
         # 1. Undo command or request
         if lowered in ('undo', 'undo that', 'undo last', 'undo last action', '/undo', 'revert'):
@@ -290,8 +312,9 @@ class DeterministicParser:
         # 6. Shift setting: e.g. "My shift today is 10 to 7 and I'll take lunch around 2"
         # or "Tomorrow I'm working 8 to 5", "shift 10:00 to 19:00"
         shift_match = re.search(
-            r'(?:(?:tomorrow\s+(?:i\'m|i\s+am)\s+working|working|my\s+shift\s+(?:today\s+|tomorrow\s+)?is\s+|shift\s+(?:is\s+)?))\s*'
-            r'(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s*(?:to|-)\s*(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)'
+            r'(?:tomorrow\s+(?:i\'m|i\s+am)\s+working|working|(?:my\s+)?shift\s+(?:today\s+|tomorrow\s+)?'
+            r'(?:(?:is|was)\s+(?:from\s+)?|(?:started|starts|start)\s+(?:at\s+)?|from\s+)?)\s*'
+            r'(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s*(?:to|-|and\s+(?:(?:it|my\s+shift)\s+)?(?:ends|end|ended|will\s+end)\s+(?:at\s+)?)\s*(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)'
             r'(?:.*?(?:lunch\s+(?:around|at|is)?\s*(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)))?',
             lowered
         )
@@ -742,6 +765,26 @@ class NLActionExecutor:
 
         # 2. SET SHIFT (Flexible daily shifts, future scheduling, day-offs, ranges)
         if intent == NLIntent.SET_SHIFT:
+            if interpretation.expected_shift:
+                expected = interpretation.expected_shift
+                if not shift or shift['id'] != expected['id']:
+                    raise ValueError('The active shift changed. Please send the timing request again.')
+                start = datetime.fromisoformat(expected['start']).astimezone(tz)
+                if entities.shift_start:
+                    hour, minute = map(int, entities.shift_start.split(':'))
+                    start = start.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                end = clock_on_shift(entities.shift_end, start) if entities.shift_end else datetime.fromisoformat(expected['end'])
+                lunch = (clock_on_shift(entities.shift_lunch, start).isoformat()
+                         if entities.shift_lunch else expected.get('lunch'))
+                reminder = (clock_on_shift(entities.eod_reminder, start).isoformat()
+                            if entities.eod_reminder else expected.get('eod_reminder'))
+                self.db.revise_shift(expected, start.isoformat(), end.isoformat(), lunch, reminder, correlation_id)
+                return (f'Shift #{shift["id"]} timing confirmed: {start:%d %b %H:%M} to {end:%d %b %H:%M}.'
+                        + (f' EOD reminder: {datetime.fromisoformat(reminder):%d %b %H:%M}.' if reminder else '')
+                        + ' Existing work preserved. Undo: /undo', correlation_id)
+
+            if entities.eod_reminder and (entities.date or today_date) > today_date:
+                return 'EOD reminders can currently be set for an active shift or a shift starting today. No changes made.', None
             # 2a. Calendar preview requested
             if entities.notes == 'preview_calendar':
                 preview = preview_calendar_week(self.db, days=7)
@@ -801,19 +844,26 @@ class NLActionExecutor:
                 return f'Lunch time updated to {entities.shift_lunch} on active Shift #{shift["id"]}. Undo: /undo', correlation_id
 
             # 2f. Start active shift for today
+            if shift:
+                raise ValueError('Changing an active shift requires a fresh timing confirmation.')
+            if not entities.shift_start and entities.eod_reminder:
+                return 'No shift is active. Tell me your shift start and end times with the EOD reminder.', None
             start_str = entities.shift_start or '10:00'
             end_str = entities.shift_end or '19:00'
             start_dt, end_dt = new_shift(config.TIMEZONE, start_str, end_str)
             lunch_dt = clock_on_shift(entities.shift_lunch, start_dt) if entities.shift_lunch else None
             validate_schedule(start_dt, end_dt, lunch_dt)
+            reminder_dt = clock_on_shift(entities.eod_reminder, start_dt) if entities.eod_reminder else None
+            if reminder_dt and not start_dt <= reminder_dt <= end_dt:
+                raise ValueError('EOD reminder must fall within the shift.')
             sid = self.db.start_shift(start_dt.isoformat(), end_dt.isoformat(),
+                                      lunch=lunch_dt.isoformat() if lunch_dt else None,
+                                      eod_reminder=reminder_dt.isoformat() if reminder_dt else None,
                                       correlation_id=correlation_id, actor='nl_engine')
-            if lunch_dt:
-                self.db.schedule(sid, end_dt.isoformat(), lunch_dt.isoformat(),
-                                 correlation_id=correlation_id, actor='nl_engine')
             return (
                 f'Shift #{sid} started: {start_dt:%d %b %H:%M} to {end_dt:%d %b %H:%M}'
-                + (f' (lunch {lunch_dt:%H:%M})' if lunch_dt else '') + '. Undo: /undo',
+                + (f' (lunch {lunch_dt:%H:%M})' if lunch_dt else '')
+                + (f' (EOD reminder {reminder_dt:%H:%M})' if reminder_dt else '') + '. Undo: /undo',
                 correlation_id
             )
 
@@ -1342,6 +1392,28 @@ class NaturalLanguagePipeline:
                 '• Or use slash commands like /task, /case, /help.',
                 interpretation
             )
+
+        # Bind timing proposals to persisted state; model confidence never authorizes an edit.
+        interpretation.expected_shift = None
+        entities = interpretation.entities
+        current_shift = self.db.active_shift()
+        today = datetime.now(ZoneInfo(config.TIMEZONE)).date().isoformat()
+        if (interpretation.intent == NLIntent.SET_SHIFT and current_shift
+                and (entities.shift_start or entities.eod_reminder)
+                and not entities.start_date and not entities.is_day_off
+                and (entities.date or today) <= today):
+            interpretation.expected_shift = {key: current_shift.get(key) for key in
+                ('id', 'start', 'end', 'lunch', 'eod_reminder', 'closed_at')}
+            interpretation.needs_confirmation = True
+            start = datetime.fromisoformat(current_shift['start']).astimezone(ZoneInfo(config.TIMEZONE))
+            end = datetime.fromisoformat(current_shift['end']).astimezone(ZoneInfo(config.TIMEZONE))
+            interpretation.clarification_question = (
+                f'Your active Shift #{current_shift["id"]} is {start:%d %b %H:%M} to {end:%d %b %H:%M}. '
+                f'Confirm timing for the shift starting {start:%d %b}: '
+                f'{entities.shift_start or start.strftime("%H:%M")} to {entities.shift_end or end.strftime("%H:%M")}'
+                + (f', lunch {entities.shift_lunch}' if entities.shift_lunch else '')
+                + (f', EOD reminder {entities.eod_reminder}' if entities.eod_reminder else '')
+                + '? Confirm to apply or reconfirm these times; Cancel to keep the current schedule. Your logged work stays attached.')
 
         # 5. Medium confidence (0.6 <= conf < 0.85) or needs confirmation -> Store proposal, no direct mutation!
         if interpretation.needs_confirmation or (0.6 <= interpretation.confidence < 0.85):

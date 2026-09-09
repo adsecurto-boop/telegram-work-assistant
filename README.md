@@ -120,6 +120,10 @@ You can interact with the bot in plain conversational English. The system uses a
   - `"Undo"` or `"Undo last action"`
 
 ### Confidence Policy & Proposals
+Active-shift timing corrections always require **Confirm** or **Cancel**, even when the wording is clear. For example, "My shift started at 10 am and ends at 7 pm" shows the current and proposed times before changing the existing shift. Confirming keeps logged work attached to the same shift; `/undo` restores the previous times. If the shift changes or closes before confirmation, send a fresh request.
+
+You can combine today's shift hours with an EOD reminder: "Today my shift is from 10 am to 8 pm, remind me for EOD at 7 pm." This sets a shift reminder without creating a case or case follow-up. Custom EOD reminders must fall within the shift; future-calendar EOD reminders are not yet supported. Reminders already delivered for that shift are not sent again after a timing correction.
+
 1. **High Confidence (>= 0.80)**: Low-risk operations execute immediately with an audit record and a 1-click `/undo` button.
 2. **Medium Confidence (0.60 – 0.79)**: A proposal is stored in `nl_proposals`. The bot explains the proposed action and presents **Confirm** / **Cancel** or choice buttons. The target record is **not mutated** until you tap Confirm. Proposals expire after 15 minutes, are bound to your user ID, and cannot be replayed.
 3. **Low Confidence (< 0.60)**: No mutations occur. The bot asks for clarification or shows likely options.
@@ -280,7 +284,7 @@ The complete test suite runs against temporary databases using mocked Telegram a
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-The suite contains 104 unit and integration tests, including production-path regressions for:
+The suite contains 117 unit and integration tests, including production-path regressions for:
 - **Telegram Handlers**: Plain natural language, voice routing, `/understand`, `/undo`, and callbacks.
 - **Undo & Cascades**: Multi-task correlation undo, compound test sessions, standalone follow-ups, cluster acceptance undo, and atomic rollback on tamper.
 - **Shift Engine**: Schedule validation, invalid time rejection (`99:80`), future shifts, day-off overrides, template range weekday enforcement, and cross-midnight shifts.
@@ -290,6 +294,7 @@ The suite contains 104 unit and integration tests, including production-path reg
 - **Report Validation**: Shift scoping, duplicate client warnings, hallucinated ticket/client detection, and task status consistency.
 - **AI Privacy & Reliability**: Sensitive data redaction, client masking, untrusted data boundaries, quota tracking, exponential backoff, and AI-disabled fallbacks.
 - **Database Migrations**: Transactional v4-to-v5 migration and automatic rollback on injected failure.
+- **Shift Corrections**: Telegram confirmation/cancellation, stale and repeated confirmations, preserved work, undo, overnight times, custom EOD reminders, and backup-first v5-to-v6 migration.
 
 ---
 

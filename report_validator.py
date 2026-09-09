@@ -240,7 +240,10 @@ class ReportValidator:
                 ))
 
         # 8. Testing Conclusions without Test Records (Rule 9)
-        claims_testing = bool(re.search(r'\b(?:tested|testing|test\s+session|reproduced)\b', lowered_report))
+        # A section heading alone is not a claim that testing happened.
+        claim_text = '\n'.join(line for line in lowered_report.splitlines()
+                               if line.strip().strip('#*: ') != 'testing')
+        claims_testing = bool(re.search(r'\b(?:tested|testing|test\s+session|reproduced)\b', claim_text))
         has_records = bool(test_sessions) or any(a.get('category') == 'testing' for a in activities)
         if claims_testing and not has_records:
             warnings.append(ReportWarning(
