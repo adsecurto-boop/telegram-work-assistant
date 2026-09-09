@@ -7,7 +7,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import config
 from database import SCHEMA_VERSION
 
-connection = sqlite3.connect(f'file:{Path(config.DB_PATH).resolve().as_posix()}?mode=ro', uri=True)
+path = Path(config.DB_PATH).resolve()
+if not path.is_file():
+    raise SystemExit(
+        f'Database file not found: {path}\n'
+        'Start the bot once to initialize the database and migrate legacy tasks.json data, '
+        'then rerun this check. If you already have a database, check SQLITE_PATH in .env.'
+    )
+try:
+    connection = sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)
+except sqlite3.OperationalError as exc:
+    raise SystemExit(f'Cannot open database: {path}\n{exc}') from None
 try:
     version = connection.execute('PRAGMA user_version').fetchone()[0]
     integrity = connection.execute('PRAGMA integrity_check').fetchone()[0]
