@@ -41,6 +41,8 @@ async def startup(application):
         BotCommand('shift','Start a flexible shift'), BotCommand('task','Plan a rich task'),
         BotCommand('todo','Show open tasks'), BotCommand('today','Show this shift plans'),
         BotCommand('undo','Undo last mutation safely'), BotCommand('understand','Preview NL intent'),
+        BotCommand('unknowns','Review low-confidence messages'), BotCommand('correct','Save an NLP correction'),
+        BotCommand('nlstats','Natural-language recognition stats'),
         BotCommand('casesummary','Factual case summary'), BotCommand('nextaction','Recommended action'),
         BotCommand('draftclient','Draft client reply'), BotCommand('draftescalation','Draft technical escalation'),
         BotCommand('analyzetest','Analyze testing findings'), BotCommand('shiftcalendar','7-day rotational shift'),

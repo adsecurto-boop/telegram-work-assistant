@@ -10,7 +10,7 @@ from pathlib import Path
 from models import Task, TaskStatus
 import config
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 _last_iso_time = 0.0
@@ -334,6 +334,16 @@ class Database:
                 warnings_json TEXT NOT NULL,
                 metrics_json TEXT NOT NULL,
                 created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS nl_corrections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                interaction_id INTEGER REFERENCES nl_interactions(id) ON DELETE SET NULL,
+                original_intent TEXT NOT NULL,
+                corrected_intent TEXT NOT NULL,
+                corrected_entities_json TEXT,
+                owner_id INTEGER NOT NULL,
+                parser_version TEXT NOT NULL DEFAULT 'v2',
+                notes TEXT,
+                created_at TEXT NOT NULL);
         ''')
 
     def _create_indexes(self, connection):
@@ -359,6 +369,8 @@ class Database:
             CREATE INDEX IF NOT EXISTS report_provenance_report_index ON report_provenance(report_id, section_name);
             CREATE INDEX IF NOT EXISTS nl_proposals_status_idx ON nl_proposals(status, expires_at);
             CREATE INDEX IF NOT EXISTS report_validations_report_idx ON report_validations(report_id);
+            CREATE INDEX IF NOT EXISTS nl_corrections_interaction_idx ON nl_corrections(interaction_id);
+            CREATE INDEX IF NOT EXISTS nl_corrections_intent_idx ON nl_corrections(corrected_intent, created_at);
         ''')
 
     def _ensure_columns(self, connection):
@@ -386,6 +398,9 @@ class Database:
                 'fingerprint': 'TEXT'},
             'shift_calendar': {
                 'is_explicit_override': 'INTEGER NOT NULL DEFAULT 1'},
+            'nl_interactions': {
+                'reason_codes_json': 'TEXT',
+                'normalized_text': 'TEXT'},
         }
         for table, columns in additions.items():
             current = {row['name'] for row in connection.execute(f'PRAGMA table_info({table})')}
@@ -434,7 +449,8 @@ class Database:
             'followups', 'nl_interactions', 'conversation_context', 'audit_log',
             'client_aliases', 'history_clusters', 'cluster_items',
             'bulk_operations', 'shift_templates', 'shift_calendar',
-            'report_provenance', 'nl_proposals', 'report_validations'
+            'report_provenance', 'nl_proposals', 'report_validations',
+            'nl_corrections'
         }
         rows = cursor.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         existing = {r['name'] if isinstance(r, sqlite3.Row) else r[0] for r in rows}
@@ -2223,15 +2239,16 @@ class Database:
     # --- Phase 4: Natural Language Interactions ---
 
     def record_nl_interaction(self, raw_text, intent, entities=None, confidence=0.0, proposed_ops=None,
-                              applied_ops=None, provider=None, model=None, parser_version='v1',
-                              status='processed', clarification=None, error_details=None, source_update_id=None):
+                              applied_ops=None, provider=None, model=None, parser_version='v2',
+                              status='processed', clarification=None, error_details=None, source_update_id=None,
+                              reason_codes=None, normalized_text=None):
         now = now_iso()
         with self.connect() as connection:
             cur = connection.execute('''INSERT INTO nl_interactions
                 (source_update_id, raw_text, intent, entities_json, confidence, proposed_operations_json,
                  applied_operations_json, provider, model, parser_version, status, clarification_json,
-                 error_details, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                 error_details, reason_codes_json, normalized_text, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                 (source_update_id, raw_text, intent,
                  json.dumps(entities) if entities else None,
                  confidence,
@@ -2239,13 +2256,158 @@ class Database:
                  json.dumps(applied_ops) if applied_ops else None,
                  provider, model, parser_version, status,
                  json.dumps(clarification) if clarification else None,
-                 error_details, now, now))
+                 error_details,
+                 json.dumps(reason_codes) if reason_codes else None,
+                 normalized_text,
+                 now, now))
             return cur.lastrowid
 
     def get_nl_interactions(self, limit=50):
         with self.connect() as connection:
             rows = connection.execute('SELECT * FROM nl_interactions ORDER BY id DESC LIMIT ?', (limit,)).fetchall()
             return [dict(r) for r in rows]
+
+    def get_nl_interaction(self, interaction_id: int) -> dict | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                'SELECT * FROM nl_interactions WHERE id=?', (interaction_id,)).fetchone()
+            return dict(row) if row else None
+
+    def add_nl_correction(self, original_intent: str, corrected_intent: str,
+                          interaction_id: int = None, corrected_entities: dict = None,
+                          owner_id: int = None, notes: str = None,
+                          parser_version: str = 'v2') -> int:
+        now = now_iso()
+        oid = int(owner_id) if (owner_id is not None and str(owner_id).isdigit()) else (config.OWNER_ID or 1)
+        entities_json = json.dumps(corrected_entities) if corrected_entities else None
+        with self.connect() as connection:
+            cur = connection.execute('''INSERT INTO nl_corrections
+                (interaction_id, original_intent, corrected_intent, corrected_entities_json,
+                 owner_id, parser_version, notes, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                (interaction_id, original_intent, corrected_intent, entities_json,
+                 oid, parser_version, notes, now))
+            corr_id = cur.lastrowid
+
+        self.record_audit(
+            correlation_id=f"corr_{corr_id}",
+            operation_type="create_nl_correction",
+            actor=str(oid),
+            affected_table="nl_corrections",
+            record_id=corr_id,
+            before_state_json=None,
+            after_state_json=json.dumps({
+                'id': corr_id,
+                'interaction_id': interaction_id,
+                'original_intent': original_intent,
+                'corrected_intent': corrected_intent,
+                'corrected_entities': corrected_entities,
+                'notes': notes,
+            }),
+            reversibility='non_reversible'
+        )
+        return corr_id
+
+    def get_recent_unknown_interactions(self, limit: int = 10, max_confidence: float = 0.80) -> list[dict]:
+        with self.connect() as connection:
+            rows = connection.execute('''
+                SELECT * FROM nl_interactions
+                WHERE intent = 'unknown' OR confidence < ?
+                ORDER BY id DESC LIMIT ?
+            ''', (max_confidence, limit)).fetchall()
+            results = []
+            for r in rows:
+                d = dict(r)
+                if d.get('entities_json'):
+                    try:
+                        d['entities'] = json.loads(d['entities_json'])
+                    except Exception:
+                        d['entities'] = {}
+                else:
+                    d['entities'] = {}
+                if d.get('reason_codes_json'):
+                    try:
+                        d['reason_codes'] = json.loads(d['reason_codes_json'])
+                    except Exception:
+                        d['reason_codes'] = []
+                else:
+                    d['reason_codes'] = []
+                results.append(d)
+            return results
+
+    def get_nl_stats(self, days: int = 7) -> dict:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        with self.connect() as connection:
+            total_rows = connection.execute(
+                'SELECT COUNT(*), AVG(confidence) FROM nl_interactions WHERE created_at >= ?',
+                (cutoff,)
+            ).fetchone()
+            total_count = total_rows[0] or 0
+            avg_confidence = round(total_rows[1] or 0.0, 3)
+
+            by_intent_rows = connection.execute('''
+                SELECT intent, COUNT(*) as cnt, AVG(confidence) as avg_c
+                FROM nl_interactions
+                WHERE created_at >= ?
+                GROUP BY intent
+                ORDER BY cnt DESC
+            ''', (cutoff,)).fetchall()
+            by_intent = {r['intent']: {'count': r['cnt'], 'avg_confidence': round(r['avg_c'] or 0.0, 3)} for r in by_intent_rows}
+
+            unknown_count = connection.execute(
+                "SELECT COUNT(*) FROM nl_interactions WHERE created_at >= ? AND intent = 'unknown'",
+                (cutoff,)
+            ).fetchone()[0] or 0
+
+            low_conf_count = connection.execute(
+                "SELECT COUNT(*) FROM nl_interactions WHERE created_at >= ? AND confidence < 0.80",
+                (cutoff,)
+            ).fetchone()[0] or 0
+
+            corrections_count = connection.execute(
+                "SELECT COUNT(*) FROM nl_corrections WHERE created_at >= ?",
+                (cutoff,)
+            ).fetchone()[0] or 0
+
+            return {
+                'days': days,
+                'total_interactions': total_count,
+                'avg_confidence': avg_confidence,
+                'unknown_count': unknown_count,
+                'low_confidence_count': low_conf_count,
+                'corrections_count': corrections_count,
+                'by_intent': by_intent,
+            }
+
+    def get_approved_corrections(self, limit: int = 5, intent: str = None) -> list[dict]:
+        with self.connect() as connection:
+            if intent:
+                rows = connection.execute('''
+                    SELECT c.*, i.raw_text
+                    FROM nl_corrections c
+                    LEFT JOIN nl_interactions i ON c.interaction_id = i.id
+                    WHERE c.corrected_intent = ?
+                    ORDER BY c.id DESC LIMIT ?
+                ''', (intent, limit)).fetchall()
+            else:
+                rows = connection.execute('''
+                    SELECT c.*, i.raw_text
+                    FROM nl_corrections c
+                    LEFT JOIN nl_interactions i ON c.interaction_id = i.id
+                    ORDER BY c.id DESC LIMIT ?
+                ''', (limit,)).fetchall()
+            results = []
+            for r in rows:
+                d = dict(r)
+                if d.get('corrected_entities_json'):
+                    try:
+                        d['corrected_entities'] = json.loads(d['corrected_entities_json'])
+                    except Exception:
+                        d['corrected_entities'] = {}
+                else:
+                    d['corrected_entities'] = {}
+                results.append(d)
+            return results
 
     def update_nl_interaction(self, interaction_id, status=None, applied_ops=None, error_details=None):
         now = now_iso()

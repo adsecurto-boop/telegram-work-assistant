@@ -276,6 +276,40 @@ If the Python environment is damaged (e.g. `.venv\pyvenv.cfg` points to a missin
 
 ---
 
+## Adaptive Natural-Language Recognition
+
+The adaptive NLP pipeline keeps the original message and a conservatively normalized copy. It protects emails, URLs, ticket IDs, versions, and quoted technical text while normalizing common date, punctuation, and time-range variations. Deterministic rules run first; the structured Gemini interpreter is an optional fallback and is unavailable-safe.
+
+Recognition confidence and permission to execute are separate. The action policy uses reason codes such as `uncertain_wording`, `invalid_time`, `ambiguous_reference`, and `missing_required_entity`. Read-only questions never mutate data, negated or invalid requests are rejected, uncertain changes require confirmation, and multiple task or case matches are shown as choices.
+
+Useful owner-only commands:
+
+```text
+/understand TEXT
+/unknowns [LIMIT]
+/correct ID INTENT [field=value ...]
+/nlstats [DAYS]
+```
+
+`/understand` is always read-only and shows the normal-message action policy. `/correct` records a parser correction for future examples and never executes the historical request.
+
+Examples:
+
+```text
+/correct 42 set_shift date=2026-09-11 shift_start=12:00 shift_end=21:00
+/correct 57 complete_task reference=#3 notes="owner correction"
+```
+
+Gemini receives redacted structured context and a maximum of five redacted owner-approved corrections. Its JSON is Pydantic-validated, and its reported confidence never bypasses local entity validation or the action policy.
+
+Run the offline evaluation corpus without Telegram or Gemini calls:
+
+```powershell
+.venv\Scripts\python.exe scripts\evaluate_nlp.py
+```
+
+---
+
 ## Verification & Automated Testing
 
 The complete test suite runs against temporary databases using mocked Telegram and Gemini interfaces:
@@ -284,7 +318,7 @@ The complete test suite runs against temporary databases using mocked Telegram a
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-The suite contains 135 unit and integration tests, including production-path regressions for:
+The suite includes unit and integration tests covering:
 - **Telegram Handlers**: Plain natural language, voice routing, `/understand`, `/undo`, and callbacks.
 - **Undo & Cascades**: Multi-task correlation undo, compound test sessions, standalone follow-ups, cluster acceptance undo, and atomic rollback on tamper.
 - **Shift Engine**: Schedule validation, invalid time rejection (`99:80`), future shifts, day-off overrides, template range weekday enforcement, and cross-midnight shifts.

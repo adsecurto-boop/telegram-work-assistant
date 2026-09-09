@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import shlex
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -24,7 +25,7 @@ MENU = ReplyKeyboardMarkup(
     [['Start Shift', 'My Tasks'], ['TOD', 'Pre-lunch', 'EOD'], ['End Shift', 'Help']],
     resize_keyboard=True)
 
-HELP = '''Work Assistant · Phase 4
+HELP = '''Work Assistant · Adaptive NLP
 You can speak or type naturally! For example:
 • "My shift today is 10 to 7 and I'll take lunch around 2"
 • "Today I need to test idle time and follow up with Rahul"
@@ -39,6 +40,9 @@ You can speak or type naturally! For example:
 Phase 4 Commands:
 /undo [ID] — Revert recent database mutation safely
 /understand TEXT — Preview natural language interpretation
+/unknowns [LIMIT] — Review recent unknown or low-confidence inputs
+/correct ID INTENT [field=value ...] — Save a parser correction without executing it
+/nlstats [DAYS] — Show natural-language recognition statistics
 /casesummary [CASE_ID] — Factual case summary
 /nextaction [CASE_ID] — Recommended next operational step
 /draftclient [CASE_ID] [instruction] — Draft professional client reply (never sent automatically)
@@ -582,6 +586,8 @@ async def handle_callback(update, context):
                 choice = saved_interp.choices[choice_idx]
                 if choice.get('case_id'):
                     saved_interp.entities.case_id = choice['case_id']
+                if choice.get('task_id'):
+                    saved_interp.entities.reference = f"#{choice['task_id']}"
                 if choice.get('test_result'):
                     saved_interp.entities.test_result = choice['test_result']
         saved_interp.needs_confirmation = False
@@ -1088,13 +1094,25 @@ async def handle(update, context):
         elif command == 'understand':
             if not argument:
                 raise ValueError('Usage: /understand your natural language message')
-            from nlp import DeterministicParser, GeminiNLParser
+            from telegram_import import redact
+            from nlp import (ContextResolver, DeterministicParser, GeminiNLParser,
+                             enrich_interpretation)
+            from nlp_normalizer import normalize_input
+            from nlp_policy import ReasonCode, evaluate_action_policy
+            normalized = normalize_input(argument)
             interp = DeterministicParser.parse(argument)
             if (not interp or interp.confidence < 0.7) and config.AI_KEY and config.AI_MODEL:
                 day = datetime.now(ZoneInfo(config.TIMEZONE)).date().isoformat()
                 if await asyncio.to_thread(db(context).reserve_ai, day, config.AI_DAILY_LIMIT):
                     parser = GeminiNLParser(config.AI_KEY, config.AI_MODEL, config.AI_FALLBACK_MODEL)
                     ctx = await asyncio.to_thread(db(context).get_conversation_context, 'owner')
+                    corrections = await asyncio.to_thread(db(context).get_approved_corrections, 5)
+                    ctx['approved_corrections'] = [
+                        {'example': redact(item.get('raw_text') or ''),
+                         'intent': item.get('corrected_intent'),
+                         'entities': item.get('corrected_entities') or {}}
+                        for item in corrections if item.get('raw_text')
+                    ]
                     gemini_res = await parser.interpret(argument, ctx)
                     succeeded = bool(gemini_res and gemini_res.provider == 'gemini')
                     await asyncio.to_thread(
@@ -1103,15 +1121,107 @@ async def handle(update, context):
                         parser.PROMPT_VERSION, 'success' if succeeded else 'failed',
                         None if succeeded else 'InterpretationError')
                     if gemini_res and gemini_res.confidence > (interp.confidence if interp else 0.0):
-                        interp = gemini_res
+                        interp = enrich_interpretation(gemini_res, normalized)
+                        interp.reason_codes.append(ReasonCode.GEMINI_FALLBACK.value)
+            if interp and interp.intent.value != 'unknown':
+                interp = await asyncio.to_thread(ContextResolver(db(context)).resolve, interp)
             if not interp:
                 await reply(update, 'Could not understand this input with confidence.')
             else:
+                normal_decision, normal_mutation, reasons = evaluate_action_policy(
+                    interp, has_active_shift=bool(await asyncio.to_thread(db(context).active_shift)))
+                preview_decision, _, reasons = evaluate_action_policy(
+                    interp, is_understand=True,
+                    has_active_shift=bool(await asyncio.to_thread(db(context).active_shift)))
+                interp.action_decision = preview_decision.value
+                interp.would_mutate = False
+                interp.reason_codes = list(dict.fromkeys(
+                    str(reason.value if hasattr(reason, 'value') else reason) for reason in reasons))
                 entities_str = json.dumps(interp.entities.model_dump(exclude_none=True), indent=2)
                 await reply(update, f"Intent: {interp.intent.value} (Confidence: {round(interp.confidence*100)}%)\n"
                                     f"Provider: {interp.provider}\n"
                                     f"Summary: {interp.proposed_summary}\n"
+                                    f"Preview action: {preview_decision.value} (always read-only)\n"
+                                    f"Normal-message policy: {normal_decision.value}\n"
+                                    f"Would mutate if sent normally: {'yes' if normal_mutation else 'no'}\n"
+                                    f"Reasons: {', '.join(interp.reason_codes) or 'none'}\n"
+                                    f"Missing: {', '.join(interp.missing_fields) or 'none'}\n"
+                                    f"Ambiguities: {', '.join(interp.ambiguities) or 'none'}\n"
                                     f"Entities:\n{entities_str}")
+        elif command == 'unknowns':
+            from telegram_import import redact
+            limit = int(argument) if argument.isdigit() else 10
+            limit = max(1, min(limit, 20))
+            items = await asyncio.to_thread(db(context).get_recent_unknown_interactions, limit)
+            if not items:
+                await reply(update, 'No recent unknown or low-confidence messages.')
+            else:
+                lines = ['Recent unknown or low-confidence messages:']
+                for item in items:
+                    raw_text = redact(item.get('raw_text') or '').replace('\n', ' ')
+                    lines.append(
+                        f"#{item['id']} [{item['intent']}] {round(float(item.get('confidence') or 0) * 100)}% — "
+                        f"{raw_text[:180]}")
+                lines.append('\nCorrect without executing: /correct ID INTENT field=value')
+                await reply(update, '\n'.join(lines))
+        elif command == 'correct':
+            try:
+                tokens = shlex.split(argument)
+            except ValueError as exc:
+                raise ValueError(f'Invalid correction syntax: {exc}') from exc
+            if len(tokens) < 2 or not tokens[0].isdigit():
+                raise ValueError('Usage: /correct ID INTENT [field=value ...]')
+            interaction_id = int(tokens[0])
+            intent_token = tokens[1].split('=', 1)[1] if tokens[1].startswith('intent=') else tokens[1]
+            from nlp import NLEntities, NLIntent, NL_PARSER_VERSION
+            try:
+                corrected_intent = NLIntent(intent_token.casefold())
+            except ValueError:
+                raise ValueError('Unknown intent. Use /understand on an example to see supported intent names.') from None
+            interaction = await asyncio.to_thread(db(context).get_nl_interaction, interaction_id)
+            if not interaction:
+                raise ValueError(f'Natural-language interaction #{interaction_id} was not found.')
+            entity_values = {}
+            notes = None
+            for token in tokens[2:]:
+                if '=' not in token:
+                    raise ValueError(f'Expected field=value, received: {token}')
+                key, value = token.split('=', 1)
+                if key == 'notes':
+                    notes = value
+                    continue
+                if key not in NLEntities.model_fields:
+                    raise ValueError(f'Unknown entity field: {key}')
+                if value.casefold() in ('true', 'false'):
+                    value = value.casefold() == 'true'
+                entity_values[key] = value
+            corrected_entities = NLEntities.model_validate(entity_values).model_dump(exclude_none=True)
+            correction_id = await asyncio.to_thread(
+                db(context).add_nl_correction,
+                interaction['intent'], corrected_intent.value, interaction_id,
+                corrected_entities, update.effective_user.id, notes, NL_PARSER_VERSION)
+            await asyncio.to_thread(db(context).update_nl_interaction, interaction_id, 'corrected')
+            await reply(update,
+                f'Saved correction #{correction_id} for interaction #{interaction_id}: '
+                f'{interaction["intent"]} → {corrected_intent.value}. No work action was executed.')
+        elif command == 'nlstats':
+            days = int(argument) if argument.isdigit() else 7
+            days = max(1, min(days, 365))
+            stats = await asyncio.to_thread(db(context).get_nl_stats, days)
+            lines = [
+                f'Natural-language statistics · last {days} day(s)',
+                f"Interactions: {stats['total_interactions']}",
+                f"Average confidence: {round(stats['avg_confidence'] * 100)}%",
+                f"Unknown: {stats['unknown_count']}",
+                f"Low confidence: {stats['low_confidence_count']}",
+                f"Corrections: {stats['corrections_count']}",
+            ]
+            if stats['by_intent']:
+                lines.append('By intent:')
+                for intent, values in list(stats['by_intent'].items())[:12]:
+                    lines.append(
+                        f"• {intent}: {values['count']} ({round(values['avg_confidence'] * 100)}% avg)")
+            await reply(update, '\n'.join(lines))
         elif command == 'casesummary':
             case_id = int(argument) if argument.isdigit() else None
             if not case_id:
