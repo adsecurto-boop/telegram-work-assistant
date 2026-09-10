@@ -40,6 +40,15 @@ You can speak or type naturally! For example:
 Phase 4 Commands:
 /undo [ID] — Revert recent database mutation safely
 /understand TEXT — Preview natural language interpretation
+/startday task one | task two — Plan without duplicating existing tasks
+/checkpoint, /timeline, /resume, /tomorrow, /carrytask ID
+Say “delete all tasks” to delete tasks immediately with Undo.
+/draft TEXT or ID — Prepare/open a persistent work message
+/drafts, /draftedit ID field=value | field=value, /drafthistory ID
+/draftfollowup ID YYYY-MM-DDTHH:MM — Schedule a follow-up
+/workcontact alias | @username | sir — Save an explicit contact
+/workclient client=NAME | platform=Teams | admin_email=EMAIL | cc=@sales
+/workstatus ID STATE note, /workhandover — Track request progress
 /unknowns [LIMIT] — Review recent unknown or low-confidence inputs
 /correct ID INTENT [field=value ...] — Save a parser correction without executing it
 /nlstats [DAYS] — Show natural-language recognition statistics
@@ -651,6 +660,12 @@ async def handle(update, context):
     if not authorized(update):
         return
     try:
+        from daily_assistant import handle_daily
+        if await handle_daily(update, context):
+            return
+        from work_messages import handle_work_message
+        if await handle_work_message(update, context):
+            return
         if update.callback_query:
             await handle_callback(update, context)
             return

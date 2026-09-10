@@ -13,6 +13,7 @@ from utils import setup_logging
 from runtime import instance_lock
 
 CALLBACK_PATTERN = (
+    r'^wd:(copy|edit|saved|shared|cancelled):\d+:\d+$|'
     r'^(final|ai|close|organize|apply|dismiss):\d+$|^drop:\d+:\d+$|'
     r'^task:[a-z_]+:\d+$|^src:(accept|ignore):\d+$|'
     r'^case:[a-z_]+:\d+$|^follow:(done|snooze):\d+$|'
@@ -30,6 +31,8 @@ async def gate(update,context):
 
 async def startup(application):
     create_scheduler(application)
+    from work_messages import remind_work_drafts
+    application.job_queue.run_repeating(remind_work_drafts, interval=60, first=10, name='work-draft-followups')
     if config.DASHBOARD_ENABLED:
         try:
             from dashboard import DashboardService
@@ -39,6 +42,12 @@ async def startup(application):
             logging.getLogger(__name__).warning('Dashboard unavailable: %s', type(exc).__name__)
     await application.bot.set_my_commands([
         BotCommand('shift','Start a flexible shift'), BotCommand('task','Plan a rich task'),
+        BotCommand('startday','Plan today’s work'), BotCommand('checkpoint','Lunch progress report'),
+        BotCommand('timeline','Current shift timeline'), BotCommand('resume','Prioritized open tasks'),
+        BotCommand('tomorrow','Review unfinished work'), BotCommand('carrytask','Reschedule a task to tomorrow'),
+        BotCommand('draft','Prepare or open a work message'), BotCommand('drafts','List work drafts'),
+        BotCommand('draftedit','Revise a work draft'), BotCommand('drafthistory','Draft revision history'),
+        BotCommand('draftfollowup','Schedule a draft follow-up'), BotCommand('workhandover','Work message handover'),
         BotCommand('todo','Show open tasks'), BotCommand('today','Show this shift plans'),
         BotCommand('undo','Undo last mutation safely'), BotCommand('understand','Preview NL intent'),
         BotCommand('unknowns','Review low-confidence messages'), BotCommand('correct','Save an NLP correction'),

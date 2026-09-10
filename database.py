@@ -10,7 +10,7 @@ from pathlib import Path
 from models import Task, TaskStatus
 import config
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 _last_iso_time = 0.0
@@ -108,6 +108,24 @@ class Database:
                 connection.execute(cleaned)
 
     def _create_schema(self, connection):
+        self._exec_sql_script(connection, '''
+            CREATE TABLE IF NOT EXISTS work_drafts (
+                id INTEGER PRIMARY KEY, owner_id INTEGER NOT NULL, source_key TEXT UNIQUE,
+                parent_id INTEGER REFERENCES work_drafts(id), raw_text TEXT NOT NULL,
+                fields_json TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'draft', created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS work_draft_events (
+                id INTEGER PRIMARY KEY, draft_id INTEGER NOT NULL REFERENCES work_drafts(id),
+                revision INTEGER NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL,
+                created_at TEXT NOT NULL, UNIQUE(draft_id,revision,kind));
+            CREATE TABLE IF NOT EXISTS work_contacts (
+                id INTEGER PRIMARY KEY, owner_id INTEGER NOT NULL, alias TEXT NOT NULL,
+                mention TEXT NOT NULL, salutation TEXT NOT NULL,
+                UNIQUE(owner_id,alias,mention));
+            CREATE TABLE IF NOT EXISTS work_client_profiles (
+                owner_id INTEGER NOT NULL, name TEXT NOT NULL, fields_json TEXT NOT NULL,
+                PRIMARY KEY(owner_id,name));
+        ''')
         self._exec_sql_script(connection, '''
             CREATE TABLE IF NOT EXISTS tasks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL,
@@ -697,6 +715,34 @@ class Database:
 
     def delete_task(self, task_id, shift_id=None):
         return self.mark_status(task_id, TaskStatus.CANCELLED, shift_id=shift_id) is not None
+
+    def delete_tasks(self, scope='all', shift_id=None, task_id=None):
+        """Delete task rows atomically while retaining historical activity and reports."""
+        clauses, params = [], []
+        if scope in ('pending', 'completed', 'in_progress', 'blocked'):
+            clauses.append('status=?'); params.append(scope)
+        elif scope == 'today':
+            if shift_id is None:
+                raise ValueError('Start a shift before deleting this shift’s tasks.')
+            clauses.append('planned_shift_id=?'); params.append(shift_id)
+        elif scope != 'all':
+            raise ValueError('Unsupported task deletion scope.')
+        if task_id is not None:
+            clauses.append('id=?'); params.append(task_id)
+        correlation = 'delete-tasks-' + uuid.uuid4().hex
+        with self.connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            rows = conn.execute('SELECT * FROM tasks' + (' WHERE ' + ' AND '.join(clauses) if clauses else ''), params).fetchall()
+            for row in rows:
+                for activity in conn.execute('SELECT id,task_id FROM activities WHERE task_id=?', (row['id'],)).fetchall():
+                    conn.execute('UPDATE activities SET task_id=NULL WHERE id=?', (activity['id'],))
+                    self._record_audit_in_connection(conn, correlation, 'detach_task_history', 'owner',
+                        'activities', activity['id'], {'task_id': row['id']}, {'task_id': None})
+                conn.execute('UPDATE conversation_context SET active_task_id=NULL WHERE active_task_id=?', (row['id'],))
+                conn.execute('DELETE FROM tasks WHERE id=?', (row['id'],))
+                self._record_audit_in_connection(conn, correlation, 'delete_task', 'owner', 'tasks',
+                                                 row['id'], dict(row), None)
+        return len(rows), correlation
 
     def _activity(self, connection, shift_id, category, detail, client=None, channel=None,
                   outcome=None, task_id=None, unplanned=0, source_message_id=None, case_id=None):
