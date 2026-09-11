@@ -1641,6 +1641,15 @@ class NaturalLanguagePipeline:
         normalized = normalize_input(text)
         # 1. Deterministic parsing
         interpretation = DeterministicParser.parse(text)
+        if interpretation and interpretation.intent == NLIntent.SET_SHIFT and interpretation.entities.start_date and interpretation.entities.end_date:
+            if shift and shift.get('start'):
+                try:
+                    shift_dt = datetime.fromisoformat(shift['start'])
+                    shift_next = (shift_dt.date() + timedelta(days=1)).isoformat()
+                    if shift_next < interpretation.entities.start_date and shift_next[:7] == interpretation.entities.start_date[:7]:
+                        interpretation.entities.start_date = shift_next
+                except Exception:
+                    pass
 
         # 2. Context resolution
         if interpretation and interpretation.intent != NLIntent.UNKNOWN:

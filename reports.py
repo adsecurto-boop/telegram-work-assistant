@@ -112,13 +112,55 @@ def _latest_task_events(activities):
             if item['category'] == 'task' and item.get('task_id')}
 
 
+import hashlib
+
+
+def compute_shift_facts_hash(activities, tasks, cases=None, test_sessions=None) -> str:
+    payload = []
+    for a in activities:
+        payload.append((a['id'], a.get('category'), a.get('detail'), a.get('outcome'), a.get('task_id'), a.get('occurred_at')))
+    for t in tasks:
+        payload.append((t.id, t.title, getattr(t.status, 'value', str(t.status)), t.priority, t.blocked_reason, t.due_date))
+    for c in (cases or []):
+        payload.append((c.get('id'), c.get('status'), c.get('client_updated'), c.get('next_action')))
+    for s in (test_sessions or []):
+        payload.append((s.get('id'), s.get('result'), s.get('retest_result')))
+    raw = repr(sorted(payload, key=lambda x: str(x[0])))
+    return hashlib.sha256(raw.encode('utf-8')).hexdigest()
+
+
+def build_report_facts(kind, shift, activities, tasks, style='standard', mask_clients=False,
+                       cases=None, test_sessions=None, baseline_snapshot=None) -> dict:
+    """Centralized factual report building layer used across slash commands and NLP."""
+    facts = {
+        'kind': kind,
+        'shift_id': shift['id'],
+        'shift_start': shift['start'],
+        'shift_end': shift['end'],
+        'style': style,
+        'facts_hash': compute_shift_facts_hash(activities, tasks, cases, test_sessions),
+        'sections': report_sections(kind, shift, activities, tasks, style=style,
+                                    mask_clients=mask_clients, cases=cases,
+                                    test_sessions=test_sessions, baseline_snapshot=baseline_snapshot)
+    }
+    return facts
+
+
 def report_sections(kind, shift, activities, tasks, style='standard', mask_clients=False,
-                    cases=None, test_sessions=None):
+                    cases=None, test_sessions=None, baseline_snapshot=None):
     if style not in ('short', 'standard', 'detailed'):
         raise ValueError('Report style must be short, standard, or detailed.')
     detailed = style == 'detailed'
     planned_ids = {item['task_id'] for item in activities
                    if item['category'] == 'plan' and item.get('task_id')}
+    if baseline_snapshot:
+        for b in baseline_snapshot:
+            bid = b.get('id') if isinstance(b, dict) else getattr(b, 'id', None)
+            if bid:
+                planned_ids.add(bid)
+    if not planned_ids and tasks and kind == 'tod':
+        planned_ids = {t.id for t in tasks if getattr(t, 'status', None) != TaskStatus.CANCELLED}
+
     current_plans = [task for task in tasks if task.id in planned_ids]
     carry = [task for task in tasks if task.id not in planned_ids and
              task.status in (TaskStatus.PENDING, TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED)]
@@ -204,19 +246,19 @@ def report_sections(kind, shift, activities, tasks, style='standard', mask_clien
 
 
 def generate_report(kind, shift, activities, tasks, style='standard', mask_clients=False,
-                    cases=None, test_sessions=None):
+                    cases=None, test_sessions=None, baseline_snapshot=None):
     title = {'tod': 'Beginning of Shift', 'pl': 'Pre Lunch', 'eod': 'EOD'}[kind]
     lines = [title, 'Shift: ' + shift['start'][:16].replace('T', ' ')]
     for heading, content in report_sections(kind, shift, activities, tasks, style, mask_clients,
-                                            cases, test_sessions).items():
+                                            cases, test_sessions, baseline_snapshot=baseline_snapshot).items():
         lines.extend((heading, content))
     return '\n'.join(lines)
 
 
 def generate_section(kind, section, shift, activities, tasks, style='standard', mask_clients=False,
-                     cases=None, test_sessions=None):
+                     cases=None, test_sessions=None, baseline_snapshot=None):
     sections = report_sections(kind, shift, activities, tasks, style, mask_clients,
-                               cases, test_sessions)
+                               cases, test_sessions, baseline_snapshot=baseline_snapshot)
     matches = [name for name in sections if section.casefold() in name.casefold()]
     if len(matches) != 1:
         raise ValueError('Section must identify one of: ' + ', '.join(sections) + '.')

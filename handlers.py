@@ -322,8 +322,14 @@ async def make_report(update, context, kind, requested_style=None):
     cases = await asyncio.to_thread(db(context).cases_for_shift, shift['id'])
     sessions = await asyncio.to_thread(db(context).test_sessions, shift['id'])
     followups = await asyncio.to_thread(db(context).list_followups, 50)
-    text = reports.generate_report(kind, shift, activities, tasks, style, mask, cases, sessions)
-    report_id = await asyncio.to_thread(db(context).save_report, shift['id'], kind, text, style)
+    baseline_snap = await asyncio.to_thread(db(context).get_baseline_plan_snapshot, shift['id'])
+    baseline_tasks = baseline_snap.get('tasks') if baseline_snap else None
+
+    facts = reports.build_report_facts(kind, shift, activities, tasks, style=style, mask_clients=mask,
+                                       cases=cases, test_sessions=sessions, baseline_snapshot=baseline_tasks)
+    facts_hash = facts['facts_hash']
+    text = reports.generate_report(kind, shift, activities, tasks, style, mask, cases, sessions, baseline_snapshot=baseline_tasks)
+    report_id = await asyncio.to_thread(db(context).save_report, shift['id'], kind, text, style, facts_hash=facts_hash)
     await asyncio.to_thread(db(context).record_delivery, shift['id'], kind)
 
     # Validate report quality and record provenance

@@ -393,8 +393,12 @@ async def handle_work_message(update, context):
                [InlineKeyboardButton(label, callback_data=f'wd:{action}:{ident}:{revision}')
                 for label, action in [('Save request','saved'), ('Mark as shared','shared'), ('Cancel','cancelled')]]]
     absent = missing(draft['fields'])
+    linked = database.get_linked_records('work_draft', ident)
+    linked_tasks = [f"#{l['other_id']}" for l in linked if l['other_type'] == 'task']
+    linked_text = ('\nLinked tasks: ' + ', '.join(linked_tasks)) if linked_tasks else ''
     await reply(update, f'Work draft #{ident} · revision {revision}\n\n' + render(draft['fields']) +
                 ('\n\nMissing: ' + ', '.join(absent) if absent else '') +
+                linked_text +
                 '\n\nReply with field=value | field=value to revise. Sharing is manual.' +
                 f'\nFollow-up: /draftfollowup {ident} YYYY-MM-DDTHH:MM',
                 InlineKeyboardMarkup(buttons))

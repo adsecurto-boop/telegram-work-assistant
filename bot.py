@@ -18,7 +18,9 @@ CALLBACK_PATTERN = (
     r'^task:[a-z_]+:\d+$|^src:(accept|ignore):\d+$|'
     r'^case:[a-z_]+:\d+$|^follow:(done|snooze):\d+$|'
     r'^audit:undo:\d+$|^nl:choose:\d+:[a-z_]+$|'
-    r'^prop:(accept|cancel):prop_[a-f0-9]+$|^prop:choose:prop_[a-f0-9]+:\d+$'
+    r'^prop:(accept|cancel):prop_[a-f0-9]+$|^prop:choose:prop_[a-f0-9]+:\d+$|'
+    r'^plan:(confirm|cancel):\d+$|^checkpoint:update:\d+:[a-z_]+$|'
+    r'^corr:(confirm|cancel):prop_[a-f0-9]+$'
 )
 
 async def gate(update,context):

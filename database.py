@@ -10,7 +10,7 @@ from pathlib import Path
 from models import Task, TaskStatus
 import config
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 _last_iso_time = 0.0
@@ -83,6 +83,8 @@ class Database:
                 self._seed_v4_defaults(cursor)
             if version < 5:
                 self._seed_v5_defaults(cursor)
+            if version < 9:
+                self._seed_v9_defaults(cursor)
             self._create_indexes(cursor)
             self._validate_schema_integrity(cursor)
             cursor.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
@@ -125,6 +127,36 @@ class Database:
             CREATE TABLE IF NOT EXISTS work_client_profiles (
                 owner_id INTEGER NOT NULL, name TEXT NOT NULL, fields_json TEXT NOT NULL,
                 PRIMARY KEY(owner_id,name));
+            CREATE TABLE IF NOT EXISTS plan_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                shift_id INTEGER NOT NULL REFERENCES shifts(id),
+                version INTEGER NOT NULL DEFAULT 1,
+                snapshot_json TEXT NOT NULL,
+                created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS record_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_type TEXT NOT NULL,
+                source_id INTEGER NOT NULL,
+                target_type TEXT NOT NULL,
+                target_id INTEGER NOT NULL,
+                link_type TEXT NOT NULL DEFAULT 'related',
+                created_at TEXT NOT NULL,
+                UNIQUE(source_type, source_id, target_type, target_id));
+            CREATE TABLE IF NOT EXISTS planning_conversations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_id INTEGER NOT NULL,
+                purpose TEXT NOT NULL DEFAULT 'daily_planning',
+                step TEXT NOT NULL,
+                proposed_values_json TEXT NOT NULL,
+                shift_id INTEGER REFERENCES shifts(id),
+                selected_record_type TEXT,
+                selected_record_id INTEGER,
+                source_update_id INTEGER,
+                source_message_id INTEGER,
+                status TEXT NOT NULL DEFAULT 'active',
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL);
         ''')
         self._exec_sql_script(connection, '''
             CREATE TABLE IF NOT EXISTS tasks (
@@ -389,6 +421,10 @@ class Database:
             CREATE INDEX IF NOT EXISTS report_validations_report_idx ON report_validations(report_id);
             CREATE INDEX IF NOT EXISTS nl_corrections_interaction_idx ON nl_corrections(interaction_id);
             CREATE INDEX IF NOT EXISTS nl_corrections_intent_idx ON nl_corrections(corrected_intent, created_at);
+            CREATE INDEX IF NOT EXISTS plan_snapshot_shift_idx ON plan_snapshots(shift_id, version);
+            CREATE INDEX IF NOT EXISTS record_links_source_idx ON record_links(source_type, source_id);
+            CREATE INDEX IF NOT EXISTS record_links_target_idx ON record_links(target_type, target_id);
+            CREATE INDEX IF NOT EXISTS planning_active_idx ON planning_conversations(owner_id, status);
         ''')
 
     def _ensure_columns(self, connection):
@@ -401,14 +437,19 @@ class Database:
             'activities': {
                 'unplanned': 'INTEGER NOT NULL DEFAULT 0',
                 'source_message_id': 'INTEGER REFERENCES source_messages(id)',
-                'case_id': 'INTEGER REFERENCES work_cases(id)'},
+                'case_id': 'INTEGER REFERENCES work_cases(id)',
+                'occurred_at': 'TEXT',
+                'time_precision': "TEXT NOT NULL DEFAULT 'exact'"},
             'source_messages': {
                 'metadata_json': 'TEXT',
                 'cluster_id': 'INTEGER REFERENCES history_clusters(id)'},
             'reports': {
                 'style': "TEXT NOT NULL DEFAULT 'standard'", 'provider': 'TEXT',
                 'model': 'TEXT', 'prompt_version': 'TEXT', 'source_report_id': 'INTEGER',
-                'provenance_json': 'TEXT'},
+                'provenance_json': 'TEXT',
+                'revision': 'INTEGER NOT NULL DEFAULT 1',
+                'is_stale': 'INTEGER NOT NULL DEFAULT 0',
+                'facts_hash': 'TEXT'},
             'proposals': {
                 'dismissed': 'INTEGER NOT NULL DEFAULT 0', 'model': 'TEXT',
                 'prompt_version': 'TEXT'},
@@ -457,6 +498,18 @@ class Database:
         except Exception:
             pass
 
+    def _seed_v9_defaults(self, connection):
+        connection.execute('''
+            UPDATE activities
+            SET occurred_at = created_at
+            WHERE occurred_at IS NULL
+        ''')
+        connection.execute('''
+            UPDATE activities
+            SET time_precision = 'exact'
+            WHERE time_precision IS NULL
+        ''')
+
     def _validate_schema_integrity(self, cursor):
         required_tables = {
             'tasks', 'settings', 'shifts', 'activities', 'clients',
@@ -468,7 +521,8 @@ class Database:
             'client_aliases', 'history_clusters', 'cluster_items',
             'bulk_operations', 'shift_templates', 'shift_calendar',
             'report_provenance', 'nl_proposals', 'report_validations',
-            'nl_corrections'
+            'nl_corrections', 'plan_snapshots', 'record_links',
+            'planning_conversations'
         }
         rows = cursor.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         existing = {r['name'] if isinstance(r, sqlite3.Row) else r[0] for r in rows}
@@ -639,11 +693,11 @@ class Database:
 
     def update_task(self, task_id, field, value, shift_id=None):
         allowed = {'title', 'priority', 'due_date', 'project', 'client', 'ticket',
-                   'next_action', 'tags', 'completion_note'}
+                   'next_action', 'tags', 'completion_note', 'planned_shift_id'}
         if field not in allowed:
             raise ValueError('Editable fields: ' + ', '.join(sorted(allowed)) + '.')
-        if field == 'priority':
-            value = int(value)
+        if field in ('priority', 'planned_shift_id'):
+            value = int(value) if value is not None and value not in ('-', 'none') else None
         with self.connect() as connection:
             row = connection.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
             if not row:
@@ -734,6 +788,10 @@ class Database:
             conn.execute('BEGIN IMMEDIATE')
             rows = conn.execute('SELECT * FROM tasks' + (' WHERE ' + ' AND '.join(clauses) if clauses else ''), params).fetchall()
             for row in rows:
+                for rlink in conn.execute('SELECT * FROM record_links WHERE (source_type="task" AND source_id=?) OR (target_type="task" AND target_id=?)', (row['id'], row['id'])).fetchall():
+                    conn.execute('DELETE FROM record_links WHERE id=?', (rlink['id'],))
+                    self._record_audit_in_connection(conn, correlation, 'detach_record_link', 'owner',
+                        'record_links', rlink['id'], dict(rlink), None)
                 for activity in conn.execute('SELECT id,task_id FROM activities WHERE task_id=?', (row['id'],)).fetchall():
                     conn.execute('UPDATE activities SET task_id=NULL WHERE id=?', (activity['id'],))
                     self._record_audit_in_connection(conn, correlation, 'detach_task_history', 'owner',
@@ -745,13 +803,18 @@ class Database:
         return len(rows), correlation
 
     def _activity(self, connection, shift_id, category, detail, client=None, channel=None,
-                  outcome=None, task_id=None, unplanned=0, source_message_id=None, case_id=None):
-        return connection.execute('''INSERT INTO activities
+                  outcome=None, task_id=None, unplanned=0, source_message_id=None, case_id=None,
+                  occurred_at=None, time_precision='exact'):
+        stamp = now_iso()
+        occ = occurred_at or stamp
+        aid = connection.execute('''INSERT INTO activities
             (shift_id,category,detail,client,channel,outcome,task_id,created_at,unplanned,
-             source_message_id,case_id)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
-            (shift_id, category, detail, client, channel, outcome, task_id, now_iso(),
-             int(bool(unplanned)), source_message_id, case_id)).lastrowid
+             source_message_id,case_id,occurred_at,time_precision)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+            (shift_id, category, detail, client, channel, outcome, task_id, stamp,
+             int(bool(unplanned)), source_message_id, case_id, occ, time_precision)).lastrowid
+        connection.execute('UPDATE reports SET is_stale=1 WHERE shift_id=? AND finalized=0', (shift_id,))
+        return aid
 
     def _client_id(self, connection, name):
         if not name:
@@ -764,10 +827,11 @@ class Database:
                                   (normalized,)).fetchone()[0]
 
     def add_activity(self, shift_id, category, detail, client=None, channel=None, outcome=None,
-                     source_message_id=None, case_id=None):
+                     source_message_id=None, case_id=None, occurred_at=None, time_precision='exact'):
         with self.connect() as connection:
             return self._activity(connection, shift_id, category, detail, client, channel, outcome,
-                                  source_message_id=source_message_id, case_id=case_id)
+                                  source_message_id=source_message_id, case_id=case_id,
+                                  occurred_at=occurred_at, time_precision=time_precision)
 
     def add_support(self, shift_id, detail, client=None, channel=None, outcome=None,
                     product=None, query_category=None, follow_up=None, ticket=None,
@@ -862,18 +926,30 @@ class Database:
                                        (replacement, activity_id))
 
     def save_report(self, shift_id, kind, text, style='standard', provider=None, model=None,
-                    prompt_version=None, source_report_id=None):
+                    prompt_version=None, source_report_id=None, facts_hash=None, revision=1):
         with self.connect() as connection:
             return connection.execute('''INSERT INTO reports
-                (shift_id,kind,text,created_at,style,provider,model,prompt_version,source_report_id)
-                VALUES (?,?,?,?,?,?,?,?,?)''',
+                (shift_id,kind,text,created_at,style,provider,model,prompt_version,source_report_id,facts_hash,revision,is_stale)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,0)''',
                 (shift_id, kind, text, now_iso(), style, provider, model,
-                 prompt_version, source_report_id)).lastrowid
+                 prompt_version, source_report_id, facts_hash, revision)).lastrowid
 
     def report(self, report_id):
         with self.connect() as connection:
             row = connection.execute('SELECT * FROM reports WHERE id=?', (report_id,)).fetchone()
-            return dict(row) if row else None
+            if not row:
+                return None
+            res = dict(row)
+            if not res.get('finalized') and res.get('facts_hash') and not res.get('is_stale'):
+                from reports import compute_shift_facts_hash
+                acts = [dict(r) for r in connection.execute('SELECT * FROM activities WHERE shift_id=?', (res['shift_id'],)).fetchall()]
+                tasks_rows = connection.execute('SELECT * FROM tasks WHERE planned_shift_id=?', (res['shift_id'],)).fetchall()
+                tasks = [Task.from_row(r) for r in tasks_rows]
+                curr_hash = compute_shift_facts_hash(acts, tasks)
+                if curr_hash != res['facts_hash']:
+                    connection.execute('UPDATE reports SET is_stale=1 WHERE id=?', (report_id,))
+                    res['is_stale'] = 1
+            return res
 
     def finalize(self, report_id, acknowledge_errors=False, require_validation=False):
         with self.connect() as connection:
@@ -2174,7 +2250,8 @@ class Database:
             'tasks', 'work_cases', 'case_events', 'activities',
             'followups', 'test_sessions', 'evidence', 'client_aliases',
             'history_clusters', 'cluster_items', 'shift_calendar',
-            'source_messages', 'shift_templates', 'shifts'
+            'source_messages', 'shift_templates', 'shifts',
+            'record_links', 'plan_snapshots'
         }
         if table not in allowed_tables:
             raise ValueError(f'Table {table} does not support automatic undo.')
@@ -2888,3 +2965,341 @@ class Database:
             if row['status'] != 'pending':
                 raise ValueError(f'Proposal is already {row["status"]}.')
             connection.execute('UPDATE nl_proposals SET status="cancelled" WHERE id=?', (proposal_id,))
+
+    # --- Phase 5: Plan Snapshots, Record Links & Planning Conversations ---
+
+    def save_plan_snapshot(self, shift_id: int, tasks: list) -> int:
+        with self.connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            latest = conn.execute(
+                'SELECT MAX(version) FROM plan_snapshots WHERE shift_id=?',
+                (shift_id,)
+            ).fetchone()[0]
+            version = (latest or 0) + 1
+            items = []
+            for t in tasks:
+                if isinstance(t, Task):
+                    items.append({
+                        'id': t.id,
+                        'title': t.title,
+                        'status': t.status.value,
+                        'priority': t.priority,
+                        'client': t.client,
+                        'ticket': t.ticket,
+                        'blocked_reason': t.blocked_reason,
+                        'next_action': t.next_action
+                    })
+                elif isinstance(t, dict):
+                    items.append(t)
+            cur = conn.execute('''
+                INSERT INTO plan_snapshots (shift_id, version, snapshot_json, created_at)
+                VALUES (?, ?, ?, ?)
+            ''', (shift_id, version, json.dumps(items), now_iso()))
+            return cur.lastrowid
+
+    def get_latest_plan_snapshot(self, shift_id: int) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute('''
+                SELECT * FROM plan_snapshots
+                WHERE shift_id=?
+                ORDER BY version DESC LIMIT 1
+            ''', (shift_id,)).fetchone()
+            if not row:
+                return None
+            d = dict(row)
+            d['tasks'] = json.loads(d['snapshot_json'])
+            return d
+
+    def get_baseline_plan_snapshot(self, shift_id: int) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute('''
+                SELECT * FROM plan_snapshots
+                WHERE shift_id=?
+                ORDER BY version ASC LIMIT 1
+            ''', (shift_id,)).fetchone()
+            if not row:
+                return None
+            d = dict(row)
+            d['tasks'] = json.loads(d['snapshot_json'])
+            return d
+
+    def get_plan_snapshots(self, shift_id: int) -> list[dict]:
+        with self.connect() as conn:
+            rows = conn.execute('''
+                SELECT * FROM plan_snapshots
+                WHERE shift_id=?
+                ORDER BY version ASC
+            ''', (shift_id,)).fetchall()
+            results = []
+            for r in rows:
+                d = dict(r)
+                d['tasks'] = json.loads(d['snapshot_json'])
+                results.append(d)
+            return results
+
+    def link_records(self, source_type: str, source_id: int, target_type: str, target_id: int, link_type: str = 'related') -> int:
+        with self.connect() as conn:
+            row = conn.execute('''
+                SELECT id FROM record_links
+                WHERE (source_type=? AND source_id=? AND target_type=? AND target_id=?)
+                   OR (source_type=? AND source_id=? AND target_type=? AND target_id=?)
+            ''', (source_type, source_id, target_type, target_id, target_type, target_id, source_type, source_id)).fetchone()
+            if row:
+                return row['id']
+            cur = conn.execute('''
+                INSERT INTO record_links (source_type, source_id, target_type, target_id, link_type, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (source_type, source_id, target_type, target_id, link_type, now_iso()))
+            return cur.lastrowid
+
+    def unlink_records(self, source_type: str, source_id: int, target_type: str, target_id: int) -> bool:
+        with self.connect() as conn:
+            res = conn.execute('''
+                DELETE FROM record_links
+                WHERE (source_type=? AND source_id=? AND target_type=? AND target_id=?)
+                   OR (source_type=? AND source_id=? AND target_type=? AND target_id=?)
+            ''', (source_type, source_id, target_type, target_id, target_type, target_id, source_type, source_id))
+            return res.rowcount > 0
+
+    def get_linked_records(self, record_type: str, record_id: int) -> list[dict]:
+        with self.connect() as conn:
+            rows = conn.execute('''
+                SELECT * FROM record_links
+                WHERE (source_type=? AND source_id=?) OR (target_type=? AND target_id=?)
+                ORDER BY id
+            ''', (record_type, record_id, record_type, record_id)).fetchall()
+            results = []
+            for r in rows:
+                d = dict(r)
+                if d['source_type'] == record_type and d['source_id'] == record_id:
+                    d['other_type'] = d['target_type']
+                    d['other_id'] = d['target_id']
+                else:
+                    d['other_type'] = d['source_type']
+                    d['other_id'] = d['source_id']
+                results.append(d)
+            return results
+
+    def save_planning_conversation(self, owner_id: int, purpose: str, step: str, proposed_values: dict,
+                                   shift_id: int | None = None, selected_record_type: str | None = None,
+                                   selected_record_id: int | None = None, source_update_id: int | None = None,
+                                   source_message_id: int | None = None, ttl_seconds: int = 3600) -> int:
+        now = datetime.now(timezone.utc)
+        expires_at = (now + timedelta(seconds=ttl_seconds)).isoformat()
+        now_str = now.isoformat()
+        with self.connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            active = conn.execute(
+                'SELECT id FROM planning_conversations WHERE owner_id=? AND purpose=? AND status="active"',
+                (owner_id, purpose)
+            ).fetchone()
+            if active:
+                conn.execute('''
+                    UPDATE planning_conversations
+                    SET step=?, proposed_values_json=?, shift_id=COALESCE(?, shift_id),
+                        selected_record_type=COALESCE(?, selected_record_type),
+                        selected_record_id=COALESCE(?, selected_record_id),
+                        source_update_id=COALESCE(?, source_update_id),
+                        source_message_id=COALESCE(?, source_message_id),
+                        expires_at=?, updated_at=?
+                    WHERE id=?
+                ''', (step, json.dumps(proposed_values), shift_id, selected_record_type,
+                      selected_record_id, source_update_id, source_message_id,
+                      expires_at, now_str, active['id']))
+                return active['id']
+            else:
+                cur = conn.execute('''
+                    INSERT INTO planning_conversations
+                    (owner_id, purpose, step, proposed_values_json, shift_id,
+                     selected_record_type, selected_record_id, source_update_id,
+                     source_message_id, status, expires_at, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+                ''', (owner_id, purpose, step, json.dumps(proposed_values), shift_id,
+                      selected_record_type, selected_record_id, source_update_id,
+                      source_message_id, expires_at, now_str, now_str))
+                return cur.lastrowid
+
+    def get_active_planning_conversation(self, owner_id: int, purpose: str = 'daily_planning') -> dict | None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self.connect() as conn:
+            row = conn.execute('''
+                SELECT * FROM planning_conversations
+                WHERE owner_id=? AND purpose=? AND status='active' AND expires_at > ?
+                ORDER BY id DESC LIMIT 1
+            ''', (owner_id, purpose, now)).fetchone()
+            if not row:
+                return None
+            d = dict(row)
+            d['proposed_values'] = json.loads(d['proposed_values_json'])
+            return d
+
+    def complete_planning_conversation(self, owner_id: int, purpose: str = 'daily_planning'):
+        with self.connect() as conn:
+            conn.execute('''
+                UPDATE planning_conversations
+                SET status='completed', updated_at=?
+                WHERE owner_id=? AND purpose=? AND status='active'
+            ''', (now_iso(), owner_id, purpose))
+
+    def cancel_planning_conversation(self, owner_id: int, purpose: str = 'daily_planning'):
+        with self.connect() as conn:
+            conn.execute('''
+                UPDATE planning_conversations
+                SET status='cancelled', updated_at=?
+                WHERE owner_id=? AND purpose=? AND status='active'
+            ''', (now_iso(), owner_id, purpose))
+
+    def create_report_revision(self, source_report_id: int, text: str, style: str = 'standard', provider: str = None, model: str = None) -> int:
+        stamp = now_iso()
+        with self.connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            src = conn.execute('SELECT * FROM reports WHERE id=?', (source_report_id,)).fetchone()
+            if not src:
+                raise ValueError('Source report not found.')
+            latest_rev = conn.execute(
+                'SELECT MAX(revision) FROM reports WHERE id=? OR source_report_id=?',
+                (source_report_id, source_report_id)
+            ).fetchone()[0] or 1
+            new_rev = latest_rev + 1
+            cur = conn.execute('''
+                INSERT INTO reports (shift_id, kind, text, created_at, finalized, style, provider, model, source_report_id, revision, facts_hash, is_stale)
+                VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, 0)
+            ''', (src['shift_id'], src['kind'], text, stamp, style, provider, model, source_report_id, new_rev, src['facts_hash'] if 'facts_hash' in src.keys() else None))
+            return cur.lastrowid
+
+    def mark_report_stale(self, report_id: int = None, shift_id: int = None):
+        with self.connect() as conn:
+            if report_id is not None:
+                conn.execute('UPDATE reports SET is_stale=1 WHERE id=?', (report_id,))
+            elif shift_id is not None:
+                conn.execute('UPDATE reports SET is_stale=1 WHERE shift_id=?', (shift_id,))
+
+    def list_shifts(self, limit: int = 10) -> list[dict]:
+        with self.connect() as conn:
+            rows = conn.execute('SELECT * FROM shifts ORDER BY id DESC LIMIT ?', (limit,)).fetchall()
+            return [dict(r) for r in rows]
+
+    def list_reports(self, shift_id: int = None) -> list[dict]:
+        with self.connect() as conn:
+            if shift_id:
+                rows = conn.execute('SELECT * FROM reports WHERE shift_id=? ORDER BY id ASC', (shift_id,)).fetchall()
+            else:
+                rows = conn.execute('SELECT * FROM reports ORDER BY id ASC').fetchall()
+            return [dict(r) for r in rows]
+
+    def get_report_revisions(self, source_report_id: int) -> list[dict]:
+        with self.connect() as conn:
+            rows = conn.execute('SELECT * FROM reports WHERE source_report_id=? ORDER BY id ASC', (source_report_id,)).fetchall()
+            return [dict(r) for r in rows]
+
+    def save_conversation_context(self, context_key='owner', **kwargs):
+        return self.update_conversation_context(context_key=context_key, **kwargs)
+
+    def get_active_nl_proposal(self, owner_id=None):
+        with self.connect() as conn:
+            if owner_id:
+                row = conn.execute(
+                    "SELECT * FROM nl_proposals WHERE owner_id=? AND status='pending' ORDER BY id DESC LIMIT 1",
+                    (owner_id,)
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM nl_proposals WHERE status='pending' ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+            if not row:
+                return None
+            res = dict(row)
+            res['proposal'] = json.loads(res['proposal_json'])
+            return res
+
+    def confirm_daily_plan_atomic(self, owner_id: int, conv_id: int, start_iso: str, end_iso: str,
+                                  lunch_iso: str | None, task_plan: list[dict]) -> tuple[int, list[Task]]:
+        """Atomically starts/revises shift, creates/associates tasks, saves baseline snapshot, and completes conversation."""
+        with self.connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            conv_row = conn.execute('SELECT * FROM planning_conversations WHERE id=?', (conv_id,)).fetchone()
+            if not conv_row:
+                raise ValueError('Planning session expired or not found.')
+            if conv_row['status'] != 'active':
+                raise ValueError(f"Planning session is already {conv_row['status']}.")
+
+            # 1. Start or revise shift
+            active_shift = conn.execute(
+                'SELECT * FROM shifts WHERE closed_at IS NULL ORDER BY id DESC LIMIT 1'
+            ).fetchone()
+            if active_shift:
+                sid = active_shift['id']
+                conn.execute(
+                    'UPDATE shifts SET start=?, end=?, lunch=? WHERE id=?',
+                    (start_iso, end_iso, lunch_iso, sid)
+                )
+            else:
+                cur = conn.execute(
+                    'INSERT INTO shifts (start, end, lunch) VALUES (?, ?, ?)',
+                    (start_iso, end_iso, lunch_iso)
+                )
+                sid = cur.lastrowid
+
+            # 2. Process tasks
+            for item in task_plan:
+                if item.get('is_new'):
+                    title = item['title']
+                    cur_t = conn.execute('''INSERT INTO tasks
+                        (title,status,created_at,priority,planned_shift_id)
+                        VALUES (?,?,?,?,?)''',
+                        (title, 'pending', now_iso(), 0, sid))
+                    tid = cur_t.lastrowid
+                    self._activity(conn, sid, 'plan', title, task_id=tid)
+                else:
+                    tid = item['id']
+                    # Associate existing task with this shift
+                    conn.execute('UPDATE tasks SET planned_shift_id=? WHERE id=?', (sid, tid))
+                    ex_act = conn.execute(
+                        "SELECT id FROM activities WHERE shift_id=? AND task_id=? AND category='plan'",
+                        (sid, tid)
+                    ).fetchone()
+                    if not ex_act:
+                        t_row = conn.execute('SELECT title FROM tasks WHERE id=?', (tid,)).fetchone()
+                        title = t_row['title'] if t_row else item.get('title', '')
+                        self._activity(conn, sid, 'plan', title, task_id=tid)
+
+            # Gather all tasks for this shift
+            all_t_rows = conn.execute(
+                'SELECT * FROM tasks WHERE planned_shift_id=? ORDER BY priority DESC, id ASC',
+                (sid,)
+            ).fetchall()
+            confirmed_tasks = [Task.from_row(r) for r in all_t_rows]
+
+            # 3. Save baseline plan snapshot
+            snap_payload = [
+                {
+                    'id': t.id,
+                    'title': t.title,
+                    'status': getattr(t.status, 'value', str(t.status)),
+                    'priority': t.priority,
+                    'blocked_reason': t.blocked_reason,
+                    'next_action': t.next_action,
+                    'client': t.client,
+                    'ticket': t.ticket
+                }
+                for t in confirmed_tasks
+            ]
+            conn.execute('''
+                INSERT INTO plan_snapshots (shift_id, version, snapshot_json, created_at)
+                VALUES (?, 1, ?, ?)
+            ''', (sid, json.dumps(snap_payload), now_iso()))
+
+            # 4. Save daily plan setting
+            plan_ids_json = json.dumps([t.id for t in confirmed_tasks])
+            conn.execute(
+                'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
+                (f'daily_plan:{sid}', plan_ids_json)
+            )
+
+            # 5. Complete planning conversation
+            conn.execute(
+                "UPDATE planning_conversations SET status='completed', updated_at=? WHERE id=?",
+                (now_iso(), conv_id)
+            )
+
+            return sid, confirmed_tasks

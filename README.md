@@ -11,6 +11,9 @@ truth; Gemini drafts and natural-language categorization are optional.
 | Feature Area | Status | Notes / Pre-requisites |
 |---|---|---|
 | **Shift Management & Overrides** | **Implemented & Tested** | Daily shifts (08:00–17:00, 10:00–19:00, 12:00–21:00, custom). Future shifts stored in `shift_calendar` without activating today. Day-off markers. |
+| **Conversational Daily Planning** | **Implemented & Tested** | Persistent multi-turn wizard (`planning_conversations`), similar-task duplicate review, confirmed versioned baseline snapshots (`plan_snapshots`), and TOD draft generation. |
+| **Task-to-Request Linking** | **Implemented & Tested** | Explicit many-to-many relationships (`record_links`) linking tasks to work drafts and cases with independent lifecycles. |
+| **Work Time vs. Logged Time** | **Implemented & Tested** | Late entries with `occurred_at` and `time_precision`, overnight shift interval matching, and finalized report immutability. |
 | **Shift Templates & Rotational Schedule** | **Implemented & Tested** | Named templates (`Morning`, `General`, `Evening`). Date-range assignments enforce `active_weekdays`. Daily overrides take priority. |
 | **Task Lifecycle & Tracking** | **Implemented & Tested** | Create, update, complete, reopen, carry forward. Scoped to shift/date. |
 | **Case Management & Evidence** | **Implemented & Tested** | Full lifecycle: new, investigating, waiting_client, waiting_internal, testing, resolved, closed. Attached photos, videos, documents with SHA-256 deduplication. |
