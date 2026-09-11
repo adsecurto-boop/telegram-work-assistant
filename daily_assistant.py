@@ -267,12 +267,19 @@ async def handle_daily(update, context) -> bool:
                 return True
         elif data.startswith('corr:pick_client:'):
             await cq.answer()
-            _, _, prop_id, client_name = data.split(':')
+            parts = data.split(':')
+            prop_id = parts[2]
+            client_ref = ':'.join(parts[3:])
             prop = db.get_nl_proposal(prop_id)
             if not prop or prop['status'] != 'pending':
                 await reply(update, "Proposal expired or already resolved.")
                 return True
             p_dict = prop['proposal']
+            candidates = p_dict.get('candidate_clients', [])
+            if client_ref.isdigit() and int(client_ref) < len(candidates):
+                client_name = candidates[int(client_ref)]
+            else:
+                client_name = client_ref
             p_dict['after']['client'] = client_name
             target_task = db.get_task(p_dict['task_id'])
             with db.connect() as conn:
@@ -677,12 +684,13 @@ async def handle_daily(update, context) -> bool:
                         'task_id': target_task.id,
                         'field': 'client',
                         'before': {'client': target_task.client},
-                        'after': {}
+                        'after': {},
+                        'candidate_clients': known_clients[:5]
                     }
                     prop_id = db.create_nl_proposal(owner_id=owner_id, intent='factual_correction', proposal_dict=proposal)
                     buttons = [
-                        [InlineKeyboardButton(c, callback_data=f"corr:pick_client:{prop_id}:{c}")]
-                        for c in known_clients[:5]
+                        [InlineKeyboardButton(c, callback_data=f"corr:pick_client:{prop_id}:{idx}")]
+                        for idx, c in enumerate(known_clients[:5])
                     ]
                     buttons.append([InlineKeyboardButton("Cancel", callback_data=f"corr:cancel:{prop_id}")])
                     await reply(update, f"Which client was Task #{target_task.id} ('{target_task.title}') for?", InlineKeyboardMarkup(buttons))
@@ -855,7 +863,21 @@ async def handle_daily(update, context) -> bool:
                 rev_id = db.create_report_revision(last_rep['id'], new_text, style=style,
                                                    facts_hash=last_rep.get('facts_hash'),
                                                    facts_snapshot=snap_json)
-                await reply(update, f"Updated EOD (Revision #{rev_id}):\n\n{new_text}")
+                from report_validator import ReportValidator
+                followups = db.list_followups(50)
+                validation = ReportValidator.validate('eod', new_text, shift_data or {}, activities, tasks, cases, sessions, followups)
+                db.save_report_validation(rev_id, validation.is_valid, [w.__dict__ for w in validation.warnings], validation.verified_metrics)
+                for p in validation.provenance_links:
+                    db.record_report_provenance(rev_id, p['section_name'], p['record_type'], p['record_id'], p.get('detail'))
+                from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+                keyboard = InlineKeyboardMarkup([[
+                    InlineKeyboardButton('Finalize', callback_data=f'final:{rev_id}'),
+                    InlineKeyboardButton('AI draft', callback_data=f'ai:{rev_id}')
+                ]])
+                warning_text = ''
+                if validation.warnings:
+                    warning_text = '\n\n⚠️ Report Validation:\n' + '\n'.join(f"• [{w.severity.upper()}] {w.message}" for w in validation.warnings[:3])
+                await reply(update, f"Updated EOD (Revision #{rev_id}):\n\n{new_text}{warning_text}", keyboard)
                 return True
 
     return False

@@ -52,6 +52,8 @@ class ReportValidator:
         cases = cases or []
         test_sessions = test_sessions or []
         followups = followups or []
+        from models import Task
+        tasks = [Task.from_row(t) if isinstance(t, dict) else t for t in (tasks or [])]
         lowered_report = report_text.casefold()
 
         shift_start = shift.get('start') or ''

@@ -10,7 +10,7 @@ from pathlib import Path
 from models import Task, TaskStatus
 import config
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 _last_iso_time = 0.0
@@ -85,6 +85,8 @@ class Database:
                 self._seed_v5_defaults(cursor)
             if version < 9:
                 self._seed_v9_defaults(cursor)
+            if version < 10:
+                self._seed_v10_defaults(cursor)
             self._create_indexes(cursor)
             self._validate_schema_integrity(cursor)
             cursor.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
@@ -511,6 +513,11 @@ class Database:
             WHERE time_precision IS NULL
         ''')
 
+    def _seed_v10_defaults(self, connection):
+        current = {row['name'] for row in connection.execute('PRAGMA table_info(reports)')}
+        if 'facts_snapshot_json' not in current:
+            connection.execute('ALTER TABLE reports ADD COLUMN facts_snapshot_json TEXT')
+
     def _validate_schema_integrity(self, cursor):
         required_tables = {
             'tasks', 'settings', 'shifts', 'activities', 'clients',
@@ -530,6 +537,9 @@ class Database:
         missing = required_tables - existing
         if missing:
             raise RuntimeError(f"Missing required database tables after migration: {missing}")
+        report_cols = {row['name'] for row in cursor.execute('PRAGMA table_info(reports)')}
+        if 'facts_snapshot_json' not in report_cols:
+            raise RuntimeError("Missing required column 'facts_snapshot_json' on reports table after migration")
 
     def _seed_structured_records(self, connection):
         for row in connection.execute("SELECT * FROM activities WHERE category='support'").fetchall():

@@ -500,16 +500,35 @@ async def ai_report(update, context, report_id, requested_style=None):
     used_model = getattr(engine, 'last_model', None) or config.AI_MODEL
     await asyncio.to_thread(db(context).record_ai_event, 'report', config.AI_PROVIDER,
                             used_model, REPORT_PROMPT_VERSION, 'success')
+    facts_hash = report.get('facts_hash')
+    snap_json = report.get('facts_snapshot_json')
     new_id = await asyncio.to_thread(
         db(context).save_report, report['shift_id'], report['kind'], text, style,
-        config.AI_PROVIDER, used_model, REPORT_PROMPT_VERSION, report_id)
+        config.AI_PROVIDER, used_model, REPORT_PROMPT_VERSION, report_id,
+        facts_hash=facts_hash, facts_snapshot=snap_json)
 
-    # Validate AI draft
-    shift = await asyncio.to_thread(db(context).shift, report['shift_id'])
-    activities = await asyncio.to_thread(db(context).activities, report['shift_id'])
-    tasks = await asyncio.to_thread(db(context).tasks_for_shift, report['shift_id'])
-    cases = await asyncio.to_thread(db(context).cases_for_shift, report['shift_id'])
-    sessions = await asyncio.to_thread(db(context).test_sessions, report['shift_id'])
+    # Validate AI draft against snapshot if available, otherwise live DB
+    snap_data = None
+    if snap_json:
+        try:
+            snap_data = json.loads(snap_json) if isinstance(snap_json, str) else snap_json
+        except Exception:
+            snap_data = None
+
+    if snap_data:
+        from models import Task
+        shift = snap_data.get('shift') or await asyncio.to_thread(db(context).shift, report['shift_id'])
+        activities = snap_data.get('activities', [])
+        tasks = [Task.from_row(t) if isinstance(t, dict) else t for t in snap_data.get('tasks', [])]
+        cases = snap_data.get('cases', [])
+        sessions = snap_data.get('sessions', [])
+    else:
+        shift = await asyncio.to_thread(db(context).shift, report['shift_id'])
+        activities = await asyncio.to_thread(db(context).activities, report['shift_id'])
+        tasks = await asyncio.to_thread(db(context).tasks_for_shift, report['shift_id'])
+        cases = await asyncio.to_thread(db(context).cases_for_shift, report['shift_id'])
+        sessions = await asyncio.to_thread(db(context).test_sessions, report['shift_id'])
+
     followups = await asyncio.to_thread(db(context).list_followups, 50)
     from report_validator import ReportValidator
     validation = ReportValidator.validate(report['kind'], text, shift or {}, activities, tasks, cases, sessions, followups)

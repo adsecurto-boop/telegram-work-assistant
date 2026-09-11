@@ -118,17 +118,65 @@ import hashlib
 def compute_shift_facts_hash(activities, tasks, cases=None, test_sessions=None) -> str:
     payload = []
     for a in activities:
-        payload.append(('activity', a['id'], a.get('category'), a.get('detail'), a.get('client'),
-                        a.get('outcome'), a.get('task_id'), a.get('occurred_at')))
+        cat = a.get('category')
+        if cat == 'support':
+            payload.append(('activity_support', a['id'], a.get('client'), a.get('channel'),
+                            a.get('detail'), a.get('outcome'), a.get('support_product'),
+                            a.get('query_category'), a.get('support_ticket'),
+                            a.get('support_follow_up'), a.get('query_count'),
+                            a.get('task_id'), a.get('occurred_at'), a.get('unplanned')))
+        elif cat == 'testing':
+            payload.append(('activity_testing', a['id'], a.get('detail'), a.get('result'),
+                            a.get('testing_product'), a.get('environment'), a.get('build'),
+                            a.get('defects'), a.get('testing_ticket'), a.get('retest'),
+                            a.get('scenario'), a.get('task_id'), a.get('occurred_at'), a.get('unplanned')))
+        elif cat == 'learning':
+            payload.append(('activity_learning', a['id'], a.get('detail'), a.get('learning_type'),
+                            a.get('learning_product'), a.get('takeaway'),
+                            a.get('learning_follow_up'), a.get('topic'),
+                            a.get('task_id'), a.get('occurred_at'), a.get('unplanned')))
+        else:
+            payload.append(('activity', a['id'], cat, a.get('detail'), a.get('client'),
+                            a.get('outcome'), a.get('task_id'), a.get('occurred_at'), a.get('unplanned')))
     for t in tasks:
-        payload.append(('task', t.id, t.title, getattr(t.status, 'value', str(t.status)),
-                        t.priority, getattr(t, 'client', None), t.blocked_reason, t.due_date))
+        if isinstance(t, dict):
+            t_id = t.get('id')
+            t_title = t.get('title')
+            st = t.get('status')
+            t_status = getattr(st, 'value', str(st)) if st is not None else None
+            t_priority = t.get('priority')
+            t_client = t.get('client')
+            t_blocked = t.get('blocked_reason')
+            t_due = t.get('due_date')
+            t_project = t.get('project')
+            t_ticket = t.get('ticket')
+            t_next = t.get('next_action')
+            t_tags = t.get('tags')
+            t_note = t.get('completion_note')
+        else:
+            t_id = t.id
+            t_title = t.title
+            t_status = getattr(t.status, 'value', str(t.status)) if hasattr(t, 'status') else None
+            t_priority = getattr(t, 'priority', None)
+            t_client = getattr(t, 'client', None)
+            t_blocked = getattr(t, 'blocked_reason', None)
+            t_due = getattr(t, 'due_date', None)
+            t_project = getattr(t, 'project', None)
+            t_ticket = getattr(t, 'ticket', None)
+            t_next = getattr(t, 'next_action', None)
+            t_tags = getattr(t, 'tags', None)
+            t_note = getattr(t, 'completion_note', None)
+        payload.append(('task', t_id, t_title, t_status, t_priority, t_client,
+                        t_blocked, t_due, t_project, t_ticket, t_next, t_tags, t_note))
     for c in (cases or []):
         payload.append(('case', c.get('id'), c.get('title'), c.get('client'), c.get('status'),
-                        c.get('client_updated'), c.get('next_action')))
+                        c.get('participation'), c.get('client_updated'), c.get('next_action'),
+                        c.get('ticket'), c.get('product'), c.get('platform'),
+                        c.get('channel'), c.get('priority')))
     for s in (test_sessions or []):
         payload.append(('session', s.get('id'), s.get('scenario'), s.get('environment'),
-                        s.get('result'), s.get('retest_result')))
+                        s.get('build'), s.get('defects'), s.get('ticket'),
+                        s.get('result'), s.get('retest_required'), s.get('retest_result')))
     raw = repr(sorted(payload, key=lambda x: (x[0], str(x[1]))))
     return hashlib.sha256(raw.encode('utf-8')).hexdigest()
 

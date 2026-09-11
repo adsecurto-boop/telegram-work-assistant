@@ -32,6 +32,7 @@ import re
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -558,11 +559,10 @@ class ConversationalPlanningTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Simulated v9 failure", str(ctx.exception))
 
         # Check rollback: version remains 8, partial table does NOT exist
-        conn = sqlite3.connect(tmp_db_path)
-        self.assertEqual(conn.execute('PRAGMA user_version').fetchone()[0], 8)
-        tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
-        self.assertNotIn("partial_v9_test", tables)
-        conn.close()
+        with closing(sqlite3.connect(tmp_db_path)) as conn:
+            self.assertEqual(conn.execute('PRAGMA user_version').fetchone()[0], 8)
+            tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+            self.assertNotIn("partial_v9_test", tables)
 
         # Backup created
         backups = list((self.root / 'backups').glob('pre-migration-v8-*.sqlite3'))
@@ -570,13 +570,12 @@ class ConversationalPlanningTests(unittest.IsolatedAsyncioTestCase):
 
         # Repeated clean initialization succeeds
         clean_db = Database(tmp_db_path)
-        conn = sqlite3.connect(tmp_db_path)
-        self.assertEqual(conn.execute('PRAGMA user_version').fetchone()[0], 9)
-        tables_v9 = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
-        self.assertIn("plan_snapshots", tables_v9)
-        self.assertIn("record_links", tables_v9)
-        self.assertIn("planning_conversations", tables_v9)
-        conn.close()
+        with closing(sqlite3.connect(tmp_db_path)) as conn:
+            self.assertEqual(conn.execute('PRAGMA user_version').fetchone()[0], SCHEMA_VERSION)
+            tables_v10 = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+            self.assertIn("plan_snapshots", tables_v10)
+            self.assertIn("record_links", tables_v10)
+            self.assertIn("planning_conversations", tables_v10)
 
     # 26. Retest disambiguation when multiple candidates exist.
     async def test_26_move_retest_multiple_candidates_disambiguation(self):
@@ -957,6 +956,311 @@ class ConversationalPlanningTests(unittest.IsolatedAsyncioTestCase):
             snaps = conn.execute('SELECT version FROM plan_snapshots WHERE shift_id=? ORDER BY version ASC', (sid,)).fetchall()
             versions = [r['version'] for r in snaps]
             self.assertEqual(versions, [1, 2, 3])
+
+    # 38. Client selection with colon in name via candidate index avoids callback unpack errors.
+    async def test_38_client_selection_with_colon_in_name_candidate_index(self):
+        sid = self.db.start_shift('2026-09-11T09:00:00+05:30', '2026-09-11T18:00:00+05:30')
+        t1 = self.db.add_task('Attend morning standup', client='Acme:Corp:Alpha', shift_id=sid)
+        self.db.update_conversation_context('owner', active_task_id=t1.id)
+        # Create at least two other clients in system so len(known_clients) > 1 and prompts picker
+        self.db.add_task('Other work 1', client='Omega:Beta:Services', shift_id=sid)
+        self.db.add_task('Other work 2', client='Gamma:Delta:Tech', shift_id=sid)
+
+        # Trigger ambiguous correction: "That was for the other client"
+        up = self.make_update("That was for the other client", uid=1001)
+        await handlers.handle(up, self.context)
+        call_args = up.effective_message.reply_text.call_args
+        reply_text = call_args[0][0]
+        keyboard = call_args[1].get('reply_markup') if 'reply_markup' in call_args[1] else (call_args[0][1] if len(call_args[0]) > 1 else None)
+        self.assertIn("Which client was Task", reply_text)
+        self.assertIsNotNone(keyboard)
+
+        # Verify buttons use index instead of raw name
+        first_btn = keyboard.inline_keyboard[0][0]
+        self.assertTrue(re.match(r'^corr:pick_client:prop_[a-f0-9]+:\d+$', first_btn.callback_data))
+
+        # Click the candidate button
+        up_click = self.make_update(uid=1002, callback_data=first_btn.callback_data)
+        await handlers.handle(up_click, self.context)
+
+        # Verify proposal was updated with client name that has colons without error
+        prop_id = first_btn.callback_data.split(':')[2]
+        prop = self.db.get_nl_proposal(prop_id)
+        self.assertIn('client', prop['proposal']['after'])
+        self.assertIn(':', prop['proposal']['after']['client'])
+
+    # 39. Staleness hashing includes all report-visible facts (case participation, test session build/defects/retest, activities).
+    async def test_39_complete_staleness_hashing_covers_all_renderer_facts(self):
+        sid = self.db.start_shift('2026-09-11T09:00:00+05:30', '2026-09-11T18:00:00+05:30')
+        with self.db.connect() as conn:
+            client_id = self.db._client_id(conn, 'Acme')
+            stamp = '2026-09-11T09:30:00'
+            cid = conn.execute('''INSERT INTO work_cases
+                (client_id, title, product, platform, channel, ticket, priority, status, participation,
+                 next_action, waiting_on, client_updated, review_state, source, created_at, updated_at)
+                VALUES (?, ?, 'AuthService', 'web', 'slack', 'PAY-101', 1, 'new', 'owned',
+                        'Check logs', NULL, 0, 'approved', 'test', ?, ?)''',
+                (client_id, 'Payment Gateway Timeout', stamp, stamp)).lastrowid
+            conn.execute('''INSERT INTO case_events
+                (case_id, shift_id, event_type, detail, actor_role, outcome, occurred_at, created_at)
+                VALUES (?, ?, 'created', 'Payment Gateway Timeout', 'owner', 'new', ?, ?)''',
+                (cid, sid, stamp, stamp))
+        sess_id = self.db.add_test_session(case_id=cid, shift_id=sid, scenario='Checkout flow', build='v1.0.0', defects=None, retest_required=False)
+        aid = self.db.add_support(sid, client='Acme', detail='Investigated auth error', product='AuthService', ticket='SUP-1')
+        t_obj = self.db.add_task('Fix retry logic', client='Acme', ticket='DEV-55', shift_id=sid)
+        tid = t_obj.id
+
+        base_hash = self.db.compute_live_facts_hash(sid)
+
+        # 1. Changing case participation must alter hash
+        self.db.update_case(cid, 'participation', 'assisted', sid)
+        hash_case_part = self.db.compute_live_facts_hash(sid)
+        self.assertNotEqual(base_hash, hash_case_part)
+        self.db.update_case(cid, 'participation', 'owned', sid)
+
+        # 2. Changing test session build must alter hash
+        with self.db.connect() as conn:
+            conn.execute("UPDATE test_sessions SET build='v1.0.1' WHERE id=?", (sess_id,))
+        hash_sess_build = self.db.compute_live_facts_hash(sid)
+        self.assertNotEqual(base_hash, hash_sess_build)
+        with self.db.connect() as conn:
+            conn.execute("UPDATE test_sessions SET build='v1.0.0' WHERE id=?", (sess_id,))
+
+        # 3. Changing test session defects must alter hash
+        with self.db.connect() as conn:
+            conn.execute("UPDATE test_sessions SET defects='BUG-404' WHERE id=?", (sess_id,))
+        hash_sess_def = self.db.compute_live_facts_hash(sid)
+        self.assertNotEqual(base_hash, hash_sess_def)
+        with self.db.connect() as conn:
+            conn.execute("UPDATE test_sessions SET defects=NULL WHERE id=?", (sess_id,))
+
+        # 4. Changing test session retest_required must alter hash
+        with self.db.connect() as conn:
+            conn.execute("UPDATE test_sessions SET retest_required=1 WHERE id=?", (sess_id,))
+        hash_sess_retest = self.db.compute_live_facts_hash(sid)
+        self.assertNotEqual(base_hash, hash_sess_retest)
+        with self.db.connect() as conn:
+            conn.execute("UPDATE test_sessions SET retest_required=0 WHERE id=?", (sess_id,))
+
+        # 5. Changing support product must alter hash
+        with self.db.connect() as conn:
+            conn.execute("UPDATE support_interactions SET product='BillingService' WHERE activity_id=?", (aid,))
+        hash_supp_prod = self.db.compute_live_facts_hash(sid)
+        self.assertNotEqual(base_hash, hash_supp_prod)
+        with self.db.connect() as conn:
+            conn.execute("UPDATE support_interactions SET product='AuthService' WHERE activity_id=?", (aid,))
+
+        # 6. Changing task ticket must alter hash
+        with self.db.connect() as conn:
+            conn.execute("UPDATE tasks SET ticket='DEV-99' WHERE id=?", (tid,))
+        hash_task_ticket = self.db.compute_live_facts_hash(sid)
+        self.assertNotEqual(base_hash, hash_task_ticket)
+
+    # 40. Upgrading an actual version-9 database triggers pre-migration backup and updates to v10.
+    async def test_40_schema_v9_to_v10_upgrade_creates_verified_backup(self):
+        migration_dir = self.root / 'migration_test'
+        migration_dir.mkdir()
+        v9_db_path = migration_dir / 'work.sqlite3'
+
+        # Initialize a complete valid database, then revert to v9 schema
+        base_db = Database(v9_db_path)
+        with closing(sqlite3.connect(str(v9_db_path))) as conn:
+            conn.execute('PRAGMA user_version = 9')
+            conn.execute('ALTER TABLE reports DROP COLUMN facts_snapshot_json')
+            conn.execute("INSERT INTO tasks (title, status, created_at) VALUES ('Legacy task', 'completed', '2026-09-10T09:00:00')")
+            conn.commit()
+
+        # Initialize Database on this v9 file
+        upgraded_db = Database(v9_db_path)
+
+        # 1. Verify PRAGMA user_version is now 10
+        with upgraded_db.connect() as connection:
+            ver = connection.execute('PRAGMA user_version').fetchone()[0]
+            self.assertEqual(ver, 10)
+            # Verify facts_snapshot_json column exists
+            cols = {row['name'] for row in connection.execute('PRAGMA table_info(reports)')}
+            self.assertIn('facts_snapshot_json', cols)
+            # Verify data preserved
+            t = connection.execute("SELECT title FROM tasks WHERE title='Legacy task'").fetchone()
+            self.assertIsNotNone(t)
+            self.assertEqual(t['title'], 'Legacy task')
+
+        # 2. Verify pre-migration backup file was created
+        backup_dir = migration_dir / 'backups'
+        self.assertTrue(backup_dir.is_dir())
+        backups = list(backup_dir.glob('pre-migration-v9-*.sqlite3'))
+        self.assertGreaterEqual(len(backups), 1)
+
+        # 3. Verify backup integrity
+        backup_file = backups[0]
+        with closing(sqlite3.connect(str(backup_file))) as bconn:
+            b_ver = bconn.execute('PRAGMA user_version').fetchone()[0]
+            self.assertEqual(b_ver, 9)
+            b_integrity = bconn.execute('PRAGMA integrity_check').fetchone()[0]
+            self.assertEqual(b_integrity, 'ok')
+            b_task = bconn.execute("SELECT title FROM tasks WHERE title='Legacy task'").fetchone()
+            self.assertIsNotNone(b_task)
+            self.assertEqual(b_task[0], 'Legacy task')
+            # Verify backup did NOT have facts_snapshot_json
+            b_cols = {row[1] for row in bconn.execute('PRAGMA table_info(reports)')}
+            self.assertNotIn('facts_snapshot_json', b_cols)
+
+    # 41. Complete shared report lifecycle through real Application dispatch with gate auth & deduplication.
+    async def test_41_end_to_end_report_lifecycle_application_dispatch(self):
+        from telegram import Update, User, Chat, Message, CallbackQuery
+        from telegram.ext import Application, TypeHandler, CallbackQueryHandler, MessageHandler, filters
+        from telegram.ext._extbot import ExtBot
+        import bot
+
+        with patch.object(ExtBot, 'get_me', new_callable=AsyncMock) as mock_get_me, \
+             patch.object(ExtBot, 'answer_callback_query', new_callable=AsyncMock):
+            mock_get_me.return_value = User(100, 'TestBot', is_bot=True, username='test_bot')
+            app = Application.builder().token('123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11').build()
+            app.bot_data['db'] = self.db
+            app.add_handler(TypeHandler(Update, bot.gate), group=-1)
+            app.add_handler(CallbackQueryHandler(handlers.handle, pattern=bot.CALLBACK_PATTERN))
+            app.add_handler(MessageHandler(filters.TEXT, handlers.handle))
+            await app.initialize()
+
+            # Helper to create real telegram Updates with bot attached
+            user = User(123, 'Owner', is_bot=False)
+            chat = Chat(123, 'private')
+
+            async def dispatch_text(text: str, update_id: int):
+                with patch.object(handlers, 'reply', new_callable=AsyncMock) as mock_reply:
+                    msg = Message(update_id, None, chat, from_user=user, text=text)
+                    msg.set_bot(app.bot)
+                    up = Update(update_id, message=msg)
+                    up.set_bot(app.bot)
+                    await app.process_update(up)
+                    replies = [call[0][1] for call in mock_reply.call_args_list if len(call[0]) > 1]
+                    keyboards = [call[0][2] if len(call[0]) > 2 else call[1].get('reply_markup') or call[1].get('keyboard') for call in mock_reply.call_args_list]
+                    return replies, keyboards
+
+            async def dispatch_cb(callback_data: str, update_id: int):
+                with patch.object(handlers, 'reply', new_callable=AsyncMock) as mock_reply:
+                    msg = Message(update_id, None, chat, from_user=user, text='...')
+                    msg.set_bot(app.bot)
+                    cq = CallbackQuery(f'cq_{update_id}', user, chat_instance='1', message=msg, data=callback_data)
+                    cq.set_bot(app.bot)
+                    up = Update(update_id, callback_query=cq)
+                    up.set_bot(app.bot)
+                    await app.process_update(up)
+                    replies = [call[0][1] for call in mock_reply.call_args_list if len(call[0]) > 1]
+                    keyboards = [call[0][2] if len(call[0]) > 2 else call[1].get('reply_markup') or call[1].get('keyboard') for call in mock_reply.call_args_list]
+                    return replies, keyboards
+
+            # --- Gate Verification ---
+            # 1. Unauthorized user is blocked by bot.gate
+            hacker = User(999, 'Attacker', is_bot=False)
+            hacker_chat = Chat(999, 'private')
+            with patch.object(handlers, 'reply', new_callable=AsyncMock) as mock_reply:
+                hacker_msg = Message(5001, None, hacker_chat, from_user=hacker, text='/health')
+                hacker_msg.set_bot(app.bot)
+                up_bad = Update(5001, message=hacker_msg)
+                up_bad.set_bot(app.bot)
+                await app.process_update(up_bad)
+                self.assertFalse(mock_reply.called)
+                self.assertTrue(self.db.claim_update(5001))  # Never claimed because gate stopped before claim
+
+            # 2. Duplicate update is blocked by bot.gate
+            replies, _ = await dispatch_text('/health', 5002)
+            self.assertTrue(len(replies) > 0)
+            with patch.object(handlers, 'reply', new_callable=AsyncMock) as mock_reply:
+                # Same update_id 5002
+                msg_dup = Message(5002, None, chat, from_user=user, text='/health')
+                msg_dup.set_bot(app.bot)
+                up_dup = Update(5002, message=msg_dup)
+                up_dup.set_bot(app.bot)
+                await app.process_update(up_dup)
+                self.assertFalse(mock_reply.called)
+
+            # --- Report Lifecycle ---
+            # Step 1: Start shift and plan work
+            sid = self.db.start_shift('2026-09-11T09:00:00+05:30', '2026-09-11T18:00:00+05:30')
+            tid1 = self.db.add_task('Complete client report', client='Acme', shift_id=sid)
+            self.db.add_activity(sid, 'support', 'Helped Acme with API integration', client='Acme', outcome='resolved')
+
+            # Step 2: Generate initial EOD report via /eod
+            replies, keyboards = await dispatch_text('/eod', 6001)
+            self.assertTrue(any("Draft #" in r for r in replies))
+            reps = self.db.list_reports(sid)
+            self.assertEqual(len(reps), 1)
+            rep1 = reps[0]
+            self.assertFalse(rep1['finalized'])
+            self.assertIsNotNone(rep1['facts_snapshot_json'])
+            self.assertIsNotNone(rep1['facts_hash'])
+            orig_hash = rep1['facts_hash']
+
+            # Step 3: Dispatch AI rewrite via callback ai:{rep1['id']}
+            with patch('ai.writer') as mock_writer_cls:
+                mock_engine = MagicMock()
+                mock_engine.draft = AsyncMock(return_value="AI Rewritten: Handled Acme support resolved.")
+                mock_engine.last_model = 'gemini-1.5-flash'
+                mock_writer_cls.return_value = mock_engine
+                with patch.object(config, 'AI_KEY', 'mock_key'), patch.object(config, 'AI_MODEL', 'gemini-1.5-flash'):
+                    replies, keyboards = await dispatch_cb(f"ai:{rep1['id']}", 6002)
+
+            reps = self.db.list_reports(sid)
+            self.assertEqual(len(reps), 2)
+            ai_rep = reps[1]
+            self.assertEqual(ai_rep['source_report_id'], rep1['id'])
+            # CRITICAL FINDING 1 VERIFICATION: AI draft preserves facts_snapshot_json and facts_hash
+            self.assertEqual(ai_rep['facts_hash'], orig_hash)
+            self.assertIsNotNone(ai_rep['facts_snapshot_json'])
+
+            # Step 4: User logs NEW late work (activity #2)
+            self.db.add_activity(sid, 'testing', 'Tested late production deployment', outcome='verified')
+
+            # Step 5: User says "make the EOD shorter"
+            replies, keyboards = await dispatch_text("make the EOD shorter", 6003)
+            self.assertTrue(any("Updated EOD (Revision #" in r for r in replies))
+            reps = self.db.list_reports(sid)
+            self.assertEqual(len(reps), 3)
+            rev_rep = reps[2]
+
+            # CRITICAL FINDINGS 1 & 3 VERIFICATION:
+            # 1. Wording revision only has activity #1 and does NOT include late activity #2
+            self.assertNotIn("Tested late production deployment", rev_rep['text'])
+            self.assertIn("Helped Acme with API integration", rev_rep['text'])
+            self.assertEqual(rev_rep['facts_hash'], orig_hash)
+
+            # 3. Wording revision has validation saved and Finalize button provided
+            with self.db.connect() as conn:
+                v_row = conn.execute('SELECT is_valid FROM report_validations WHERE report_id=?', (rev_rep['id'],)).fetchone()
+                self.assertIsNotNone(v_row)
+                self.assertEqual(v_row['is_valid'], 1)
+
+            # Check that Finalize button was returned in reply
+            has_finalize_btn = False
+            for kb in keyboards:
+                if kb and hasattr(kb, 'inline_keyboard'):
+                    for row in kb.inline_keyboard:
+                        for btn in row:
+                            if btn.callback_data == f"final:{rev_rep['id']}":
+                                has_finalize_btn = True
+            self.assertTrue(has_finalize_btn, "Wording revision must provide a Finalize button")
+
+            # Step 6: User clicks Finalize button
+            replies, _ = await dispatch_cb(f"final:{rev_rep['id']}", 6004)
+            self.assertTrue(any(f"Report #{rev_rep['id']} finalized" in r for r in replies))
+            self.assertTrue(self.db.report(rev_rep['id'])['finalized'])
+
+            # Step 7: Close the shift
+            self.db.close_shift(sid)
+            self.assertIsNone(self.db.active_shift())
+
+            # Step 8: Historical /eod revision for the closed shift reflects new late work
+            replies, _ = await dispatch_text(f"/eod revision {sid}", 6005)
+            self.assertTrue(any("Revised EOD" in r for r in replies))
+            reps = self.db.list_reports(sid)
+            self.assertEqual(len(reps), 4)
+            hist_rep = reps[3]
+            self.assertFalse(hist_rep['finalized'])
+            # Historical revision includes the late activity #2
+            self.assertIn("Tested late production deployment", hist_rep['text'])
+            # Hash reflects the updated facts
+            self.assertNotEqual(hist_rep['facts_hash'], orig_hash)
 
 
 if __name__ == '__main__':
