@@ -118,14 +118,18 @@ import hashlib
 def compute_shift_facts_hash(activities, tasks, cases=None, test_sessions=None) -> str:
     payload = []
     for a in activities:
-        payload.append((a['id'], a.get('category'), a.get('detail'), a.get('outcome'), a.get('task_id'), a.get('occurred_at')))
+        payload.append(('activity', a['id'], a.get('category'), a.get('detail'), a.get('client'),
+                        a.get('outcome'), a.get('task_id'), a.get('occurred_at')))
     for t in tasks:
-        payload.append((t.id, t.title, getattr(t.status, 'value', str(t.status)), t.priority, t.blocked_reason, t.due_date))
+        payload.append(('task', t.id, t.title, getattr(t.status, 'value', str(t.status)),
+                        t.priority, getattr(t, 'client', None), t.blocked_reason, t.due_date))
     for c in (cases or []):
-        payload.append((c.get('id'), c.get('status'), c.get('client_updated'), c.get('next_action')))
+        payload.append(('case', c.get('id'), c.get('title'), c.get('client'), c.get('status'),
+                        c.get('client_updated'), c.get('next_action')))
     for s in (test_sessions or []):
-        payload.append((s.get('id'), s.get('result'), s.get('retest_result')))
-    raw = repr(sorted(payload, key=lambda x: str(x[0])))
+        payload.append(('session', s.get('id'), s.get('scenario'), s.get('environment'),
+                        s.get('result'), s.get('retest_result')))
+    raw = repr(sorted(payload, key=lambda x: (x[0], str(x[1]))))
     return hashlib.sha256(raw.encode('utf-8')).hexdigest()
 
 

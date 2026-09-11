@@ -700,6 +700,264 @@ class ConversationalPlanningTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Legacy carried task", snap_titles)
         self.assertIn("Build new API", snap_titles)
 
+    # 31. Dispatcher and CALLBACK_PATTERN regex coverage for all button formats.
+    async def test_31_callback_pattern_matches_all_new_button_formats(self):
+        from bot import CALLBACK_PATTERN
+        test_callbacks = [
+            "checkpoint:update:12:in_progress:completed",
+            "checkpoint:update:12:pending:blocked",
+            "task:reschedule:15:tomorrow",
+            "task:reschedule:15:today",
+            "corr:pick_task:prop_abcd1234:42",
+            "corr:pick_client:prop_abcd1234:NVIZION",
+            "corr:confirm:prop_abcd1234",
+            "corr:cancel:prop_abcd1234",
+            "late:shift:prop_abcd1234:5",
+            "late:cancel:prop_abcd1234",
+        ]
+        for cb in test_callbacks:
+            with self.subTest(callback=cb):
+                self.assertIsNotNone(re.match(CALLBACK_PATTERN, cb), f"CALLBACK_PATTERN failed to match {cb}")
+
+    # 32. Correction selection updates proposal_json without database error and clicks through.
+    async def test_32_correction_selection_writes_proposal_json_and_executes(self):
+        sid = self.db.start_shift('2026-09-11T09:00:00+05:30', '2026-09-11T18:00:00+05:30')
+        t1 = self.db.add_task("Payment gateway integration", shift_id=sid)
+        t2 = self.db.add_task("Payment gateway stress testing", shift_id=sid)
+
+        # Ambiguous correction referencing failure without active context task
+        up1 = self.make_update("Actually, it failed on staging", uid=1001)
+        await handlers.handle(up1, self.context)
+
+        reply1 = up1.effective_message.reply_text.call_args[0][0]
+        self.assertIn("Which task", reply1)
+        markup1 = up1.effective_message.reply_text.call_args[1].get('reply_markup')
+        self.assertIsNotNone(markup1)
+
+        # Find the button for task t1
+        t1_buttons = [btn for row in markup1.inline_keyboard for btn in row if f":{t1.id}" in btn.callback_data]
+        self.assertTrue(len(t1_buttons) > 0)
+        pick_cb = t1_buttons[0].callback_data
+        from bot import CALLBACK_PATTERN
+        self.assertIsNotNone(re.match(CALLBACK_PATTERN, pick_cb))
+
+        # Click the task pick button through real handler dispatch
+        up_pick = self.make_update(callback_data=pick_cb, uid=1002)
+        await handlers.handle(up_pick, self.context)
+
+        # Verify proposal updated successfully in database (no schema column error)
+        prop_id = pick_cb.split(':')[2]
+        prop = self.db.get_nl_proposal(prop_id)
+        self.assertIsNotNone(prop)
+        self.assertEqual(prop['proposal']['task_id'], t1.id)
+
+        # Verify confirmation prompt was sent with Confirm Correction button
+        reply2 = up_pick.effective_message.reply_text.call_args[0][0]
+        self.assertIn("Confirm to apply?", reply2)
+        markup2 = up_pick.effective_message.reply_text.call_args[1].get('reply_markup')
+        confirm_btn = [btn for row in markup2.inline_keyboard for btn in row if btn.callback_data.startswith('corr:confirm:')][0]
+        self.assertIsNotNone(re.match(CALLBACK_PATTERN, confirm_btn.callback_data))
+
+        # Click confirm button through dispatcher
+        up_confirm = self.make_update(callback_data=confirm_btn.callback_data, uid=1003)
+        await handlers.handle(up_confirm, self.context)
+
+        # Verify task is now blocked
+        t1_updated = self.db.get_task(t1.id)
+        self.assertEqual(t1_updated.status, TaskStatus.BLOCKED)
+        self.assertIn("staging", t1_updated.blocked_reason)
+
+    # 33. Wording-only revision preserves immutable factual snapshot and excludes subsequent work.
+    async def test_33_wording_revision_uses_immutable_factual_snapshot(self):
+        sid = self.db.start_shift('2026-09-11T09:00:00+05:30', '2026-09-11T18:00:00+05:30')
+        t = self.db.add_task("Initial Feature A", shift_id=sid)
+        self.db.add_activity(sid, 'task', 'Initial Feature A completed', outcome='completed', task_id=t.id)
+
+        up_eod = self.make_update('/eod', uid=1001)
+        await handlers.handle(up_eod, self.context)
+
+        reps = self.db.list_reports(sid)
+        self.assertEqual(len(reps), 1)
+        orig_rep = reps[0]
+        orig_hash = orig_rep['facts_hash']
+        orig_snap_json = orig_rep['facts_snapshot_json']
+        self.assertIsNotNone(orig_snap_json)
+        self.assertIn("Initial Feature A", orig_rep['text'])
+
+        # Now add new work after EOD generation
+        self.db.add_activity(sid, 'support', 'Post-EOD critical hotfix for ACME', client='ACME', outcome='resolved')
+
+        # Request wording revision: "make the eod shorter"
+        up_shorter = self.make_update("make the eod shorter", uid=1002)
+        await handlers.handle(up_shorter, self.context)
+
+        reps_after = self.db.list_reports(sid)
+        self.assertEqual(len(reps_after), 2)
+        rev_rep = reps_after[1]
+        self.assertEqual(rev_rep['revision'], 2)
+        self.assertEqual(rev_rep['style'], 'short')
+
+        # Crucial check: the wording revision must NOT leak the post-EOD work!
+        self.assertNotIn("Post-EOD critical hotfix", rev_rep['text'])
+        # Fingerprint must match the immutable snapshot
+        self.assertEqual(rev_rep['facts_hash'], orig_hash)
+        self.assertEqual(rev_rep['facts_snapshot_json'], orig_snap_json)
+
+    # 34. Staleness check consistency across cases, test sessions, and client changes.
+    async def test_34_staleness_consistency_across_cases_sessions_and_client_changes(self):
+        sid = self.db.start_shift('2026-09-11T09:00:00+05:30', '2026-09-11T18:00:00+05:30')
+        t = self.db.add_task("Core task", client="InitialClient", shift_id=sid)
+        self.db.create_case("Case 101", client="InitialClient", status="new", shift_id=sid)
+        self.db.add_testing(sid, "Login scenario", result="pass", environment="staging")
+
+        # Generate report
+        up = self.make_update('/eod', uid=1001)
+        await handlers.handle(up, self.context)
+
+        reps = self.db.list_reports(sid)
+        self.assertEqual(len(reps), 1)
+        rid = reps[0]['id']
+
+        # Retrieval check: must NOT be stale immediately after creation
+        rep_fetched = self.db.report(rid)
+        self.assertEqual(rep_fetched['is_stale'], 0)
+
+        # Mutate client field on task
+        self.db.update_task(t.id, 'client', 'UpdatedClient')
+
+        # Retrieval check: must detect mutation as stale
+        rep_stale = self.db.report(rid)
+        self.assertEqual(rep_stale['is_stale'], 1)
+
+    # 35. Unmatched and overlapping late work requests shift selection, clicking button assigns to selected shift.
+    async def test_35_unmatched_and_overlapping_late_work_prompts_and_assigns(self):
+        tz = ZoneInfo(config.TIMEZONE)
+        now_dt = datetime.now(tz)
+        yest_date = (now_dt - timedelta(days=1)).date()
+        today_date = now_dt.date()
+
+        # Shift 1: 09:00 to 17:00 yesterday
+        sid1 = self.db.start_shift(f"{yest_date.isoformat()}T09:00:00+05:30", f"{yest_date.isoformat()}T17:00:00+05:30")
+        self.db.close_shift(sid1)
+        # Shift 2: 16:30 to 23:00 yesterday (overlaps with Shift 1 from 16:30 to 17:00)
+        sid2 = self.db.start_shift(f"{yest_date.isoformat()}T16:30:00+05:30", f"{yest_date.isoformat()}T23:00:00+05:30")
+        self.db.close_shift(sid2)
+
+        # Active shift: today
+        sid3 = self.db.start_shift(f"{today_date.isoformat()}T09:00:00+05:30", f"{today_date.isoformat()}T18:00:00+05:30")
+
+        # 1. Overlapping match: 16:45 falls into both Shift 1 and Shift 2
+        up_overlap = self.make_update("Yesterday at 4:45 pm I resolved the memory leak", uid=1001)
+        await handlers.handle(up_overlap, self.context)
+
+        reply1 = up_overlap.effective_message.reply_text.call_args[0][0]
+        self.assertIn("Multiple shifts match", reply1)
+        markup1 = up_overlap.effective_message.reply_text.call_args[1].get('reply_markup')
+        self.assertIsNotNone(markup1)
+
+        # Find button for sid2
+        from bot import CALLBACK_PATTERN
+        sid2_btn = [btn for row in markup1.inline_keyboard for btn in row if f":{sid2}" in btn.callback_data][0]
+        self.assertIsNotNone(re.match(CALLBACK_PATTERN, sid2_btn.callback_data))
+
+        # Click sid2 button
+        up_click = self.make_update(callback_data=sid2_btn.callback_data, uid=1002)
+        await handlers.handle(up_click, self.context)
+
+        acts2 = self.db.activities(sid2)
+        self.assertTrue(any('memory leak' in a['detail'] for a in acts2))
+        self.assertFalse(any('memory leak' in a['detail'] for a in self.db.activities(sid1)))
+        self.assertFalse(any('memory leak' in a['detail'] for a in self.db.activities(sid3)))
+
+        # 2. Unmatched timestamp: 3:00 am yesterday (no shift ran at 3:00 am yesterday)
+        up_unmatched = self.make_update("Yesterday at 3:00 am I investigated a server reboot", uid=1003)
+        await handlers.handle(up_unmatched, self.context)
+
+        reply2 = up_unmatched.effective_message.reply_text.call_args[0][0]
+        self.assertIn("No shift directly matched", reply2)
+        markup2 = up_unmatched.effective_message.reply_text.call_args[1].get('reply_markup')
+        self.assertIsNotNone(markup2)
+
+        # Must NOT have defaulted to active shift sid3
+        self.assertFalse(any('server reboot' in a['detail'] for a in self.db.activities(sid3)))
+
+    # 36. Historical /eod revision works on closed shift without active shift.
+    async def test_36_historical_eod_revision_without_active_shift(self):
+        sid = self.db.start_shift('2026-09-10T09:00:00+05:30', '2026-09-10T18:00:00+05:30')
+        t = self.db.add_task("Original Feature", shift_id=sid)
+        self.db.add_activity(sid, 'task', 'Original Feature done', outcome='completed', task_id=t.id)
+        # Generate initial EOD
+        up_eod = self.make_update('/eod', uid=1001)
+        await handlers.handle(up_eod, self.context)
+        reps = self.db.list_reports(sid)
+        self.assertEqual(len(reps), 1)
+        orig_rid = reps[0]['id']
+        self.db.finalize(orig_rid)
+        self.db.close_shift(sid)
+
+        # Confirm no active shift
+        self.assertIsNone(self.db.active_shift())
+
+        # Add late work to closed shift
+        self.db.add_activity(sid, 'testing', 'Late sanity test on prod', outcome='verified')
+
+        # Run /eod revision without an active shift
+        up_rev = self.make_update(f'/eod revision {sid}', uid=1002)
+        await handlers.handle(up_rev, self.context)
+
+        reply = up_rev.effective_message.reply_text.call_args[0][0]
+        self.assertIn("Revised EOD", reply)
+        self.assertIn(f"Shift #{sid}", reply)
+        self.assertIn("Late sanity test on prod", reply)
+
+        reps_after = self.db.list_reports(sid)
+        self.assertEqual(len(reps_after), 2)
+        rev_report = reps_after[1]
+        self.assertEqual(rev_report['source_report_id'], orig_rid)
+        self.assertEqual(rev_report['revision'], 2)
+
+    # 37. Atomic planning confirmations increment snapshot versions.
+    async def test_37_atomic_planning_increments_snapshot_versions(self):
+        sid = self.db.start_shift('2026-09-11T09:00:00+05:30', '2026-09-11T18:00:00+05:30')
+        # Version 1 confirmation
+        conv_id1 = self.db.save_planning_conversation(
+            123, 'daily_planning', 'awaiting_confirmation',
+            {'shift_range': {'start': '09:00', 'end': '18:00'}, 'tasks': [{'title': 'Task A', 'is_new': True}]},
+            shift_id=sid
+        )
+        self.db.confirm_daily_plan_atomic(123, conv_id1, '2026-09-11T09:00:00+05:30', '2026-09-11T18:00:00+05:30', None, [{'title': 'Task A', 'is_new': True}])
+
+        with self.db.connect() as conn:
+            snaps = conn.execute('SELECT version FROM plan_snapshots WHERE shift_id=? ORDER BY version ASC', (sid,)).fetchall()
+            versions = [r['version'] for r in snaps]
+            self.assertEqual(versions, [1])
+
+        # Version 2 confirmation
+        conv_id2 = self.db.save_planning_conversation(
+            123, 'daily_planning', 'awaiting_confirmation',
+            {'shift_range': {'start': '09:00', 'end': '18:00'}, 'tasks': [{'title': 'Task B', 'is_new': True}]},
+            shift_id=sid
+        )
+        self.db.confirm_daily_plan_atomic(123, conv_id2, '2026-09-11T09:00:00+05:30', '2026-09-11T18:00:00+05:30', None, [{'title': 'Task B', 'is_new': True}])
+
+        with self.db.connect() as conn:
+            snaps = conn.execute('SELECT version FROM plan_snapshots WHERE shift_id=? ORDER BY version ASC', (sid,)).fetchall()
+            versions = [r['version'] for r in snaps]
+            self.assertEqual(versions, [1, 2])
+
+        # Version 3 confirmation
+        conv_id3 = self.db.save_planning_conversation(
+            123, 'daily_planning', 'awaiting_confirmation',
+            {'shift_range': {'start': '09:00', 'end': '18:00'}, 'tasks': [{'title': 'Task C', 'is_new': True}]},
+            shift_id=sid
+        )
+        self.db.confirm_daily_plan_atomic(123, conv_id3, '2026-09-11T09:00:00+05:30', '2026-09-11T18:00:00+05:30', None, [{'title': 'Task C', 'is_new': True}])
+
+        with self.db.connect() as conn:
+            snaps = conn.execute('SELECT version FROM plan_snapshots WHERE shift_id=? ORDER BY version ASC', (sid,)).fetchall()
+            versions = [r['version'] for r in snaps]
+            self.assertEqual(versions, [1, 2, 3])
+
 
 if __name__ == '__main__':
     unittest.main()

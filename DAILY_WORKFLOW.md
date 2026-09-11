@@ -95,9 +95,9 @@ This happened during my previous shift: Emergency firewall patch.
 
 ### Rules & Storage
 - **Automatic Categorization:** Keywords in the detail automatically classify late work into `testing`, `learning`, `support`, or `task` (e.g. "I tested..." is categorized as `testing`, never misclassified as `support`).
-- **Shift Boundary Matching:** The occurrence timestamp is matched against past shift boundaries (`start <= occurred_at <= end/closed_at`). Work is assigned to the shift that actually covered that time window, preserving accurate historical metrics.
+- **Shift Boundary Matching & Interactive Selection:** The occurrence timestamp is matched against past shift boundaries (`start <= occurred_at <= end/closed_at`). If exactly one shift matches, it is assigned directly. If the timestamp overlaps multiple shifts or matches no shift, the bot prompts with interactive buttons to explicitly select the target shift—never silently falling back to the active shift or picking the first candidate.
 - Stored with `occurred_at` (timezone-aware ISO datetime) and `time_precision` (`exact`, `approximate`, `unknown`).
-- **Finalized shift immutability:** Late entries for a closed shift log the activity against that shift and prompt the user to generate an explicit new report revision (`/eod revision`). Finalized reports are never silently overwritten.
+- **Finalized shift immutability & Historical Revision Flow:** Late entries for a closed shift log the activity against that shift. The user can generate a revised report with `/eod revision [shift_id] [style]` without requiring an active shift. This creates a new versioned report revision reflecting the added work while preserving the original finalized report.
 
 ---
 
@@ -128,7 +128,7 @@ Compares current shift progress against the frozen start-of-day baseline:
 All report paths (slash commands, natural language, scheduler) use `build_report_facts` and `ReportValidator`:
 - **Unique Clients vs. Interaction Count:** 4 support queries for 1 client are counted as 1 distinct client and 4 interactions (no count inflation).
 - **Verification separation:** Developer-reported fixes do not count as verified until retested.
-- **Automatic Staleness Detection:** Reports retain `facts_hash`. Any new work, task edits, or activities automatically mark unfinalized reports stale (`is_stale = 1`) without requiring manual commands.
+- **Automatic Staleness Detection:** Reports retain `facts_hash` computed symmetrically across generation and retrieval from activities, tasks, cases, testing sessions, and client assignments. Any new work or client/status edits mark unfinalized reports stale (`is_stale = 1`) without false positives on reports containing cases or tests.
 
 ### Conversational Report Review
 Request formatting adjustments without mutating underlying data or losing factual context:
@@ -138,8 +138,8 @@ Use bullet points
 Add the testing environment
 ```
 - Creates a new versioned entry in `reports` with `revision = revision + 1` and `style = 'short' | 'detailed'`.
-- Preserves the full factual snapshot (cases, testing sessions, baseline tasks, client masking) across wording revisions.
-- Preserves historical versions immutably.
+- **Immutable Factual Snapshot:** Wording revisions reload and render from the source report's frozen `facts_snapshot_json`, ensuring work added after the original draft never leaks into a shortened or re-styled revision.
+- Preserves the original `facts_hash` and snapshot immutably on the revision.
 - Does not change or delete underlying tasks or activities.
 
 ---

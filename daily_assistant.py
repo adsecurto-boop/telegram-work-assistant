@@ -240,7 +240,7 @@ async def handle_daily(update, context) -> bool:
                 p_dict['before'] = {'status': target_task.status.value, 'blocked_reason': target_task.blocked_reason}
                 env = p_dict['after'].get('environment', '')
                 with db.connect() as conn:
-                    conn.execute("UPDATE nl_proposals SET proposed_values_json=? WHERE id=?", (json.dumps(p_dict), prop_id))
+                    conn.execute("UPDATE nl_proposals SET proposal_json=? WHERE id=?", (json.dumps(p_dict), prop_id))
                 buttons = [
                     [InlineKeyboardButton('Confirm Correction', callback_data=f'corr:confirm:{prop_id}'),
                      InlineKeyboardButton('Cancel', callback_data=f'corr:cancel:{prop_id}')]
@@ -255,7 +255,7 @@ async def handle_daily(update, context) -> bool:
                 p_dict['before'] = {'client': target_task.client}
                 other_client = p_dict['after'].get('client')
                 with db.connect() as conn:
-                    conn.execute("UPDATE nl_proposals SET proposed_values_json=? WHERE id=?", (json.dumps(p_dict), prop_id))
+                    conn.execute("UPDATE nl_proposals SET proposal_json=? WHERE id=?", (json.dumps(p_dict), prop_id))
                 buttons = [
                     [InlineKeyboardButton('Confirm Correction', callback_data=f'corr:confirm:{prop_id}'),
                      InlineKeyboardButton('Cancel', callback_data=f'corr:cancel:{prop_id}')]
@@ -276,7 +276,7 @@ async def handle_daily(update, context) -> bool:
             p_dict['after']['client'] = client_name
             target_task = db.get_task(p_dict['task_id'])
             with db.connect() as conn:
-                conn.execute("UPDATE nl_proposals SET proposed_values_json=? WHERE id=?", (json.dumps(p_dict), prop_id))
+                conn.execute("UPDATE nl_proposals SET proposal_json=? WHERE id=?", (json.dumps(p_dict), prop_id))
             buttons = [
                 [InlineKeyboardButton('Confirm Correction', callback_data=f'corr:confirm:{prop_id}'),
                  InlineKeyboardButton('Cancel', callback_data=f'corr:cancel:{prop_id}')]
@@ -298,6 +298,41 @@ async def handle_daily(update, context) -> bool:
             prop_id = data.split(':')[2]
             db.cancel_nl_proposal(prop_id, owner_id)
             await reply(update, 'Proposed correction cancelled.')
+            return True
+        elif data.startswith('late:shift:'):
+            await cq.answer()
+            parts = data.split(':')
+            prop_id = parts[2]
+            sid = int(parts[3])
+            prop = db.get_nl_proposal(prop_id)
+            if not prop or prop['status'] != 'pending':
+                await reply(update, "Proposal expired or already resolved.")
+                return True
+            claimed = db.claim_nl_proposal(prop_id, owner_id)
+            p_dict = claimed['proposal']
+            detail = p_dict['detail']
+            category = p_dict['category']
+            occurred_at = p_dict.get('occurred_at')
+            precision = p_dict.get('precision', 'exact')
+            target_shift = db.shift(sid)
+            active_s = db.active_shift()
+            is_closed = bool(target_shift and (target_shift.get('closed_at') or (active_s and sid != active_s['id'])))
+            aid = db.add_activity(sid, category, detail, occurred_at=occurred_at, time_precision=precision)
+            db.finish_nl_proposal(prop_id, 'accepted')
+            occ_display = occurred_at[:16].replace('T', ' ') if occurred_at else 'unknown'
+            if is_closed:
+                await reply(update,
+                            f"Logged late work #{aid} ('{detail}') [category={category}, occurred={occ_display}, precision={precision}] for finalized Shift #{sid}.\n"
+                            f"Existing finalized EOD is immutable. Generate a new revision with /eod revision.")
+            else:
+                await reply(update,
+                            f"Logged late work #{aid} ('{detail}') [category={category}, occurred={occ_display}, precision={precision}]. /undo to revert.")
+            return True
+        elif data.startswith('late:cancel:'):
+            await cq.answer()
+            prop_id = data.split(':')[2]
+            db.cancel_nl_proposal(prop_id, owner_id)
+            await reply(update, 'Late work entry cancelled.')
             return True
         return False
 
@@ -711,11 +746,22 @@ async def handle_daily(update, context) -> bool:
         all_shifts = db.list_shifts(limit=20)
         target_shift = None
 
-        if late_prev_shift:
-            for s in all_shifts:
-                if s.get('closed_at') or (shift and s['id'] != shift['id']):
-                    target_shift = s
-                    break
+        if late_before_lunch:
+            target_shift = shift
+        elif late_prev_shift:
+            prev_shifts = [s for s in all_shifts if s.get('closed_at') or (shift and s['id'] != shift['id'])]
+            if len(prev_shifts) == 1:
+                target_shift = prev_shifts[0]
+            elif len(prev_shifts) > 1:
+                proposal = {'action': 'late_work', 'detail': detail, 'category': category, 'occurred_at': occurred_at, 'precision': precision}
+                prop_id = db.create_nl_proposal(owner_id=owner_id, intent='late_work', proposal_dict=proposal)
+                buttons = [
+                    [InlineKeyboardButton(f"Shift #{s['id']} ({s['start'][:10]} {s['start'][11:16]}-{s.get('end', '')[11:16] or 'closed'})", callback_data=f"late:shift:{prop_id}:{s['id']}")]
+                    for s in prev_shifts[:4]
+                ]
+                buttons.append([InlineKeyboardButton('Cancel', callback_data=f"late:cancel:{prop_id}")])
+                await reply(update, f"Multiple previous shifts found for late work ('{detail}'). Which shift does this belong to?", InlineKeyboardMarkup(buttons))
+                return True
         elif occurred_at:
             occ_dt = datetime.fromisoformat(occurred_at)
             if occ_dt.tzinfo is None:
@@ -736,11 +782,23 @@ async def handle_daily(update, context) -> bool:
                 if (s_start - timedelta(minutes=30)) <= occ_dt <= (s_end + timedelta(minutes=30)):
                     matching_shifts.append(s)
 
-            if matching_shifts:
+            if len(matching_shifts) == 1:
                 target_shift = matching_shifts[0]
-
-        if not target_shift:
-            target_shift = shift
+            else:
+                candidate_shifts = matching_shifts if len(matching_shifts) > 1 else all_shifts[:4]
+                if not candidate_shifts:
+                    await reply(update, f"Could not determine shift for late work ('{detail}'). Please start a shift first.")
+                    return True
+                proposal = {'action': 'late_work', 'detail': detail, 'category': category, 'occurred_at': occurred_at, 'precision': precision}
+                prop_id = db.create_nl_proposal(owner_id=owner_id, intent='late_work', proposal_dict=proposal)
+                buttons = [
+                    [InlineKeyboardButton(f"Shift #{s['id']} ({s['start'][:10]} {s['start'][11:16]}-{s.get('end', '')[11:16] or ('active' if not s.get('closed_at') else 'closed')})", callback_data=f"late:shift:{prop_id}:{s['id']}")]
+                    for s in candidate_shifts
+                ]
+                buttons.append([InlineKeyboardButton('Cancel', callback_data=f"late:cancel:{prop_id}")])
+                msg_reason = "Multiple shifts match this timestamp" if len(matching_shifts) > 1 else "No shift directly matched this timestamp"
+                await reply(update, f"{msg_reason} for late work ('{detail}'). Which shift does this belong to?", InlineKeyboardMarkup(buttons))
+                return True
 
         if target_shift:
             sid = target_shift['id']
@@ -766,22 +824,37 @@ async def handle_daily(update, context) -> bool:
     env_match = re.search(r'\badd\s+(?:the\s+)?testing\s+environment\b', text, re.I)
     if short_match or bullets_match or env_match:
         if shift:
-            reports = [r for r in db.list_reports(shift['id']) if r['kind'] == 'eod']
-            if reports:
-                last_rep = reports[-1]
+            reports_list = [r for r in db.list_reports(shift['id']) if r['kind'] == 'eod']
+            if reports_list:
+                last_rep = reports_list[-1]
                 style = 'short' if short_match else 'detailed' if env_match else 'standard'
-                activities = db.activities(shift['id'])
-                tasks = db.tasks_for_shift(shift['id'])
-                cases = db.cases_for_shift(shift['id'])
-                sessions = db.test_sessions(shift['id'])
-                baseline_snap = db.get_baseline_plan_snapshot(shift['id'])
-                baseline_tasks = baseline_snap.get('tasks') if baseline_snap else None
-                mask = (db.get_setting('mask_client_names') == 'true')
+                snap_json = last_rep.get('facts_snapshot_json')
+                if snap_json:
+                    snap = json.loads(snap_json)
+                    shift_data = snap.get('shift', shift)
+                    activities = snap.get('activities', [])
+                    from models import Task
+                    tasks = [Task.from_row(t) if isinstance(t, dict) else t for t in snap.get('tasks', [])]
+                    cases = snap.get('cases', [])
+                    sessions = snap.get('sessions', [])
+                    baseline_tasks = snap.get('baseline_snapshot')
+                    mask = snap.get('mask', False)
+                else:
+                    shift_data = shift
+                    activities = db.activities(shift['id'])
+                    tasks = db.tasks_for_shift(shift['id'])
+                    cases = db.cases_for_shift(shift['id'])
+                    sessions = db.test_sessions(shift['id'])
+                    baseline_snap = db.get_baseline_plan_snapshot(shift['id'])
+                    baseline_tasks = baseline_snap.get('tasks') if baseline_snap else None
+                    mask = (db.get_setting('mask_client_names') == 'true')
                 from reports import generate_report
-                new_text = generate_report('eod', shift, activities, tasks, style=style,
+                new_text = generate_report('eod', shift_data, activities, tasks, style=style,
                                            mask_clients=mask, cases=cases, test_sessions=sessions,
                                            baseline_snapshot=baseline_tasks)
-                rev_id = db.create_report_revision(last_rep['id'], new_text, style=style)
+                rev_id = db.create_report_revision(last_rep['id'], new_text, style=style,
+                                                   facts_hash=last_rep.get('facts_hash'),
+                                                   facts_snapshot=snap_json)
                 await reply(update, f"Updated EOD (Revision #{rev_id}):\n\n{new_text}")
                 return True
 

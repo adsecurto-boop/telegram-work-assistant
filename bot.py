@@ -15,12 +15,13 @@ from runtime import instance_lock
 CALLBACK_PATTERN = (
     r'^wd:(copy|edit|saved|shared|cancelled):\d+:\d+$|'
     r'^(final|ai|close|organize|apply|dismiss):\d+$|^drop:\d+:\d+$|'
-    r'^task:[a-z_]+:\d+$|^src:(accept|ignore):\d+$|'
+    r'^task:[a-z_]+:\d+(:[a-z0-9_]+)?$|^src:(accept|ignore):\d+$|'
     r'^case:[a-z_]+:\d+$|^follow:(done|snooze):\d+$|'
     r'^audit:undo:\d+$|^nl:choose:\d+:[a-z_]+$|'
     r'^prop:(accept|cancel):prop_[a-f0-9]+$|^prop:choose:prop_[a-f0-9]+:\d+$|'
-    r'^plan:(confirm|cancel):\d+$|^checkpoint:update:\d+:[a-z_]+$|'
-    r'^corr:(confirm|cancel):prop_[a-f0-9]+$'
+    r'^plan:(confirm|cancel):\d+$|^checkpoint:update:\d+:[a-z_]+(:[a-z_]+)?$|'
+    r'^corr:(confirm|cancel|pick_task|pick_client):prop_[a-f0-9]+(:[a-zA-Z0-9_ -]+)?$|'
+    r'^late:(shift|cancel):prop_[a-f0-9]+(:\d+)?$'
 )
 
 async def gate(update,context):

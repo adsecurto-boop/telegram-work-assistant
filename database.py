@@ -449,7 +449,8 @@ class Database:
                 'provenance_json': 'TEXT',
                 'revision': 'INTEGER NOT NULL DEFAULT 1',
                 'is_stale': 'INTEGER NOT NULL DEFAULT 0',
-                'facts_hash': 'TEXT'},
+                'facts_hash': 'TEXT',
+                'facts_snapshot_json': 'TEXT'},
             'proposals': {
                 'dismissed': 'INTEGER NOT NULL DEFAULT 0', 'model': 'TEXT',
                 'prompt_version': 'TEXT'},
@@ -827,10 +828,11 @@ class Database:
                                   (normalized,)).fetchone()[0]
 
     def add_activity(self, shift_id, category, detail, client=None, channel=None, outcome=None,
-                     source_message_id=None, case_id=None, occurred_at=None, time_precision='exact'):
+                     source_message_id=None, case_id=None, occurred_at=None, time_precision='exact',
+                     task_id=None):
         with self.connect() as connection:
             return self._activity(connection, shift_id, category, detail, client, channel, outcome,
-                                  source_message_id=source_message_id, case_id=case_id,
+                                  task_id=task_id, source_message_id=source_message_id, case_id=case_id,
                                   occurred_at=occurred_at, time_precision=time_precision)
 
     def add_support(self, shift_id, detail, client=None, channel=None, outcome=None,
@@ -926,13 +928,23 @@ class Database:
                                        (replacement, activity_id))
 
     def save_report(self, shift_id, kind, text, style='standard', provider=None, model=None,
-                    prompt_version=None, source_report_id=None, facts_hash=None, revision=1):
+                    prompt_version=None, source_report_id=None, facts_hash=None, revision=1,
+                    facts_snapshot=None):
+        snapshot_json = json.dumps(facts_snapshot) if isinstance(facts_snapshot, dict) else facts_snapshot
         with self.connect() as connection:
             return connection.execute('''INSERT INTO reports
-                (shift_id,kind,text,created_at,style,provider,model,prompt_version,source_report_id,facts_hash,revision,is_stale)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,0)''',
+                (shift_id,kind,text,created_at,style,provider,model,prompt_version,source_report_id,facts_hash,revision,is_stale,facts_snapshot_json)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,0,?)''',
                 (shift_id, kind, text, now_iso(), style, provider, model,
-                 prompt_version, source_report_id, facts_hash, revision)).lastrowid
+                 prompt_version, source_report_id, facts_hash, revision, snapshot_json)).lastrowid
+
+    def compute_live_facts_hash(self, shift_id: int) -> str:
+        from reports import compute_shift_facts_hash
+        acts = self.activities(shift_id)
+        tasks = self.tasks_for_shift(shift_id)
+        cases = self.cases_for_shift(shift_id)
+        sessions = self.test_sessions(shift_id)
+        return compute_shift_facts_hash(acts, tasks, cases, sessions)
 
     def report(self, report_id):
         with self.connect() as connection:
@@ -941,12 +953,8 @@ class Database:
                 return None
             res = dict(row)
             if not res.get('finalized') and res.get('facts_hash') and not res.get('is_stale'):
-                from reports import compute_shift_facts_hash
-                acts = [dict(r) for r in connection.execute('SELECT * FROM activities WHERE shift_id=?', (res['shift_id'],)).fetchall()]
-                tasks_rows = connection.execute('SELECT * FROM tasks WHERE planned_shift_id=?', (res['shift_id'],)).fetchall()
-                tasks = [Task.from_row(r) for r in tasks_rows]
-                curr_hash = compute_shift_facts_hash(acts, tasks)
-                if curr_hash != res['facts_hash']:
+                live_hash = self.compute_live_facts_hash(res['shift_id'])
+                if live_hash != res['facts_hash']:
                     connection.execute('UPDATE reports SET is_stale=1 WHERE id=?', (report_id,))
                     res['is_stale'] = 1
             return res
@@ -3149,7 +3157,7 @@ class Database:
                 WHERE owner_id=? AND purpose=? AND status='active'
             ''', (now_iso(), owner_id, purpose))
 
-    def create_report_revision(self, source_report_id: int, text: str, style: str = 'standard', provider: str = None, model: str = None) -> int:
+    def create_report_revision(self, source_report_id: int, text: str, style: str = 'standard', provider: str = None, model: str = None, facts_hash: str = None, facts_snapshot = None) -> int:
         stamp = now_iso()
         with self.connect() as conn:
             conn.execute('BEGIN IMMEDIATE')
@@ -3161,10 +3169,14 @@ class Database:
                 (source_report_id, source_report_id)
             ).fetchone()[0] or 1
             new_rev = latest_rev + 1
+            src_hash = src['facts_hash'] if 'facts_hash' in src.keys() else None
+            effective_hash = facts_hash if facts_hash is not None else src_hash
+            src_snap = src['facts_snapshot_json'] if 'facts_snapshot_json' in src.keys() else None
+            effective_snap = json.dumps(facts_snapshot) if isinstance(facts_snapshot, dict) else (facts_snapshot if facts_snapshot is not None else src_snap)
             cur = conn.execute('''
-                INSERT INTO reports (shift_id, kind, text, created_at, finalized, style, provider, model, source_report_id, revision, facts_hash, is_stale)
-                VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, 0)
-            ''', (src['shift_id'], src['kind'], text, stamp, style, provider, model, source_report_id, new_rev, src['facts_hash'] if 'facts_hash' in src.keys() else None))
+                INSERT INTO reports (shift_id, kind, text, created_at, finalized, style, provider, model, source_report_id, revision, facts_hash, is_stale, facts_snapshot_json)
+                VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, 0, ?)
+            ''', (src['shift_id'], src['kind'], text, stamp, style, provider, model, source_report_id, new_rev, effective_hash, effective_snap))
             return cur.lastrowid
 
     def mark_report_stale(self, report_id: int = None, shift_id: int = None):
@@ -3284,10 +3296,15 @@ class Database:
                 }
                 for t in confirmed_tasks
             ]
+            latest_v = conn.execute(
+                'SELECT MAX(version) FROM plan_snapshots WHERE shift_id=?',
+                (sid,)
+            ).fetchone()[0]
+            next_version = (latest_v or 0) + 1
             conn.execute('''
                 INSERT INTO plan_snapshots (shift_id, version, snapshot_json, created_at)
-                VALUES (?, 1, ?, ?)
-            ''', (sid, json.dumps(snap_payload), now_iso()))
+                VALUES (?, ?, ?, ?)
+            ''', (sid, next_version, json.dumps(snap_payload), now_iso()))
 
             # 4. Save daily plan setting
             plan_ids_json = json.dumps([t.id for t in confirmed_tasks])

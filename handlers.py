@@ -329,7 +329,17 @@ async def make_report(update, context, kind, requested_style=None):
                                        cases=cases, test_sessions=sessions, baseline_snapshot=baseline_tasks)
     facts_hash = facts['facts_hash']
     text = reports.generate_report(kind, shift, activities, tasks, style, mask, cases, sessions, baseline_snapshot=baseline_tasks)
-    report_id = await asyncio.to_thread(db(context).save_report, shift['id'], kind, text, style, facts_hash=facts_hash)
+    facts_snapshot = {
+        'shift': dict(shift),
+        'activities': [dict(a) if isinstance(a, dict) or hasattr(a, 'keys') else a for a in activities],
+        'tasks': [t.__dict__ if hasattr(t, '__dict__') else dict(t) for t in tasks],
+        'cases': [dict(c) if isinstance(c, dict) or hasattr(c, 'keys') else c for c in cases],
+        'sessions': [dict(s) if isinstance(s, dict) or hasattr(s, 'keys') else s for s in sessions],
+        'baseline_snapshot': baseline_tasks,
+        'mask': mask
+    }
+    report_id = await asyncio.to_thread(db(context).save_report, shift['id'], kind, text, style,
+                                        facts_hash=facts_hash, facts_snapshot=facts_snapshot)
     await asyncio.to_thread(db(context).record_delivery, shift['id'], kind)
 
     # Validate report quality and record provenance
@@ -347,6 +357,96 @@ async def make_report(update, context, kind, requested_style=None):
         InlineKeyboardButton('Finalize', callback_data=f'final:{report_id}'),
         InlineKeyboardButton('AI draft', callback_data=f'ai:{report_id}')]])
     await reply(update, f'Draft #{report_id} ({style}){warning_text}\n\n{text}', keyboard)
+    return report_id
+
+
+async def make_historical_eod_revision(update, context, argument):
+    tokens = (argument or '').strip().split()
+    target_sid = None
+    style_arg = None
+    for tok in tokens[1:]:
+        if tok.isdigit():
+            target_sid = int(tok)
+        elif tok.casefold() in ('short', 'standard', 'detailed'):
+            style_arg = tok.casefold()
+
+    target_shift = None
+    if target_sid is not None:
+        target_shift = await asyncio.to_thread(db(context).shift, target_sid)
+        if not target_shift:
+            raise ValueError(f"Shift #{target_sid} not found.")
+    else:
+        shifts = await asyncio.to_thread(db(context).list_shifts, 20)
+        for s in shifts:
+            reps = await asyncio.to_thread(db(context).list_reports, s['id'])
+            if any(r['kind'] == 'eod' for r in reps):
+                target_shift = s
+                break
+        if not target_shift:
+            active_s = await asyncio.to_thread(db(context).active_shift)
+            if active_s:
+                target_shift = active_s
+            else:
+                raise ValueError('No shift with an EOD report found to revise.')
+
+    sid = target_shift['id']
+    reps = await asyncio.to_thread(db(context).list_reports, sid)
+    eod_reps = [r for r in reps if r['kind'] == 'eod']
+    source_rep = eod_reps[-1] if eod_reps else None
+
+    default_style = await asyncio.to_thread(db(context).get_setting, 'report_style') or 'standard'
+    style = style_arg or (source_rep.get('style') if source_rep else None) or default_style
+    mask = (await asyncio.to_thread(db(context).get_setting, 'mask_client_names')) == 'true'
+
+    activities = await asyncio.to_thread(db(context).activities, sid)
+    tasks = await asyncio.to_thread(db(context).tasks_for_shift, sid)
+    cases = await asyncio.to_thread(db(context).cases_for_shift, sid)
+    sessions = await asyncio.to_thread(db(context).test_sessions, sid)
+    followups = await asyncio.to_thread(db(context).list_followups, 50)
+    baseline_snap = await asyncio.to_thread(db(context).get_baseline_plan_snapshot, sid)
+    baseline_tasks = baseline_snap.get('tasks') if baseline_snap else None
+
+    facts = reports.build_report_facts('eod', target_shift, activities, tasks, style=style, mask_clients=mask,
+                                       cases=cases, test_sessions=sessions, baseline_snapshot=baseline_tasks)
+    facts_hash = facts['facts_hash']
+    text = reports.generate_report('eod', target_shift, activities, tasks, style=style, mask_clients=mask,
+                                   cases=cases, test_sessions=sessions, baseline_snapshot=baseline_tasks)
+
+    facts_snapshot = {
+        'shift': dict(target_shift),
+        'activities': [dict(a) if isinstance(a, dict) or hasattr(a, 'keys') else a for a in activities],
+        'tasks': [t.__dict__ if hasattr(t, '__dict__') else dict(t) for t in tasks],
+        'cases': [dict(c) if isinstance(c, dict) or hasattr(c, 'keys') else c for c in cases],
+        'sessions': [dict(s) if isinstance(s, dict) or hasattr(s, 'keys') else s for s in sessions],
+        'baseline_snapshot': baseline_tasks,
+        'mask': mask
+    }
+
+    if source_rep:
+        report_id = await asyncio.to_thread(
+            db(context).create_report_revision,
+            source_rep['id'], text, style=style, facts_hash=facts_hash, facts_snapshot=facts_snapshot
+        )
+    else:
+        report_id = await asyncio.to_thread(
+            db(context).save_report,
+            sid, 'eod', text, style, facts_hash=facts_hash, facts_snapshot=facts_snapshot
+        )
+
+    from report_validator import ReportValidator
+    validation = ReportValidator.validate('eod', text, target_shift, activities, tasks, cases, sessions, followups)
+    await asyncio.to_thread(db(context).save_report_validation, report_id, validation.is_valid, [w.__dict__ for w in validation.warnings], validation.verified_metrics)
+    for p in validation.provenance_links:
+        await asyncio.to_thread(db(context).record_report_provenance, report_id, p['section_name'], p['record_type'], p['record_id'], p.get('detail'))
+
+    warning_text = ''
+    if validation.warnings:
+        warning_text = '\n\n⚠️ Report Validation:\n' + '\n'.join(f"• [{w.severity.upper()}] {w.message}" for w in validation.warnings[:3])
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton('Finalize', callback_data=f'final:{report_id}'),
+        InlineKeyboardButton('AI draft', callback_data=f'ai:{report_id}')]])
+    await reply(update, f'Revised EOD #{report_id} ({style}) for Shift #{sid}{warning_text}\n\n{text}', keyboard)
     return report_id
 
 
@@ -988,11 +1088,14 @@ async def handle(update, context):
             await reply(update, 'Activity corrected. Generate a new report version.')
         elif command in ('tod', 'bos', 'pl', 'prelunch', 'eod', 'endshift'):
             kind = {'bos': 'tod', 'prelunch': 'pl', 'endshift': 'eod'}.get(command, command)
-            report_id = await make_report(update, context, kind, argument or None)
-            if command == 'endshift':
-                await reply(update, 'Review the EOD, then close this shift.',
-                    InlineKeyboardMarkup([[InlineKeyboardButton(
-                        'Finalize EOD & close shift', callback_data=f'close:{report_id}')]]))
+            if command == 'eod' and argument and argument.strip().casefold().startswith('revision'):
+                report_id = await make_historical_eod_revision(update, context, argument)
+            else:
+                report_id = await make_report(update, context, kind, argument or None)
+                if command == 'endshift':
+                    await reply(update, 'Review the EOD, then close this shift.',
+                        InlineKeyboardMarkup([[InlineKeyboardButton(
+                            'Finalize EOD & close shift', callback_data=f'close:{report_id}')]]))
         elif command == 'reportstyle':
             style, _ = await report_preferences(context, argument)
             await asyncio.to_thread(db(context).set_setting, 'report_style', style)
