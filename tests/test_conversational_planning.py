@@ -1077,10 +1077,10 @@ class ConversationalPlanningTests(unittest.IsolatedAsyncioTestCase):
         # Initialize Database on this v9 file
         upgraded_db = Database(v9_db_path)
 
-        # 1. Verify PRAGMA user_version is now 10
+        # 1. Verify PRAGMA user_version is now SCHEMA_VERSION
         with upgraded_db.connect() as connection:
             ver = connection.execute('PRAGMA user_version').fetchone()[0]
-            self.assertEqual(ver, 10)
+            self.assertEqual(ver, SCHEMA_VERSION)
             # Verify facts_snapshot_json column exists
             cols = {row['name'] for row in connection.execute('PRAGMA table_info(reports)')}
             self.assertIn('facts_snapshot_json', cols)
@@ -1108,6 +1108,40 @@ class ConversationalPlanningTests(unittest.IsolatedAsyncioTestCase):
             # Verify backup did NOT have facts_snapshot_json
             b_cols = {row[1] for row in bconn.execute('PRAGMA table_info(reports)')}
             self.assertNotIn('facts_snapshot_json', b_cols)
+
+    # 40b. Upgrading an actual version-10 database creates backup and migrates to v11 with is_active
+    async def test_40b_schema_v10_to_v11_upgrade_creates_verified_backup(self):
+        migration_dir = self.root / 'migration_test_v10'
+        migration_dir.mkdir()
+        v10_db_path = migration_dir / 'work.sqlite3'
+
+        base_db = Database(v10_db_path)
+        with closing(sqlite3.connect(str(v10_db_path))) as conn:
+            conn.execute('PRAGMA user_version = 10')
+            conn.execute('DROP INDEX IF EXISTS nl_corrections_active_idx')
+            conn.execute('ALTER TABLE nl_corrections DROP COLUMN is_active')
+            conn.execute("INSERT INTO nl_corrections (original_intent, corrected_intent, owner_id, parser_version, created_at) VALUES ('unknown', 'create_task', 1, 'v2', '2026-09-10T10:00:00')")
+            conn.commit()
+
+        upgraded_db = Database(v10_db_path)
+        with upgraded_db.connect() as connection:
+            ver = connection.execute('PRAGMA user_version').fetchone()[0]
+            self.assertEqual(ver, 11)
+            cols = {row['name'] for row in connection.execute('PRAGMA table_info(nl_corrections)')}
+            self.assertIn('is_active', cols)
+            c = connection.execute("SELECT is_active FROM nl_corrections WHERE corrected_intent='create_task'").fetchone()
+            self.assertIsNotNone(c)
+            self.assertEqual(c['is_active'], 1)
+
+        backup_dir = migration_dir / 'backups'
+        self.assertTrue(backup_dir.is_dir())
+        backups = list(backup_dir.glob('pre-migration-v10-*.sqlite3'))
+        self.assertGreaterEqual(len(backups), 1)
+        with closing(sqlite3.connect(str(backups[0]))) as bconn:
+            self.assertEqual(bconn.execute('PRAGMA user_version').fetchone()[0], 10)
+            self.assertEqual(bconn.execute('PRAGMA integrity_check').fetchone()[0], 'ok')
+            b_cols = {row[1] for row in bconn.execute('PRAGMA table_info(nl_corrections)')}
+            self.assertNotIn('is_active', b_cols)
 
     # 41. Complete shared report lifecycle through real Application dispatch with gate auth & deduplication.
     async def test_41_end_to_end_report_lifecycle_application_dispatch(self):

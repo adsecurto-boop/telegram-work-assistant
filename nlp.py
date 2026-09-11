@@ -105,6 +105,8 @@ class NLEntities(BaseModel):
     attachment_target: str | None = None
     reference: str | None = None  # e.g. "that case", "it", "the attendance issue"
     notes: str | None = None
+    task_status: str | None = None
+    blocked_reason: str | None = None
 
 
 class NLChoice(BaseModel):
@@ -112,6 +114,8 @@ class NLChoice(BaseModel):
     label: str = ''
     case_id: int | None = None
     task_id: int | None = None
+    intent: str | None = None
+    client: str | None = None
     choice_index: int | None = None
     description: str | None = None
 
@@ -282,44 +286,98 @@ MONTH_MAP = {
 }
 
 
-def parse_explicit_date(text: str, reference_time: datetime | None = None) -> str | None:
+def resolve_date_reference(text: str, reference_time: datetime | None = None) -> tuple[str | None, bool]:
+    """
+    Consolidated date/time resolver.
+    Returns (resolved_iso_date, is_invalid).
+    - If valid date: (YYYY-MM-DD, False)
+    - If invalid explicit date (e.g. 29 Feb 2027, 31 April): (None, True)
+    - If no date mention found: (None, False)
+    """
     ref = reference_time or datetime.now(ZoneInfo(config.TIMEZONE))
-    lowered = text.casefold()
-    m = re.search(r'\b(?:today\s+(?:ie|i\.e\.|is)?\s+)?(\d{1,2})(?:st|nd|rd|th)?\s+(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\b', lowered)
-    if not m:
-        m = re.search(r'\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\s+(\d{1,2})(?:st|nd|rd|th)?\b', lowered)
-        if m:
-            month_str, day_str = m.group(1), m.group(2)
+    lowered = text.strip().casefold()
+
+    # 1. ISO date check: YYYY-MM-DD
+    iso_match = re.search(r'\b(\d{4})-(\d{1,2})-(\d{1,2})\b', lowered)
+    if iso_match:
+        try:
+            y, m, d = int(iso_match.group(1)), int(iso_match.group(2)), int(iso_match.group(3))
+            return datetime(y, m, d).date().isoformat(), False
+        except ValueError:
+            return None, True
+
+    # 2. Explicit textual date with optional year:
+    # "15 January 2027", "15th January 2027", "15 Jan", "January 15, 2027", "January 15th"
+    months_pat = r'(?:january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)'
+    m1 = re.search(
+        rf'\b(?:today\s+(?:ie|i\.e\.|is)?\s+)?(\d{{1,2}})(?:st|nd|rd|th)?\s+(?:of\s+)?({months_pat})\b(?:\s*,?\s*(\d{{4}}))?',
+        lowered
+    )
+    m2 = re.search(
+        rf'\b({months_pat})\s+(\d{{1,2}})(?:st|nd|rd|th)?\b(?:\s*,?\s*(\d{{4}}))?',
+        lowered
+    )
+    if m1 or m2:
+        if m1:
+            day_str, month_str, year_str = m1.group(1), m1.group(2), m1.group(3)
         else:
-            return None
-    else:
-        day_str, month_str = m.group(1), m.group(2)
-    month = MONTH_MAP.get(month_str)
-    if not month:
-        return None
-    try:
-        dt = datetime(ref.year, month, int(day_str)).date()
-        return dt.isoformat()
-    except ValueError:
-        return None
+            month_str, day_str, year_str = m2.group(1), m2.group(2), m2.group(3)
+        month = MONTH_MAP.get(month_str)
+        if month:
+            target_year = int(year_str) if year_str else ref.year
+            try:
+                dt = datetime(target_year, month, int(day_str)).date()
+                return dt.isoformat(), False
+            except ValueError:
+                return None, True
+
+    # 3. Ambiguous numeric date formats (e.g. 02/03/2027, 03-04-2027)
+    ambig_num = re.search(r'\b(\d{1,2})[/.-](\d{1,2})[/.-](\d{2,4})\b', lowered)
+    if ambig_num:
+        n1, n2 = int(ambig_num.group(1)), int(ambig_num.group(2))
+        if 1 <= n1 <= 12 and 1 <= n2 <= 12:
+            return None, True  # Ambiguous numeric format rejected per requirement 4
+
+    # 4. Relative words
+    if re.search(r'\btomorrow\b', lowered):
+        return (ref.date() + timedelta(days=1)).isoformat(), False
+    if re.search(r'\byesterday\b', lowered):
+        return (ref.date() - timedelta(days=1)).isoformat(), False
+    if re.search(r'\btoday\b', lowered):
+        return ref.date().isoformat(), False
+
+    # 5. Weekday references: "on Friday", "this Friday", "Friday"
+    weekday_map = {
+        'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3,
+        'friday': 4, 'saturday': 5, 'sunday': 6
+    }
+    for w_name, w_idx in weekday_map.items():
+        if re.search(rf'\b(?:on\s+|this\s+|next\s+)?{w_name}\b', lowered):
+            days_ahead = (w_idx - ref.weekday()) % 7
+            if days_ahead == 0:
+                days_ahead = 7
+            return (ref.date() + timedelta(days=days_ahead)).isoformat(), False
+
+    return None, False
+
+
+def parse_explicit_date(text: str, reference_time: datetime | None = None) -> str | None:
+    res, is_inv = resolve_date_reference(text, reference_time)
+    return res if not is_inv else None
 
 
 def extract_entities_from_text(text: str, intent: NLIntent | str | None = None,
-                               reference_time: datetime | None = None,
-                               ref: str | None = None) -> NLEntities:
+                              reference_time: datetime | None = None,
+                              ref: str | None = None) -> NLEntities:
     """Extracts entities fresh from incoming message without copying stale values from saved corrections."""
     ref = reference_time or datetime.now(ZoneInfo(config.TIMEZONE))
     raw = text.strip()
     lowered = raw.casefold()
     entities = NLEntities()
 
-    exp_date = parse_explicit_date(lowered, ref)
-    if exp_date:
-        entities.date = exp_date
-    elif 'tomorrow' in lowered:
-        entities.date = (ref.date() + timedelta(days=1)).isoformat()
-    elif 'today' in lowered:
-        entities.date = ref.date().isoformat()
+    res_date, is_inv = resolve_date_reference(lowered, ref)
+    if res_date:
+        entities.date = res_date
 
     shift_range_match = re.search(
         r'\b(?:from\s+)?(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s*(?:to|-|until|till)\s*(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b',
@@ -607,7 +665,34 @@ class DeterministicParser:
 
         # 6. Shift setting: e.g. "My shift today is 10 to 7 and I'll take lunch around 2"
         # or "Tomorrow I'm working 8 to 5", "shift 10:00 to 19:00", "my shift on today ie 11 september is from 12 pm to 9 pm"
-        explicit_date = parse_explicit_date(lowered, ref)
+        res_date, is_inv = resolve_date_reference(lowered, ref)
+        if is_inv:
+            return NLInterpretation(
+                intent=NLIntent.UNKNOWN,
+                confidence=0.2,
+                explanation='The specified date is invalid or ambiguous.',
+                proposed_summary='Reject invalid date.',
+                reason_codes=[ReasonCode.INVALID_TIME.value]
+            )
+
+        # Shift extension: e.g. "Extend this shift to 6 am", "extend shift to 6"
+        extend_match = re.search(r'\bextend\s+(?:this\s+|my\s+|the\s+)?shift\s+to\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b', lowered)
+        if extend_match:
+            try:
+                new_end_time = parse_time_token(extend_match.group(1))
+                return NLInterpretation(
+                    intent=NLIntent.SET_SHIFT,
+                    confidence=0.95,
+                    entities=NLEntities(
+                        date=ref.date().isoformat(),
+                        shift_end=new_end_time
+                    ),
+                    proposed_summary=f'Extend active shift to {new_end_time}'
+                )
+            except ValueError:
+                pass
+
+        explicit_date = res_date
         shift_match = re.search(
             r'(?:tomorrow\s+(?:i\'m|i\s+am)\s+work(?:ing)?\s+(?:from\s+)?|'
             r'(?:i\s+)?(?:am\s+|might\s+|may\s+|could\s+|will\s+)?work(?:ing)?\s+(?:from\s+)?|'
@@ -627,9 +712,14 @@ class DeterministicParser:
                     date_target = (ref.date() + timedelta(days=1)).isoformat()
                 else:
                     date_target = ref.date().isoformat()
+                is_tentative = bool(re.search(r'\b(might|maybe|can\s+be|could\s+be|may\s+be|perhaps)\b', lowered))
+                reasons = [ReasonCode.UNCERTAIN_WORDING.value] if is_tentative else []
+                conf = 0.75 if is_tentative else 0.95
                 return NLInterpretation(
                     intent=NLIntent.SET_SHIFT,
-                    confidence=0.95,
+                    confidence=conf,
+                    needs_confirmation=is_tentative,
+                    reason_codes=reasons,
                     entities=NLEntities(
                         date=date_target,
                         shift_start=start_str,
@@ -663,8 +753,8 @@ class DeterministicParser:
                 pass
 
         # 7. Multi-task / Plan creation: e.g. "Today I need to test the idle-time issue and follow up with Rahul"
-        # or "today i have to perform testing in ubuntu 22 system for gbb client..."
-        plan_match = re.search(r'\b(?:today\s+)?(?:i\s+)?(?:have\s+to|need\s+to|plan\s+to|must|going\s+to)\s+(?:perform\s+)?(.+)', lowered)
+        # or "Tomorrow I need to test the Ubuntu agent", "today i have to perform testing in ubuntu 22 system for gbb client..."
+        plan_match = re.search(r'\b(?:(?:today|tomorrow|yesterday)\s+)?(?:i\s+)?(?:have\s+to|need\s+to|plan\s+to|must|going\s+to)\s+(?:perform\s+)?(.+)', lowered)
         if plan_match:
             items_text = plan_match.group(1).strip()
             sub_items = [s.strip() for s in re.split(r'\s+and\s+|,\s*', items_text) if s.strip()]
@@ -679,6 +769,7 @@ class DeterministicParser:
                 plat_m = re.search(r'\b(ubuntu(?:\s*\d+)?|macos(?:\s+devices)?|windows(?:\s*\d+)?|linux|android|ios)\b', raw, re.I)
                 if plat_m:
                     plat = plat_m.group(1).replace('devices', '').strip()
+                target_plan_date = res_date or ref.date().isoformat()
                 return NLInterpretation(
                     intent=NLIntent.CREATE_TASK,
                     confidence=0.95,
@@ -687,23 +778,50 @@ class DeterministicParser:
                         task_title=sub_items[0],
                         client=cl,
                         platform=plat,
-                        date=ref.date().isoformat()
+                        date=target_plan_date
                     ),
-                    proposed_summary=f'Create {len(sub_items)} planned task(s): ' + ', '.join(sub_items)
+                    proposed_summary=f'Create {len(sub_items)} planned task(s) for {target_plan_date}: ' + ', '.join(sub_items)
                 )
 
-        # 8a. Carried tasks into today: e.g. "my carried tasks is to check empmonitor agent issue in ubuntu 22 for gbb client"
+        # 8a. Bulk Carry tasks forward: e.g. "Carry all unfinished tasks into my next shift", "Carry all unfinished tasks"
+        bulk_carry_match = re.search(
+            r'\b(?:carry|move|push)\s+all\s+(?:the\s+)?(?:unfinished|pending|remaining)\s+(?:tasks?|work|issues?|items?)(?:\s+(?:forward|into\s+(?:today|tomorrow|my\s+next\s+shift)|to\s+tomorrow))?\b|'
+            r'\b(?:carry|move|push)\s+(?:the\s+)?(?:(?:remaining|pending|unfinished)\s+)?(?:tasks?|issues?|items?|work)\s+(?:to\s+tomorrow|forward|into\s+my\s+next\s+shift)\b',
+            lowered
+        )
+        if bulk_carry_match:
+            if 'into today' in lowered or 'to today' in lowered:
+                target_date = ref.date().isoformat()
+            else:
+                target_date = res_date or (ref.date() + timedelta(days=1)).isoformat()
+            return NLInterpretation(
+                intent=NLIntent.CARRY_TASK_FORWARD,
+                confidence=0.95,
+                entities=NLEntities(
+                    date=target_date,
+                    reference='all unfinished tasks',
+                    task_title='all unfinished tasks'
+                ),
+                proposed_summary=f'Carry all unfinished tasks into {target_date}.'
+            )
+
+        # 8b. Specific task carry: e.g. "Carry task #12 into today", "Move task #12 to 2027-01-15",
+        # "Move the blocked Ubuntu retest to tomorrow", "Carry the attendance retest for Client Alpha",
+        # "my carried tasks is to check empmonitor agent issue in ubuntu 22 for gbb client"
         carried_today_match = re.search(
             r'\b(?:my\s+)?carried\s+(?:tasks?|issues?|items?|work)\s+(?:is|are|to)\s+(.+)|'
-            r'\b(?:carry|move)\s+(?:the\s+)?(?:unfinished\s+|pending\s+)?(?:tasks?|issues?)\s+(.+?)\s+(?:into|to)\s+today\b|'
+            r'\b(?:carry|move|push)\s+(?:the\s+)?(?:(?:blocked|unfinished|pending)\s+)?(?:tasks?\s*)?(#?\d+|.+?)\s+(?:(?:in)?to\s+(today|tomorrow|\d{4}-\d{1,2}-\d{1,2}|.+)|forward)\b|'
+            r'\b(?:carry|move)\s+(?:the\s+)?(?:(?:blocked|unfinished|pending)\s+)?(?:tasks?\s*)?(#?\d+|.+?)\s+for\s+client\s+([a-zA-Z0-9_\- ]+)\b|'
             r'\b(?:yesterday(?:[\'’]s)?\s+unfinished\s+(?:tasks?|work)\s+carried\s+(?:into|to)\s+today)\b',
             lowered
         )
         if carried_today_match:
-            detail = (carried_today_match.group(1) or carried_today_match.group(2) or '').strip()
+            g1 = carried_today_match.group(1)
+            g2 = carried_today_match.group(2) if carried_today_match.lastindex and carried_today_match.lastindex >= 2 else None
+            detail = (g1 or g2 or '').strip()
             detail = re.sub(r'^(?:to|is|are)\s+', '', detail, flags=re.I).strip()
             cl = None
-            cl_m = re.search(r'\bfor\s+([a-zA-Z0-9_\- ]+?)\s+client\b', raw, re.I)
+            cl_m = re.search(r'\bfor\s+(?:client\s+)?([a-zA-Z0-9_\- ]+?)(?:\s+client)?(?:\s+into|\s+to|$)', raw, re.I)
             if not cl_m:
                 cl_m = re.search(r'\bclient\s+([a-zA-Z0-9_\- ]+?)(?:\s+for|\s+in|$)', raw, re.I)
             if cl_m:
@@ -712,31 +830,25 @@ class DeterministicParser:
             plat_m = re.search(r'\b(ubuntu(?:\s*\d+)?|macos(?:\s+devices)?|windows(?:\s*\d+)?|linux|android|ios)\b', raw, re.I)
             if plat_m:
                 plat = plat_m.group(1).replace('devices', '').strip()
-            target_date = ref.date().isoformat()
+
+            if 'into today' in lowered or 'to today' in lowered or 'carried tasks' in lowered or 'carried work' in lowered or 'carried items' in lowered:
+                target_date = ref.date().isoformat()
+            else:
+                target_date = res_date or (ref.date() + timedelta(days=1)).isoformat()
+
+            ref_val = detail or raw
+            ref_val = re.sub(r'\s+(?:tasks?|issues?|items?)$', '', ref_val, flags=re.I).strip()
             return NLInterpretation(
                 intent=NLIntent.CARRY_TASK_FORWARD,
                 confidence=0.95,
                 entities=NLEntities(
                     date=target_date,
-                    task_title=detail or raw,
-                    reference=detail or raw,
+                    task_title=ref_val,
+                    reference=ref_val,
                     client=cl,
                     platform=plat
                 ),
-                proposed_summary=f"Carry yesterday's unfinished task into today: {detail or 'open work'}"
-            )
-
-        # 8b. Move task forward: e.g. "Move the remaining task to tomorrow", "Carry forward pending tasks"
-        carry_match = re.search(
-            r'\b(?:move|carry|push)\s+(?:the\s+)?(?:(?:remaining|pending)\s+)?'
-            r'(.+?\s+)?(?:tasks?|issues?|items?)\s+(?:to\s+tomorrow|forward)\b', lowered)
-        if carry_match:
-            reference = (carry_match.group(1) or '').strip() or 'pending tasks'
-            return NLInterpretation(
-                intent=NLIntent.CARRY_TASK_FORWARD,
-                confidence=0.95,
-                entities=NLEntities(reference=reference),
-                proposed_summary='Move remaining pending tasks forward to tomorrow.'
+                proposed_summary=f"Carry task '{ref_val}' into {target_date}."
             )
 
         # 9. Create Case: e.g. "Create a case for Acme's attendance issue", "Create case for Acme regarding sync error"
@@ -1060,21 +1172,31 @@ class ContextResolver:
             ref = (entities.reference or entities.task_title or '').strip()
             task = None
             carry_all = (interpretation.intent == NLIntent.CARRY_TASK_FORWARD
-                         and ref.casefold() in ('', 'pending tasks', 'remaining tasks', 'all tasks'))
+                         and ref.casefold() in ('', 'all', 'all tasks', 'pending tasks', 'remaining tasks', 'all unfinished tasks', 'all unfinished tasks into my next shift'))
+            candidate_tasks = self.db.list_carry_eligible_tasks()
             id_match = re.fullmatch(r'(?:task\s*)?#?(\d+)', ref, re.I)
             if id_match:
-                task = self.db.get_task(int(id_match.group(1)))
-                if task is None:
+                tid = int(id_match.group(1))
+                found_task = self.db.get_task(tid)
+                if found_task is None:
                     interpretation.confidence = min(interpretation.confidence, 0.5)
                     interpretation.needs_confirmation = True
-                    interpretation.ambiguities.append(f'Task #{id_match.group(1)} was not found.')
-                    interpretation.clarification_question = f'Task #{id_match.group(1)} was not found.'
+                    interpretation.ambiguities.append(f'Task #{tid} was not found.')
+                    interpretation.clarification_question = f'Task #{tid} was not found.'
                     interpretation.reason_codes.append(ReasonCode.AMBIGUOUS_REFERENCE.value)
+                elif interpretation.intent == NLIntent.CARRY_TASK_FORWARD and found_task.status in (TaskStatus.COMPLETED, TaskStatus.CANCELLED):
+                    interpretation.confidence = min(interpretation.confidence, 0.4)
+                    interpretation.needs_confirmation = True
+                    interpretation.ambiguities.append(f'Task #{tid} is already {found_task.status.value}. Completed/cancelled tasks cannot be carried forward.')
+                    interpretation.clarification_question = f'Task #{tid} is already {found_task.status.value}. Completed or cancelled tasks cannot be carried forward.'
+                    interpretation.reason_codes.append(ReasonCode.AMBIGUOUS_REFERENCE.value)
+                else:
+                    task = found_task
             elif ref.casefold() in ('it', 'that', 'that task', 'this', 'this task', 'active'):
                 active_id = context.get('active_task_id')
                 task = self.db.get_task(active_id) if active_id else None
                 if task is None:
-                    matches = self.db.list_pending()
+                    matches = candidate_tasks
                     if len(matches) == 1:
                         task = matches[0]
                     elif len(matches) > 1:
@@ -1083,7 +1205,7 @@ class ContextResolver:
                         interpretation.ambiguities.append('The task reference could match multiple open tasks.')
                         interpretation.clarification_question = 'Which task did you mean?'
                         interpretation.choices = [
-                            NLChoice(label=f'Task #{item.id}: {item.title}', task_id=item.id)
+                            NLChoice(label=f'Task #{item.id} ({item.client or "No client"}): {item.title}', task_id=item.id, client=item.client)
                             for item in matches[:4]
                         ]
                     else:
@@ -1093,7 +1215,12 @@ class ContextResolver:
                         interpretation.clarification_question = 'There is no active or open task to match that reference.'
                         interpretation.reason_codes.append(ReasonCode.AMBIGUOUS_REFERENCE.value)
             elif ref and not carry_all:
-                matches = find_matching_tasks(ref, self.db.list_pending())
+                matches = find_matching_tasks(ref, candidate_tasks)
+                if entities.client and matches:
+                    client_clean = entities.client.strip().casefold()
+                    filtered = [m for m in matches if (m.client or '').strip().casefold() == client_clean]
+                    if filtered:
+                        matches = filtered
                 if len(matches) == 1:
                     task = matches[0]
                 elif len(matches) > 1:
@@ -1102,22 +1229,26 @@ class ContextResolver:
                     interpretation.ambiguities.append(f'Multiple tasks match "{ref}".')
                     interpretation.clarification_question = f'Multiple tasks match "{ref}". Which one did you mean?'
                     interpretation.choices = [
-                        NLChoice(label=f'Task #{item.id}: {item.title}', task_id=item.id)
+                        NLChoice(label=f'Task #{item.id} ({item.client or "No client"}): {item.title}', task_id=item.id, client=item.client)
                         for item in matches[:4]
                     ]
                     interpretation.reason_codes.append(ReasonCode.AMBIGUOUS_REFERENCE.value)
                 elif not matches:
-                    is_carried_today = (interpretation.intent == NLIntent.CARRY_TASK_FORWARD
-                                        and entities.date == get_tz_today())
-                    if not is_carried_today:
-                        interpretation.confidence = min(interpretation.confidence, 0.5)
-                        interpretation.needs_confirmation = True
-                        interpretation.ambiguities.append(f'No open task matches "{ref}".')
-                        interpretation.clarification_question = f'I could not find an open task matching "{ref}".'
-                        interpretation.reason_codes.append(ReasonCode.AMBIGUOUS_REFERENCE.value)
+                    interpretation.confidence = min(interpretation.confidence, 0.5)
+                    interpretation.needs_confirmation = True
+                    interpretation.ambiguities.append(f'No open task matches "{ref}".')
+                    interpretation.clarification_question = f'I could not find an open task matching "{ref}".'
+                    interpretation.reason_codes.append(ReasonCode.AMBIGUOUS_REFERENCE.value)
+                    if candidate_tasks:
+                        interpretation.choices = [
+                            NLChoice(label=f'Task #{item.id} ({item.client or "No client"}): {item.title}', task_id=item.id, client=item.client)
+                            for item in candidate_tasks[:4]
+                        ]
             if task:
                 entities.reference = f'#{task.id}'
                 entities.task_title = task.title
+                if task.client and not entities.client:
+                    entities.client = task.client
                 interpretation.reason_codes.append(ReasonCode.UNIQUE_CONTEXT_MATCH.value)
 
         # Resolve Case Reference
@@ -1394,6 +1525,28 @@ class NLActionExecutor:
                 lunch_note = f' (lunch {lunch_time})' if lunch_time else ''
                 return f"Scheduled shift for {target_date}: {start_time} to {end_time}{lunch_note}. Stored in shift calendar (not active today). Undo: /undo", correlation_id
 
+            # 2d-hist. Historical date shift recording (< today)
+            if target_date < today_date:
+                start_time = entities.shift_start or '10:00'
+                end_time = entities.shift_end or '19:00'
+                lunch_time = entities.shift_lunch
+                s_h, s_m = map(int, start_time.split(':'))
+                e_h, e_m = map(int, end_time.split(':'))
+                if not (0 <= s_h <= 23 and 0 <= s_m <= 59 and 0 <= e_h <= 23 and 0 <= e_m <= 59):
+                    raise ValueError('Invalid shift hours.')
+
+                self.db.set_shift_calendar_override(
+                    date_str=target_date,
+                    start_time=start_time,
+                    lunch_time=lunch_time,
+                    end_time=end_time,
+                    is_day_off=0,
+                    note=f"Historical shift: {start_time} to {end_time}",
+                    correlation_id=correlation_id
+                )
+                lunch_note = f' (lunch {lunch_time})' if lunch_time else ''
+                return f"Recorded historical shift for {target_date}: {start_time} to {end_time}{lunch_note}. Stored in shift calendar (active shift unchanged). Undo: /undo", correlation_id
+
             # 2e. Today shift: lunch update only if shift active
             if not entities.shift_start and entities.shift_lunch and shift:
                 start = datetime.fromisoformat(shift['start'])
@@ -1510,87 +1663,78 @@ class NLActionExecutor:
         # 6. CARRY TASK FORWARD
         if intent == NLIntent.CARRY_TASK_FORWARD:
             today_date = get_tz_today()
-            is_carry_to_today = (entities.date == today_date)
+            ref_str = (entities.reference or entities.task_title or '').strip()
+            carry_all = ref_str.casefold() in (
+                '', 'all', 'all tasks', 'pending tasks', 'remaining tasks',
+                'all unfinished tasks', 'all unfinished tasks into my next shift',
+                'all unfinished tasks forward', 'all pending tasks'
+            )
 
-            if is_carry_to_today:
-                target_task = None
-                if entities.reference and entities.reference.startswith('#') and entities.reference[1:].isdigit():
-                    target_task = self.db.get_task(int(entities.reference[1:]))
-                elif entities.task_title or entities.reference:
-                    ref_text = entities.task_title or entities.reference
-                    matches = find_matching_tasks(ref_text, self.db.list_pending())
-                    if len(matches) == 1:
-                        target_task = matches[0]
+            target_date = entities.date or (datetime.now(tz).date() + timedelta(days=1)).isoformat()
+            shift_id_to_associate = shift['id'] if (target_date == today_date and shift) else None
 
-                if target_task:
-                    before = {'planned_shift_id': target_task.planned_shift_id, 'due_date': target_task.due_date}
-                    self.db.update_task(target_task.id, 'due_date', today_date)
-                    if shift_id:
-                        self.db.update_task(target_task.id, 'planned_shift_id', shift_id)
-                        with self.db.connect() as conn:
-                            ex_act = conn.execute(
-                                "SELECT id FROM activities WHERE shift_id=? AND task_id=? AND category='plan'",
-                                (shift_id, target_task.id)
-                            ).fetchone()
-                            if not ex_act:
-                                self.db._activity(conn, shift_id, 'plan', target_task.title,
-                                                  client=target_task.client, task_id=target_task.id, unplanned=0)
-                    self.db.record_audit(
-                        correlation_id=correlation_id,
-                        operation_type='update_task',
-                        actor='nl_engine',
-                        affected_table='tasks',
-                        record_id=target_task.id,
-                        before_state_json=json.dumps(before),
-                        after_state_json=json.dumps({'planned_shift_id': shift_id, 'due_date': today_date})
-                    )
-                    self.db.update_conversation_context('owner', active_task_id=target_task.id, last_intent=intent.value)
-                    return f"Carried Task #{target_task.id} into today's shift (included in TOD):\n• Task #{target_task.id}: {target_task.title}\nUndo: /undo", correlation_id
-                else:
-                    task_title = (entities.task_title or entities.reference or 'Carried work').strip()
-                    new_task = self.db.add_task(
-                        title=task_title,
-                        priority=entities.priority or 1,
-                        due_date=today_date,
-                        client=entities.client,
-                        project=entities.product,
-                        ticket=entities.ticket,
-                        shift_id=shift_id
-                    )
-                    self.db.record_audit(
-                        correlation_id=correlation_id,
-                        operation_type='create_task',
-                        actor='nl_engine',
-                        affected_table='tasks',
-                        record_id=new_task.id,
-                        before_state_json=None,
-                        after_state_json=json.dumps({'title': new_task.title, 'status': new_task.status.value, 'carried': True})
-                    )
-                    self.db.update_conversation_context('owner', active_task_id=new_task.id, last_intent=intent.value)
-                    return f"Carried task into today's shift (included in TOD):\n• Task #{new_task.id}: {new_task.title}\nUndo: /undo", correlation_id
-
-            pending = self.db.list_pending()
-            if entities.reference and entities.reference.startswith('#') and entities.reference[1:].isdigit():
-                selected = self.db.get_task(int(entities.reference[1:]))
-                pending = [selected] if selected and selected in pending else []
-            if not pending:
-                return 'No pending tasks to move to tomorrow.', None
-            carried = []
-            tomorrow_date = (datetime.now(tz).date() + timedelta(days=1)).isoformat()
-            for t in pending:
-                before = {'due_date': t.due_date}
-                self.db.update_task(t.id, 'due_date', tomorrow_date)
-                self.db.record_audit(
-                    correlation_id=correlation_id,
-                    operation_type='update_task',
+            if carry_all:
+                res = self.db.carry_all_eligible_tasks_transactional(
+                    target_date=target_date,
+                    shift_id=shift_id_to_associate,
                     actor='nl_engine',
-                    affected_table='tasks',
-                    record_id=t.id,
-                    before_state_json=json.dumps(before),
-                    after_state_json=json.dumps({'due_date': tomorrow_date})
+                    correlation_id=correlation_id
                 )
-                carried.append(f'Task #{t.id}: {t.title}')
-            return f"Moved {len(carried)} task(s) to tomorrow ({tomorrow_date}):\n" + '\n'.join(f'• {c}' for c in carried) + '\nUndo: /undo', correlation_id
+                if res['carried_count'] == 0:
+                    return 'No eligible unfinished tasks to carry forward.', None
+                task_lines = [f"• Task #{t['id']}: {t['title']} [{t['status']}]" for t in res['carried_tasks']]
+                date_label = "today's shift (included in TOD)" if target_date == today_date else f"date {target_date}"
+                return (
+                    f"Carried {res['carried_count']} unfinished task(s) into {date_label}:\n"
+                    + "\n".join(task_lines)
+                    + "\nUndo: /undo",
+                    correlation_id
+                )
+
+            # Single task carry
+            target_task = None
+            if entities.reference and re.search(r'#?(\d+)', entities.reference):
+                m_id = re.search(r'#?(\d+)', entities.reference)
+                target_task = self.db.get_task(int(m_id.group(1)))
+            elif entities.task_title or entities.reference:
+                ref_text = entities.task_title or entities.reference
+                matches = find_matching_tasks(ref_text, self.db.list_carry_eligible_tasks())
+                if entities.client and matches:
+                    client_clean = entities.client.strip().casefold()
+                    filtered = [m for m in matches if (m.client or '').strip().casefold() == client_clean]
+                    if filtered:
+                        matches = filtered
+                if len(matches) == 1:
+                    target_task = matches[0]
+
+            if not target_task:
+                return f'Could not find an eligible task matching "{ref_str}". Use /todo to check open tasks.', None
+
+            if target_task.status in (TaskStatus.COMPLETED, TaskStatus.CANCELLED):
+                return f'Task #{target_task.id} is already {target_task.status.value}. Completed/cancelled tasks cannot be carried forward.', None
+
+            res = self.db.carry_task_forward_transactional(
+                task_id=target_task.id,
+                target_date=target_date,
+                shift_id=shift_id_to_associate,
+                actor='nl_engine',
+                correlation_id=correlation_id
+            )
+            self.db.update_conversation_context('owner', active_task_id=target_task.id, last_intent=intent.value)
+            tomorrow_date = (datetime.now(ZoneInfo(config.TIMEZONE)).date() + timedelta(days=1)).isoformat()
+            if target_date == tomorrow_date:
+                header = f"Moved 1 task(s) to tomorrow ({target_date}):"
+            elif target_date == today_date:
+                header = f"Carried Task #{target_task.id} into today's shift (included in TOD):"
+            else:
+                header = f"Carried Task #{target_task.id} into date {target_date}:"
+            blocker_note = f" [blocked: {target_task.blocked_reason}]" if target_task.blocked_reason else ""
+            return (
+                f"{header}\n"
+                f"• Task #{target_task.id}: {target_task.title} [{target_task.status.value}]{blocker_note}\n"
+                f"Undo: /undo",
+                correlation_id
+            )
 
         # 7. CREATE CASE
         if intent == NLIntent.CREATE_CASE:
@@ -2007,14 +2151,19 @@ class NaturalLanguagePipeline:
                         matched_intent = NLIntent(matched_intent_str)
                         fresh_entities = extract_entities_from_text(text, matched_intent, ref=top_match.get('raw_text'))
                         safe_conf = min(0.78, max(0.65, 0.55 + top_score * 0.3))
+                        reasons = [ReasonCode.CORRECTION_MATCH.value]
+                        if normalized.has_negation:
+                            reasons.append(ReasonCode.NEGATION_DETECTED.value)
                         corr_interp = NLInterpretation(
                             intent=matched_intent,
                             confidence=safe_conf,
                             raw_text=text,
+                            has_negation=normalized.has_negation,
                             entities=fresh_entities,
-                            reason_codes=[ReasonCode.CORRECTION_MATCH.value],
+                            reason_codes=reasons,
                             explanation=f"Interpreted via matching saved correction #{top_match['id']}"
                         )
+                        corr_interp = enrich_interpretation(corr_interp, normalized)
                         if not interpretation or corr_interp.confidence > interpretation.confidence:
                             interpretation = corr_interp
                     except Exception:
@@ -2025,7 +2174,8 @@ class NaturalLanguagePipeline:
             interpretation = self.resolver.resolve(interpretation)
 
         # 4. Structured Gemini fallback if needed and available
-        if (not interpretation or interpretation.confidence < 0.7) and self.ai:
+        has_conflict = bool(interpretation and ReasonCode.CONFLICTING_CORRECTIONS.value in interpretation.reason_codes)
+        if (not interpretation or interpretation.confidence < 0.7) and self.ai and not has_conflict:
             day = datetime.now(ZoneInfo(config.TIMEZONE)).date().isoformat()
             if self.db.reserve_ai(day, config.AI_DAILY_LIMIT):
                 context = self.db.get_conversation_context('owner')
@@ -2087,8 +2237,9 @@ class NaturalLanguagePipeline:
         normalized = normalize_input(text)
         interpretation = await self.interpret_message(text, shift=shift)
 
-        # 4. If still unknown or low confidence (< 0.6) and NOT needing confirmation
-        if not interpretation or interpretation.intent == NLIntent.UNKNOWN or (interpretation.confidence < 0.6 and not interpretation.needs_confirmation):
+        has_choices = bool(interpretation and interpretation.choices)
+        # 4. If still unknown or low confidence (< 0.6) and NOT needing confirmation / choices
+        if not interpretation or (interpretation.intent == NLIntent.UNKNOWN and not has_choices) or (interpretation.confidence < 0.6 and not interpretation.needs_confirmation and not has_choices):
             if not interpretation:
                 interpretation = NLInterpretation(
                     intent=NLIntent.UNKNOWN,
@@ -2142,7 +2293,7 @@ class NaturalLanguagePipeline:
         if (interpretation.intent == NLIntent.SET_SHIFT and current_shift
                 and (entities.shift_start or entities.shift_end or entities.eod_reminder)
                 and not entities.start_date and not entities.is_day_off
-                and (entities.date or today) <= today):
+                and (entities.date is None or entities.date == today)):
             interpretation.expected_shift = {key: current_shift.get(key) for key in
                 ('id', 'start', 'end', 'lunch', 'eod_reminder', 'closed_at')}
             interpretation.needs_confirmation = True

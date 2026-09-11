@@ -18,7 +18,7 @@ from nlp_policy import evaluate_action_policy
 
 
 def evaluate(cases: list[dict], reference: datetime) -> tuple[dict, list[str]]:
-    intent_hits = entity_hits = entity_total = false_actions = unknown_count = 0
+    intent_hits = entity_hits = entity_total = false_actions = unknown_count = clarification_count = 0
     failures: list[str] = []
     by_intent: dict[str, dict[str, int]] = {}
     for case in cases:
@@ -46,6 +46,8 @@ def evaluate(cases: list[dict], reference: datetime) -> tuple[dict, list[str]]:
         if parsed:
             policy, mutates, _ = evaluate_action_policy(parsed)
             decision = policy.value
+            if decision in ('require_clarification', 'propose_confirmation'):
+                clarification_count += 1
         expected_decision = case.get('decision')
         decision_ok = expected_decision is None or decision == expected_decision
         if case.get('allow_mutation') is False and mutates:
@@ -61,6 +63,8 @@ def evaluate(cases: list[dict], reference: datetime) -> tuple[dict, list[str]]:
         'total': len(cases),
         'intent_accuracy': intent_hits / len(cases) if cases else 0.0,
         'entity_accuracy': entity_hits / entity_total if entity_total else 1.0,
+        'clarification_count': clarification_count,
+        'clarification_rate': clarification_count / len(cases) if cases else 0.0,
         'unknown_rate': unknown_count / len(cases) if cases else 0.0,
         'false_actions': false_actions,
         'by_intent': by_intent,
@@ -79,6 +83,7 @@ def main() -> int:
     print(f"Cases: {metrics['total']}")
     print(f"Intent accuracy: {metrics['intent_accuracy']:.1%}")
     print(f"Entity accuracy: {metrics['entity_accuracy']:.1%}")
+    print(f"Clarification behavior: {metrics['clarification_count']} cases ({metrics['clarification_rate']:.1%}) require clarification/confirmation")
     print(f"Unknown rate: {metrics['unknown_rate']:.1%}")
     print(f"False actions: {metrics['false_actions']}")
     print('Per intent:')

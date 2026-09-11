@@ -207,7 +207,11 @@ async def handle_daily(update, context) -> bool:
             shift = db.active_shift()
             st = TaskStatus(target_status_str)
             db.mark_status(tid, st, shift_id=shift['id'] if shift else None, actor='owner')
-            await reply(update, f"Updated task #{tid} to [{st.value}].")
+            if st == TaskStatus.BLOCKED:
+                db.update_conversation_context('owner', active_task_id=tid, context_data={'expecting_blocker_reason_for': tid})
+                await reply(update, f"Updated Task #{tid} to [blocked]. What is blocking it? (e.g. 'Blocked because I need client credentials')")
+            else:
+                await reply(update, f"Updated task #{tid} to [{st.value}].")
             return True
         elif data.startswith('task:reschedule:'):
             await cq.answer()
@@ -469,13 +473,15 @@ async def handle_daily(update, context) -> bool:
             if not argument.strip():
                 await reply(update, 'Usage: /carrytask <id>')
                 return True
-            task = db.get_task(int(argument.strip()))
+            task_id = int(argument.strip())
+            task = db.get_task(task_id)
             if not task:
-                raise ValueError('Task not found.')
+                raise ValueError(f'Task #{task_id} not found.')
+            if task.status in (TaskStatus.COMPLETED, TaskStatus.CANCELLED):
+                raise ValueError(f'Task #{task_id} is already {task.status.value}; completed/cancelled tasks cannot be carried forward.')
             due = (datetime.now(ZoneInfo(config.TIMEZONE)).date() + timedelta(days=1)).isoformat()
-            db.update_task(task.id, 'due_date', due)
-            db.record_audit('carry-' + uuid.uuid4().hex, 'carry_task', 'owner', 'tasks', task.id,
-                            json.dumps({'due_date': task.due_date}), json.dumps({'due_date': due}))
+            corr_id = 'carry-' + uuid.uuid4().hex
+            res = db.carry_task_forward_transactional(task.id, due, shift_id=None, actor='owner', correlation_id=corr_id)
             await reply(update, f'Task #{task.id} rescheduled to {due}; status and blocker preserved. /undo to revert.')
             return True
 
@@ -491,7 +497,8 @@ async def handle_daily(update, context) -> bool:
                     line += f" — next: {t.next_action}"
                 links = db.get_linked_records('task', t.id)
                 if links:
-                    line += f" (linked: {', '.join(f'{l["other_type"]}:{l["other_id"]}' for l in links)})"
+                    linked_str = ', '.join(f"{l['other_type']}:{l['other_id']}" for l in links)
+                    line += f" (linked: {linked_str})"
                 lines.append(line)
             await reply(update, "Unfinished work for review:\n" + ('\n'.join(lines) or 'No unfinished tasks.') +
                         "\n\nActions: /carrytask ID to move to tomorrow, /edittask ID | priority | VALUE, or /todo.")
@@ -505,14 +512,58 @@ async def handle_daily(update, context) -> bool:
                 (f' — next: {t.next_action}' if t.next_action else '') for t in tasks) or 'No unfinished tasks.')
             return True
 
-    # --- 7. Natural Task Updates: Started, Finished, Blocked, Retest ---
-    started_match = re.fullmatch(r'(?:started|start working on|working on)\s+(.+)', text, re.I)
-    finished_match = re.fullmatch(r'(?:finished|completed|done with)\s+(.+)', text, re.I)
-    blocked_match = re.fullmatch(r'(.+?)\s+is\s+blocked\s+because\s+(.+)', text, re.I)
-    waiting_match = re.fullmatch(r'waiting\s+for\s+(.+)', text, re.I)
+    # --- 7. Natural Progress Updates: Started, Finished, Blocked, Retest, Dev-fixed, Client-confirmed ---
+    dev_fixed_match = re.search(r'\b(?:the\s+)?developer\s+says?\s+(?:it\s+is\s+)?fixed[,;]?\s+(?:i\s+)?(?:still\s+)?need\s+to\s+retest\b', text, re.I)
+    if dev_fixed_match:
+        ctx = db.get_conversation_context('owner')
+        active_task = db.get_task(ctx.get('active_task_id')) if ctx else None
+        if active_task:
+            db.update_task(active_task.id, 'next_action', 'Retest fix in environment')
+            if shift:
+                db.add_activity(shift['id'], 'testing', f"Developer reported fix for Task #{active_task.id} ('{active_task.title}'); awaiting user retest.", task_id=active_task.id)
+            await reply(update, f"Recorded developer report on Task #{active_task.id}: 'Developer says it is fixed'. Next action set to 'Retest fix in environment'. Task remains open until verified.")
+        else:
+            if shift:
+                db.add_activity(shift['id'], 'testing', "Developer reported fix; user retest required.")
+            await reply(update, "Recorded developer report: 'Developer says it is fixed; I still need to retest'. Awaiting verification before closing any task.")
+        return True
 
-    if started_match or finished_match or blocked_match or waiting_match:
+    client_confirmed_match = re.search(r'\bclient\s+confirmed\s+(?:it\s+works|resolution|the\s+fix|all\s+good|it\s+is\s+working)\b', text, re.I)
+    if client_confirmed_match:
+        ctx = db.get_conversation_context('owner')
+        active_cid = ctx.get('active_case_id') if ctx else None
+        if active_cid:
+            db.update_case(active_cid, 'client_updated', True, shift['id'] if shift else None, 'Client confirmed resolution.')
+            await reply(update, f"Recorded client confirmation on CASE-{active_cid}: 'Client confirmed it works'.")
+        elif shift:
+            db.add_activity(shift['id'], 'support', 'Client confirmed resolution.', outcome='resolved')
+            await reply(update, "Recorded client confirmation: 'Client confirmed it works'.")
+        else:
+            await reply(update, "Recorded client confirmation: 'Client confirmed it works'.")
+        return True
+
+    blocked_standalone_match = re.fullmatch(r'blocked\s+because\s+(.+)', text.strip().rstrip('.!'), re.I)
+    if blocked_standalone_match:
+        reason = blocked_standalone_match.group(1).strip()
+        ctx = db.get_conversation_context('owner')
+        task = db.get_task(ctx.get('active_task_id')) if ctx else None
+        if task:
+            db.mark_status(task.id, TaskStatus.BLOCKED, blocked_reason=reason,
+                           shift_id=shift['id'] if shift else None, correlation_id='daily-' + uuid.uuid4().hex, actor='owner')
+            await reply(update, f"Marked Task #{task.id} blocked ({reason}). /undo to revert.")
+        else:
+            await reply(update, "Which task is blocked? Use '/block TASK_ID reason' or specify the task name.")
+        return True
+
+    still_working_match = re.fullmatch(r'still\s+working\s+on\s+(.+)', text.strip().rstrip('.!'), re.I)
+    started_match = re.fullmatch(r'(?:started|start working on|working on)\s+(.+)', text.strip().rstrip('.!'), re.I)
+    finished_match = re.fullmatch(r'(?:finished|completed|done with)\s+(.+)', text.strip().rstrip('.!'), re.I)
+    blocked_match = re.fullmatch(r'(.+?)\s+is\s+blocked\s+because\s+(.+)', text.strip().rstrip('.!'), re.I)
+    waiting_match = re.fullmatch(r'waiting\s+for\s+(.+)', text.strip().rstrip('.!'), re.I)
+
+    if started_match or still_working_match or finished_match or blocked_match or waiting_match:
         target_ref = (started_match.group(1) if started_match else
+                      still_working_match.group(1) if still_working_match else
                       finished_match.group(1) if finished_match else
                       blocked_match.group(1) if blocked_match else None)
 
@@ -535,11 +586,12 @@ async def handle_daily(update, context) -> bool:
                 return True
 
         if task:
-            if started_match:
+            if started_match or still_working_match:
                 db.mark_status(task.id, TaskStatus.IN_PROGRESS, shift_id=shift['id'] if shift else None,
                                correlation_id='daily-' + uuid.uuid4().hex, actor='owner')
                 db.save_conversation_context('owner', active_task_id=task.id)
-                await reply(update, f"Started working on Task #{task.id}: '{task.title}'. /undo to revert.")
+                action_word = "Still working on" if still_working_match else "Started working on"
+                await reply(update, f"{action_word} Task #{task.id}: '{task.title}'. /undo to revert.")
                 return True
             elif finished_match:
                 db.mark_status(task.id, TaskStatus.COMPLETED, shift_id=shift['id'] if shift else None,
@@ -548,6 +600,12 @@ async def handle_daily(update, context) -> bool:
                 return True
             elif blocked_match:
                 reason = blocked_match.group(2).strip()
+                db.mark_status(task.id, TaskStatus.BLOCKED, blocked_reason=reason,
+                               shift_id=shift['id'] if shift else None, correlation_id='daily-' + uuid.uuid4().hex, actor='owner')
+                await reply(update, f"Marked Task #{task.id} blocked ({reason}). /undo to revert.")
+                return True
+            elif waiting_match:
+                reason = f"Waiting for {waiting_match.group(1).strip()}"
                 db.mark_status(task.id, TaskStatus.BLOCKED, blocked_reason=reason,
                                shift_id=shift['id'] if shift else None, correlation_id='daily-' + uuid.uuid4().hex, actor='owner')
                 await reply(update, f"Marked Task #{task.id} blocked ({reason}). /undo to revert.")

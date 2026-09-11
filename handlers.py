@@ -51,6 +51,8 @@ Say “delete all tasks” to delete tasks immediately with Undo.
 /workstatus ID STATE note, /workhandover — Track request progress
 /unknowns [LIMIT] — Review recent unknown or low-confidence inputs
 /correct ID INTENT [field=value ...] — Save a parser correction without executing it
+/corrections [LIMIT] — Review saved parser corrections
+/disablecorrection ID, /enablecorrection ID, /deletecorrection ID — Manage saved corrections
 /nlstats [DAYS] — Show natural-language recognition statistics
 /casesummary [CASE_ID] — Factual case summary
 /nextaction [CASE_ID] — Recommended next operational step
@@ -695,6 +697,8 @@ async def handle_callback(update, context):
         prop_action = parts[1]
         prop_id = parts[2]
         callback_user = getattr(query, 'from_user', None)
+        if callback_user and callback_user.id != config.OWNER_ID:
+            return
         owner_id = callback_user.id if callback_user else None
         proposal = await asyncio.to_thread(db(context).get_nl_proposal, prop_id)
         if not proposal:
@@ -712,16 +716,48 @@ async def handle_callback(update, context):
         except Exception as exc:
             await reply(update, f'Could not accept proposal: {exc}')
             return
-        from nlp import NLInterpretation, NLActionExecutor
+        from nlp import NLInterpretation, NLActionExecutor, NLIntent, ReasonCode
         saved_interp = NLInterpretation.model_validate(accepted['proposal'])
         if prop_action == 'choose' and len(parts) > 3:
             choice_idx = int(parts[3])
             if choice_idx < len(saved_interp.choices):
                 choice = saved_interp.choices[choice_idx]
+                if choice.get('intent'):
+                    from nlp import extract_entities_from_text, ContextResolver
+                    from nlp_policy import required_entities_for_intent, evaluate_action_policy, ActionDecision
+                    chosen_intent_str = choice['intent']
+                    chosen_intent = NLIntent(chosen_intent_str)
+                    fresh_entities = extract_entities_from_text(saved_interp.raw_text, chosen_intent)
+                    required_fields = required_entities_for_intent(chosen_intent.value)
+                    missing = [f for f in required_fields if not getattr(fresh_entities, f, None)]
+                    if missing:
+                        await asyncio.to_thread(db(context).finish_nl_proposal, prop_id, 'accepted')
+                        readable_missing = ', '.join(missing)
+                        await reply(update, f"You selected '{chosen_intent_str}'. Please provide the missing information: {readable_missing} before saving.")
+                        return
+
+                    saved_interp.intent = chosen_intent
+                    saved_interp.entities = fresh_entities
+                    saved_interp.confidence = 0.95
+                    saved_interp.reason_codes = [ReasonCode.CORRECTION_MATCH.value]
+                    saved_interp = ContextResolver(db(context)).resolve(saved_interp)
+
+                    shift = await asyncio.to_thread(db(context).active_shift)
+                    decision, would_mutate, _ = evaluate_action_policy(saved_interp, has_active_shift=bool(shift))
+                    if decision in (ActionDecision.PROPOSE_CONFIRMATION, ActionDecision.REQUIRE_CLARIFICATION):
+                        await asyncio.to_thread(db(context).finish_nl_proposal, prop_id, 'accepted')
+                        clarif = saved_interp.clarification_question or f"Proposed {saved_interp.proposed_summary}. Please confirm."
+                        await reply(update, clarif)
+                        return
+
                 if choice.get('case_id'):
                     saved_interp.entities.case_id = choice['case_id']
                 if choice.get('task_id'):
                     saved_interp.entities.reference = f"#{choice['task_id']}"
+                    if choice.get('client') and not saved_interp.entities.client:
+                        saved_interp.entities.client = choice['client']
+                    from nlp import ContextResolver
+                    saved_interp = ContextResolver(db(context)).resolve(saved_interp)
                 if choice.get('test_result'):
                     saved_interp.entities.test_result = choice['test_result']
         saved_interp.needs_confirmation = False
@@ -1336,6 +1372,34 @@ async def handle(update, context):
                     lines.append(
                         f"• {intent}: {values['count']} ({round(values['avg_confidence'] * 100)}% avg)")
             await reply(update, '\n'.join(lines))
+        elif command == 'corrections':
+            limit = int(argument) if argument.isdigit() else 15
+            limit = max(1, min(limit, 50))
+            items = await asyncio.to_thread(db(context).list_nl_corrections, limit=limit, include_inactive=True)
+            if not items:
+                await reply(update, 'No saved corrections found.')
+            else:
+                lines = ['Saved natural language corrections:']
+                for c in items:
+                    raw = (c.get('raw_text') or '').replace('\n', ' ')[:100]
+                    status = 'active' if c.get('is_active', 1) else 'disabled'
+                    lines.append(f"#{c['id']} [{status}] {c['original_intent']} → {c['corrected_intent']}: \"{raw}\"")
+                lines.append('\nManage: /disablecorrection ID, /enablecorrection ID, /deletecorrection ID')
+                await reply(update, '\n'.join(lines))
+        elif command in ('disablecorrection', 'enablecorrection'):
+            if not argument or not argument.isdigit():
+                raise ValueError(f'Usage: /{command} ID')
+            cid = int(argument)
+            is_active = (command == 'enablecorrection')
+            await asyncio.to_thread(db(context).set_nl_correction_active, cid, is_active)
+            verb = 'enabled' if is_active else 'disabled'
+            await reply(update, f'Correction #{cid} {verb}.' + (' It will no longer influence interpretation.' if not is_active else ''))
+        elif command == 'deletecorrection':
+            if not argument or not argument.isdigit():
+                raise ValueError('Usage: /deletecorrection ID')
+            cid = int(argument)
+            await asyncio.to_thread(db(context).delete_nl_correction, cid)
+            await reply(update, f'Correction #{cid} deleted.')
         elif command == 'casesummary':
             case_id = int(argument) if argument.isdigit() else None
             if not case_id:

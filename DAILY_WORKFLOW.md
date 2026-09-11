@@ -1,6 +1,6 @@
 # Daily Workflow, Conversational Planning & Task Tracking
 
-The daily workflow unifies flexible shifts, conversational planning, task-to-request relationships, factual corrections, work-time precision, and verifiable TOD/lunch/EOD reporting. All states persist in SQLite (Schema Version 9) and survive process restarts.
+The daily workflow unifies flexible shifts, conversational planning, task-to-request relationships, factual corrections, work-time precision, transactional carry-forward, and verifiable TOD/lunch/EOD reporting. All states persist in SQLite (Schema Version 11) and survive process restarts.
 
 ---
 
@@ -81,6 +81,24 @@ That was for client Acme
 - **Stale-State Protection:** Confirmation compares the proposal's stored `before` state against the task's current live state. If the task was modified after the proposal was generated, the proposal is rejected with an explanatory conflict notice.
 - **Atomic Undo:** Full audit trail recorded; `/undo` reverts back to previous status and blocker.
 
+### Correction Learning Management & Conflicting Corrections
+- **Conflicting Corrections:** When past approved corrections suggest different intents (e.g. `create_task` vs `log_support`), the assistant presents an interactive proposal choice. It never guesses or executes a partially populated action.
+- **Fresh Entity Extraction:** Selecting an intent extracts entities fresh from the incoming message; it never copies stale client names, dates, or task IDs from the historical correction.
+- **Owner-Visible Management:**
+  - `/corrections [LIMIT]`: List saved learning examples with interaction and correction details.
+  - `/disablecorrection ID`: Deactivate an erroneous correction example (`is_active = 0`) so it stops influencing parsing.
+  - `/enablecorrection ID`: Re-activate a previously disabled correction.
+  - `/deletecorrection ID`: Permanently remove an incorrect learning example.
+- **Strictly Non-Executing:** Corrections provide interpretation evidence, never direct authorization or execution. Negations (`do not...`) always override correction matches.
+
+### Natural Progress Updates
+Progress can be recorded naturally without false conflations:
+- `"Started task 12"` / `"Still working on the attendance issue"`: Transitions task to `in_progress`.
+- `"The developer says it is fixed; I still need to retest"`: Updates `next_action` on the active task to `"Retest fix in environment"`. Does **not** complete the task or resolve linked cases.
+- `"Finished the Ubuntu retest for GBB"`: Records testing note/evidence.
+- `"Client confirmed it works"`: Appends client confirmation event to the linked case.
+- `"Blocked because I need client credentials"`: Updates active task blocker reason without creating a duplicate task.
+
 ---
 
 ## 4. Work Time vs. Logged Time (Stage D)
@@ -155,9 +173,19 @@ At end-of-shift review, manage open work cleanly:
 ```
 
 - `/tomorrow`: Lists all unfinished tasks (pending, in progress, blocked) with next actions, blockers, and linked requests.
-- `/carrytask ID`: Advances `due_date` to tomorrow while preserving task ID, status, blocker, and history. Undoable via `/undo`.
+- `/carrytask ID`: Atomically advances `due_date` to tomorrow while preserving task ID, status (`pending`, `in_progress`, or `blocked`), blocker reason, and history in a single SQLite transaction. Creates a planning activity if carried into an active shift. Single-correlation `/undo` reverts both task changes and created planning activities.
+- `"Carry all unfinished tasks into my next shift"` / `"Move all pending tasks to tomorrow"`: Bulk carry executes atomically in one transaction with full undo.
+- **Carry Eligibility:** Only `pending`, `in_progress`, and `blocked` tasks can be carried forward. Completed and cancelled tasks are rejected and never silently reopened.
+- **Ambiguity & Client Disambiguation:** Tasks with similar titles across different clients (e.g. "Attendance retest for Client Alpha" vs "Attendance retest for Client Beta") require interactive selection and never merge silently.
 - `/workhandover`: Produces a clean handover summary of active requests, latest verified status, waiting-on dependencies, and next actions.
 - Pending tasks are never automatically forced into tomorrow's TOD without explicit planning confirmation.
+
+### Consolidated Date & Shift Parsing Rules
+- **Explicit Years:** Formats like `"15 January 2027"` and `"2027-01-15"` strictly preserve the specified year across parsing, proposals, persistence, and task views.
+- **Invalid Dates:** Invalid calendar dates (such as `"29 February 2027"` or ambiguous `"03/04/2026"`) are safely rejected (`invalid_time`) without guessing. Valid leap dates (e.g. `"29 February 2028"`) are recognized correctly.
+- **Tomorrow Planning:** Phrasing such as `"Tomorrow I need to test the Ubuntu agent"` assigns tomorrow's date through persistence without defaulting to today.
+- **Historical Shifts:** Logging past work (`"My shift yesterday was 10 am to 7 pm"`) stores the schedule override in `shift_calendar` without modifying or prompting to revise today's active shift.
+- **Overnight Shifts:** Active overnight shift intervals (e.g. 20:00–05:00) and extensions (`"Extend this shift to 6 am"`) are resolved cleanly.
 
 ---
 
@@ -184,13 +212,13 @@ delete task 5
 Verify system health and database integrity:
 
 ```powershell
-# Verify live schema version (v9) and table integrity
+# Verify live schema version (v11) and table integrity
 .\.venv\Scripts\python.exe scripts\check_database.py
 
-# Verify NLP intent and entity accuracy
+# Verify NLP intent, entity accuracy, and clarification behavior
 .\.venv\Scripts\python.exe scripts\evaluate_nlp.py
 
-# Run complete test suite (203 tests)
+# Run complete test suite (242 tests)
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 
 # Check Scheduled Task status

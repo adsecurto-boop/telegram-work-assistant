@@ -12,7 +12,7 @@ from pathlib import Path
 from models import Task, TaskStatus
 import config
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 
 _last_iso_time = 0.0
@@ -89,6 +89,8 @@ class Database:
                 self._seed_v9_defaults(cursor)
             if version < 10:
                 self._seed_v10_defaults(cursor)
+            if version < 11:
+                self._seed_v11_defaults(cursor)
             self._create_indexes(cursor)
             self._validate_schema_integrity(cursor)
             cursor.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
@@ -397,6 +399,7 @@ class Database:
                 owner_id INTEGER NOT NULL,
                 parser_version TEXT NOT NULL DEFAULT 'v2',
                 notes TEXT,
+                is_active INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL);
         ''')
 
@@ -425,6 +428,7 @@ class Database:
             CREATE INDEX IF NOT EXISTS report_validations_report_idx ON report_validations(report_id);
             CREATE INDEX IF NOT EXISTS nl_corrections_interaction_idx ON nl_corrections(interaction_id);
             CREATE INDEX IF NOT EXISTS nl_corrections_intent_idx ON nl_corrections(corrected_intent, created_at);
+            CREATE INDEX IF NOT EXISTS nl_corrections_active_idx ON nl_corrections(is_active, corrected_intent);
             CREATE INDEX IF NOT EXISTS plan_snapshot_shift_idx ON plan_snapshots(shift_id, version);
             CREATE INDEX IF NOT EXISTS record_links_source_idx ON record_links(source_type, source_id);
             CREATE INDEX IF NOT EXISTS record_links_target_idx ON record_links(target_type, target_id);
@@ -465,6 +469,8 @@ class Database:
             'nl_interactions': {
                 'reason_codes_json': 'TEXT',
                 'normalized_text': 'TEXT'},
+            'nl_corrections': {
+                'is_active': 'INTEGER NOT NULL DEFAULT 1'},
         }
         for table, columns in additions.items():
             current = {row['name'] for row in connection.execute(f'PRAGMA table_info({table})')}
@@ -520,6 +526,12 @@ class Database:
         if 'facts_snapshot_json' not in current:
             connection.execute('ALTER TABLE reports ADD COLUMN facts_snapshot_json TEXT')
 
+    def _seed_v11_defaults(self, connection):
+        current = {row['name'] for row in connection.execute('PRAGMA table_info(nl_corrections)')}
+        if 'is_active' not in current:
+            connection.execute('ALTER TABLE nl_corrections ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1')
+        connection.execute('UPDATE nl_corrections SET is_active=1 WHERE is_active IS NULL')
+
     def _validate_schema_integrity(self, cursor):
         required_tables = {
             'tasks', 'settings', 'shifts', 'activities', 'clients',
@@ -542,6 +554,9 @@ class Database:
         report_cols = {row['name'] for row in cursor.execute('PRAGMA table_info(reports)')}
         if 'facts_snapshot_json' not in report_cols:
             raise RuntimeError("Missing required column 'facts_snapshot_json' on reports table after migration")
+        corr_cols = {row['name'] for row in cursor.execute('PRAGMA table_info(nl_corrections)')}
+        if 'is_active' not in corr_cols:
+            raise RuntimeError("Missing required column 'is_active' on nl_corrections table after migration")
 
     def _seed_structured_records(self, connection):
         for row in connection.execute("SELECT * FROM activities WHERE category='support'").fetchall():
@@ -747,6 +762,172 @@ class Database:
     def list_pending(self):
         return [task for task in self.list_tasks()
                 if task.status in (TaskStatus.PENDING, TaskStatus.IN_PROGRESS)]
+
+    def list_carry_eligible_tasks(self):
+        """Eligible for carry-forward: pending, in_progress, and blocked tasks.
+        Completed and cancelled tasks are excluded and must not silently reopen."""
+        eligible = (TaskStatus.PENDING, TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED)
+        return [task for task in self.list_tasks() if task.status in eligible]
+
+    def carry_task_forward_transactional(self, task_id: int, target_date: str,
+                                         target_shift_id: int | None = None,
+                                         create_plan_activity: bool = True,
+                                         actor: str = 'owner',
+                                         correlation_id: str | None = None,
+                                         shift_id: int | None = None) -> dict:
+        """
+        Atomically carries forward an eligible task in a single transaction:
+        - Validates existence and eligibility (pending, in_progress, blocked).
+        - Rejects completed and cancelled tasks.
+        - Updates task due_date and optional planned_shift_id.
+        - Creates a planning activity if target_shift_id is provided and create_plan_activity is True.
+        - Writes audit entries under a single correlation_id.
+        - Rolls back completely if any step fails.
+        """
+        actual_shift_id = target_shift_id if target_shift_id is not None else shift_id
+        corr_id = correlation_id or f'carry-{uuid.uuid4().hex}'
+        with self.connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            row = conn.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
+            if not row:
+                raise ValueError(f'Task #{task_id} not found.')
+            if row['status'] in (TaskStatus.COMPLETED.value, 'cancelled'):
+                raise ValueError(
+                    f"Task #{task_id} is {row['status']} and cannot be carried forward. Completed tasks must not silently reopen."
+                )
+
+            task_before = {
+                'due_date': row['due_date'],
+                'planned_shift_id': row['planned_shift_id']
+            }
+
+            conn.execute(
+                'UPDATE tasks SET due_date=?, planned_shift_id=COALESCE(?, planned_shift_id) WHERE id=?',
+                (target_date, actual_shift_id, task_id)
+            )
+            updated_row = conn.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
+            task_after = {
+                'due_date': updated_row['due_date'],
+                'planned_shift_id': updated_row['planned_shift_id']
+            }
+
+            self._record_audit_in_connection(
+                conn, corr_id, 'carry_task', actor, 'tasks', task_id, task_before, task_after
+            )
+
+            created_activity_id = None
+            if actual_shift_id and create_plan_activity:
+                ex = conn.execute(
+                    "SELECT id FROM activities WHERE shift_id=? AND task_id=? AND category='plan'",
+                    (actual_shift_id, task_id)
+                ).fetchone()
+                if not ex:
+                    stamp = now_iso()
+                    created_activity_id = conn.execute('''INSERT INTO activities
+                        (shift_id, category, detail, client, task_id, created_at, unplanned, occurred_at, time_precision)
+                        VALUES (?, 'plan', ?, ?, ?, ?, 0, ?, 'exact')''',
+                        (actual_shift_id, row['title'], row['client'], task_id, stamp, stamp)).lastrowid
+                    conn.execute('UPDATE reports SET is_stale=1 WHERE shift_id=? AND finalized=0', (actual_shift_id,))
+                    self._record_audit_in_connection(
+                        conn, corr_id, 'create_plan_activity', actor, 'activities', created_activity_id,
+                        None, {'shift_id': actual_shift_id, 'category': 'plan', 'task_id': task_id, 'detail': row['title']}
+                    )
+
+            # Update conversation context
+            conn.execute(
+                'UPDATE conversation_context SET active_task_id=? WHERE context_key=?',
+                (task_id, 'owner')
+            )
+
+            audit_row = conn.execute(
+                'SELECT id FROM audit_log WHERE correlation_id=? ORDER BY id DESC LIMIT 1',
+                (corr_id,)
+            ).fetchone()
+
+            return {
+                'task': Task.from_row(updated_row),
+                'correlation_id': corr_id,
+                'activity_id': created_activity_id,
+                'audit_id': audit_row['id'] if audit_row else None
+            }
+
+    def carry_all_eligible_tasks_transactional(self, target_date: str,
+                                               target_shift_id: int | None = None,
+                                               create_plan_activities: bool = True,
+                                               actor: str = 'owner',
+                                               shift_id: int | None = None) -> dict:
+        """
+        Atomically carries all eligible tasks (pending, in_progress, blocked) in one single transaction.
+        All task updates, activity creations, and audit records share the same correlation_id.
+        One /undo reverts the entire batch atomically.
+        """
+        actual_shift_id = target_shift_id if target_shift_id is not None else shift_id
+        corr_id = f'bulk-carry-{uuid.uuid4().hex}'
+        eligible = (TaskStatus.PENDING.value, TaskStatus.IN_PROGRESS.value, TaskStatus.BLOCKED.value)
+        with self.connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            rows = conn.execute(
+                f"SELECT * FROM tasks WHERE status IN ({','.join(['?']*len(eligible))}) ORDER BY id ASC",
+                eligible
+            ).fetchall()
+            carried_tasks = []
+            activity_ids = []
+            for row in rows:
+                tid = row['id']
+                task_before = {
+                    'due_date': row['due_date'],
+                    'planned_shift_id': row['planned_shift_id']
+                }
+                conn.execute(
+                    'UPDATE tasks SET due_date=?, planned_shift_id=COALESCE(?, planned_shift_id) WHERE id=?',
+                    (target_date, actual_shift_id, tid)
+                )
+                updated_row = conn.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone()
+                task_after = {
+                    'due_date': updated_row['due_date'],
+                    'planned_shift_id': updated_row['planned_shift_id']
+                }
+                self._record_audit_in_connection(
+                    conn, corr_id, 'carry_task', actor, 'tasks', tid, task_before, task_after
+                )
+                carried_tasks.append(Task.from_row(updated_row))
+
+                if actual_shift_id and create_plan_activities:
+                    ex = conn.execute(
+                        "SELECT id FROM activities WHERE shift_id=? AND task_id=? AND category='plan'",
+                        (actual_shift_id, tid)
+                    ).fetchone()
+                    if not ex:
+                        stamp = now_iso()
+                        aid = conn.execute('''INSERT INTO activities
+                            (shift_id, category, detail, client, task_id, created_at, unplanned, occurred_at, time_precision)
+                            VALUES (?, 'plan', ?, ?, ?, ?, 0, ?, 'exact')''',
+                            (actual_shift_id, row['title'], row['client'], tid, stamp, stamp)).lastrowid
+                        conn.execute('UPDATE reports SET is_stale=1 WHERE shift_id=? AND finalized=0', (actual_shift_id,))
+                        self._record_audit_in_connection(
+                            conn, corr_id, 'create_plan_activity', actor, 'activities', aid,
+                            None, {'shift_id': actual_shift_id, 'category': 'plan', 'task_id': tid, 'detail': row['title']}
+                        )
+                        activity_ids.append(aid)
+
+            stamp = now_iso()
+            conn.execute('''INSERT INTO bulk_operations
+                (correlation_id, operation_type, scope, affected_count, created_at)
+                VALUES (?, 'bulk_carry', 'eligible_tasks', ?, ?)''',
+                (corr_id, len(carried_tasks), stamp))
+
+            audit_row = conn.execute(
+                'SELECT id FROM audit_log WHERE correlation_id=? ORDER BY id DESC LIMIT 1',
+                (corr_id,)
+            ).fetchone()
+
+            return {
+                'tasks': carried_tasks,
+                'count': len(carried_tasks),
+                'correlation_id': corr_id,
+                'activity_ids': activity_ids,
+                'audit_id': audit_row['id'] if audit_row else None
+            }
 
     def mark_status(self, task_id, status, blocked_reason=None, shift_id=None, completion_note=None,
                     correlation_id=None, actor='system'):
@@ -2271,7 +2452,7 @@ class Database:
             'followups', 'test_sessions', 'evidence', 'client_aliases',
             'history_clusters', 'cluster_items', 'shift_calendar',
             'source_messages', 'shift_templates', 'shifts',
-            'record_links', 'plan_snapshots'
+            'record_links', 'plan_snapshots', 'nl_corrections'
         }
         if table not in allowed_tables:
             raise ValueError(f'Table {table} does not support automatic undo.')
@@ -2563,7 +2744,7 @@ class Database:
                     SELECT c.*, i.raw_text
                     FROM nl_corrections c
                     LEFT JOIN nl_interactions i ON c.interaction_id = i.id
-                    WHERE c.corrected_intent = ?
+                    WHERE c.corrected_intent = ? AND COALESCE(c.is_active, 1) = 1
                     ORDER BY c.id DESC LIMIT 200
                 ''', (intent,)).fetchall()
             else:
@@ -2571,6 +2752,7 @@ class Database:
                     SELECT c.*, i.raw_text
                     FROM nl_corrections c
                     LEFT JOIN nl_interactions i ON c.interaction_id = i.id
+                    WHERE COALESCE(c.is_active, 1) = 1
                     ORDER BY c.id DESC LIMIT 200
                 ''').fetchall()
             scored = []
@@ -2602,7 +2784,7 @@ class Database:
                     SELECT c.*, i.raw_text
                     FROM nl_corrections c
                     LEFT JOIN nl_interactions i ON c.interaction_id = i.id
-                    WHERE c.corrected_intent = ?
+                    WHERE c.corrected_intent = ? AND COALESCE(c.is_active, 1) = 1
                     ORDER BY c.id DESC LIMIT ?
                 ''', (intent, limit)).fetchall()
             else:
@@ -2610,6 +2792,7 @@ class Database:
                     SELECT c.*, i.raw_text
                     FROM nl_corrections c
                     LEFT JOIN nl_interactions i ON c.interaction_id = i.id
+                    WHERE COALESCE(c.is_active, 1) = 1
                     ORDER BY c.id DESC LIMIT ?
                 ''', (limit,)).fetchall()
             results = []
@@ -2624,6 +2807,40 @@ class Database:
                     d['corrected_entities'] = {}
                 results.append(d)
             return results
+
+    def list_nl_corrections(self, limit: int = 50, include_inactive: bool = True) -> list[dict]:
+        with self.connect() as conn:
+            query = '''
+                SELECT c.*, i.raw_text
+                FROM nl_corrections c
+                LEFT JOIN nl_interactions i ON c.interaction_id = i.id
+            '''
+            if not include_inactive:
+                query += ' WHERE COALESCE(c.is_active, 1) = 1'
+            query += ' ORDER BY c.id DESC LIMIT ?'
+            rows = conn.execute(query, (limit,)).fetchall()
+            results = []
+            for r in rows:
+                d = dict(r)
+                if d.get('corrected_entities_json'):
+                    try:
+                        d['corrected_entities'] = json.loads(d['corrected_entities_json'])
+                    except Exception:
+                        d['corrected_entities'] = {}
+                else:
+                    d['corrected_entities'] = {}
+                results.append(d)
+            return results
+
+    def set_nl_correction_active(self, correction_id: int, is_active: bool) -> bool:
+        with self.connect() as conn:
+            cur = conn.execute('UPDATE nl_corrections SET is_active=? WHERE id=?', (1 if is_active else 0, correction_id))
+            return cur.rowcount > 0
+
+    def delete_nl_correction(self, correction_id: int) -> bool:
+        with self.connect() as conn:
+            cur = conn.execute('DELETE FROM nl_corrections WHERE id=?', (correction_id,))
+            return cur.rowcount > 0
 
     def update_nl_interaction(self, interaction_id, status=None, applied_ops=None, error_details=None):
         now = now_iso()
