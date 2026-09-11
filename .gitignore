@@ -37,3 +37,4 @@ storage/evidence/
 storage/exports/
 !.env.example
 storage/*.lock
+script-update/

@@ -290,7 +290,9 @@ class ConversationalPlanningTests(unittest.IsolatedAsyncioTestCase):
     # 11. Late work during an overnight shift.
     async def test_11_late_work_during_overnight_shift(self):
         # Shift spans yesterday 20:00 to today 05:00
-        sid = self.db.start_shift('2026-09-10T20:00:00+05:30', '2026-09-11T05:00:00+05:30')
+        now = datetime.now(ZoneInfo(config.TIMEZONE))
+        yest = now - timedelta(days=1)
+        sid = self.db.start_shift(yest.strftime('%Y-%m-%dT20:00:00+05:30'), now.strftime('%Y-%m-%dT05:00:00+05:30'))
         up = self.make_update("Yesterday at 11 pm I tested the new build.")
         await handlers.handle(up, self.context)
 
@@ -649,10 +651,12 @@ class ConversationalPlanningTests(unittest.IsolatedAsyncioTestCase):
 
     # 29. Late work category and shift boundary matching.
     async def test_29_late_work_category_and_shift_matching(self):
-        sid1 = self.db.start_shift('2026-09-10T10:00:00+05:30', '2026-09-10T19:00:00+05:30')
+        now = datetime.now(ZoneInfo(config.TIMEZONE))
+        yest = now - timedelta(days=1)
+        sid1 = self.db.start_shift(yest.strftime('%Y-%m-%dT10:00:00+05:30'), yest.strftime('%Y-%m-%dT19:00:00+05:30'))
         self.db.close_shift(sid1)
 
-        sid2 = self.db.start_shift('2026-09-11T09:00:00+05:30', '2026-09-11T18:00:00+05:30')
+        sid2 = self.db.start_shift(now.strftime('%Y-%m-%dT09:00:00+05:30'), now.strftime('%Y-%m-%dT18:00:00+05:30'))
 
         up = self.make_update("Yesterday at 11 am I tested the auth token flow")
         await handlers.handle(up, self.context)

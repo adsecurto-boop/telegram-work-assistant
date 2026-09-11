@@ -29,6 +29,10 @@ logger = logging.getLogger(__name__)
 NL_PARSER_VERSION = 'nlp-v5.0'
 
 
+def get_tz_today() -> str:
+    return datetime.now(ZoneInfo(config.TIMEZONE)).date().isoformat()
+
+
 class NLIntent(str, Enum):
     SHOW_SHIFT = 'show_shift'
     LOG_SUPPORT = 'log_support'
@@ -262,6 +266,133 @@ def parse_shift_time_range(start_token: str, end_token: str) -> tuple[str, str]:
     return start, end
 
 
+MONTH_MAP = {
+    'january': 1, 'jan': 1,
+    'february': 2, 'feb': 2,
+    'march': 3, 'mar': 3,
+    'april': 4, 'apr': 4,
+    'may': 5,
+    'june': 6, 'jun': 6,
+    'july': 7, 'jul': 7,
+    'august': 8, 'aug': 8,
+    'september': 9, 'sep': 9, 'sept': 9,
+    'october': 10, 'oct': 10,
+    'november': 11, 'nov': 11,
+    'december': 12, 'dec': 12,
+}
+
+
+def parse_explicit_date(text: str, reference_time: datetime | None = None) -> str | None:
+    ref = reference_time or datetime.now(ZoneInfo(config.TIMEZONE))
+    lowered = text.casefold()
+    m = re.search(r'\b(?:today\s+(?:ie|i\.e\.|is)?\s+)?(\d{1,2})(?:st|nd|rd|th)?\s+(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\b', lowered)
+    if not m:
+        m = re.search(r'\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\s+(\d{1,2})(?:st|nd|rd|th)?\b', lowered)
+        if m:
+            month_str, day_str = m.group(1), m.group(2)
+        else:
+            return None
+    else:
+        day_str, month_str = m.group(1), m.group(2)
+    month = MONTH_MAP.get(month_str)
+    if not month:
+        return None
+    try:
+        dt = datetime(ref.year, month, int(day_str)).date()
+        return dt.isoformat()
+    except ValueError:
+        return None
+
+
+def extract_entities_from_text(text: str, intent: NLIntent | str | None = None,
+                               reference_time: datetime | None = None,
+                               ref: str | None = None) -> NLEntities:
+    """Extracts entities fresh from incoming message without copying stale values from saved corrections."""
+    ref = reference_time or datetime.now(ZoneInfo(config.TIMEZONE))
+    raw = text.strip()
+    lowered = raw.casefold()
+    entities = NLEntities()
+
+    exp_date = parse_explicit_date(lowered, ref)
+    if exp_date:
+        entities.date = exp_date
+    elif 'tomorrow' in lowered:
+        entities.date = (ref.date() + timedelta(days=1)).isoformat()
+    elif 'today' in lowered:
+        entities.date = ref.date().isoformat()
+
+    shift_range_match = re.search(
+        r'\b(?:from\s+)?(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s*(?:to|-|until|till)\s*(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b',
+        lowered)
+    if shift_range_match:
+        try:
+            s_str, e_str = parse_shift_time_range(shift_range_match.group(1), shift_range_match.group(2))
+            entities.shift_start = s_str
+            entities.shift_end = e_str
+        except Exception:
+            pass
+    ext_match = re.search(r'\bextended\s+(?:to|until|till)\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b', lowered)
+    if ext_match:
+        try:
+            entities.shift_end = parse_time_token(ext_match.group(1))
+        except Exception:
+            pass
+    lunch_match = re.search(r'\blunch\s+(?:around|at|is)?\s*(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b', lowered)
+    if lunch_match:
+        try:
+            entities.shift_lunch = parse_time_token(lunch_match.group(1))
+        except Exception:
+            pass
+
+    cl_match = re.search(r'\bfor\s+(?:client\s+)?([a-zA-Z0-9_\- ]+?)\s+client\b', raw, re.I)
+    if not cl_match:
+        cl_match = re.search(r'\bclient\s+([a-zA-Z0-9_\- ]+?)(?:\s+(?:in|on|via|through|over|for|regarding)|$)', raw, re.I)
+    if not cl_match:
+        cl_match = re.search(r'\bfor\s+([a-zA-Z0-9_\- ]+?)\s+client\b', raw, re.I)
+    if not cl_match:
+        cl_match = re.search(r'\b([a-zA-Z0-9_\- ]+?)\s+client\b', raw, re.I)
+    if cl_match:
+        cl = cl_match.group(1).strip()
+        if cl.casefold() not in ('the', 'a', 'this', 'that', 'our', 'new'):
+            entities.client = cl
+
+    plat_match = re.search(r'\b(ubuntu(?:\s*\d+)?|macos(?:\s+devices)?|windows(?:\s*\d+)?|linux|android|ios|teams)\b', raw, re.I)
+    if plat_match:
+        entities.platform = plat_match.group(1).replace('devices', '').strip()
+
+    chan_match = re.search(r'\b(?:in|on|via|through|over)\s+(?:microsoft\s+)?(teams|whatsapp|email|phone|chat)\b', raw, re.I)
+    if chan_match:
+        entities.channel = chan_match.group(1).lower()
+
+    ref_match = re.search(r'\b(task|case)\s*#?(\d+)\b', raw, re.I)
+    if ref_match:
+        ref_type = ref_match.group(1).lower()
+        ref_id = int(ref_match.group(2))
+        entities.reference = f'#{ref_id}'
+        if ref_type == 'case':
+            entities.case_id = ref_id
+
+    if re.search(r'\b(resolved|resolve)\b', lowered):
+        entities.status = 'resolved'
+    elif re.search(r'\b(addressed|assisted|helped|handled|supported)\b', lowered):
+        entities.status = 'assisted'
+    elif re.search(r'\b(investigated|investigate)\b', lowered):
+        entities.status = 'investigated'
+    elif re.search(r'\b(escalated|escalate)\b', lowered):
+        entities.status = 'escalated'
+
+    for_issue = re.search(r'\b(?:for|about|regarding)\s+(.+?)(?:$|\s+for\s+|\s+in\s+teams)', raw, re.I)
+    if for_issue:
+        entities.query = for_issue.group(1).strip()
+
+    intent_str = intent.value if isinstance(intent, NLIntent) else (intent or '')
+    if intent_str in ('create_task', 'carry_task_forward'):
+        entities.task_title = raw
+        entities.task_titles = [raw]
+
+    return entities
+
+
 class DeterministicParser:
     """Fast regex and keyword matcher for common workplace expressions."""
 
@@ -312,13 +443,13 @@ class DeterministicParser:
                                     proposed_summary=f'Change the active shift end to {end}')
 
         support = re.fullmatch(
-            r'(?:i\s+)?(resolved|addressed|handled|investigated|escalated|discussed)\s+'
+            r'(?:i\s+)?(resolved|addressed|assisted|helped|supported|handled|investigated|escalated|discussed)\s+'
             r'(?:(?:a|the)\s+)?client\s+(?:query|concern|issue|question|request)\s+'
             r'(?:of|about|regarding|with)\s+(.+?)\s+for\s+'
             r'(?:(whatsapp|email|phone|teams|chat)\s+)?(?:client\s+(.+?)|(.+?)\s+client)[.!]?',
             raw, re.I)
         client_first_support = re.fullmatch(
-            r'(?:i\s+)?(resolved|addressed|handled|investigated|escalated|discussed)\s+'
+            r'(?:i\s+)?(resolved|addressed|assisted|helped|supported|handled|investigated|escalated|discussed)\s+'
             r'(?:client\s+(.+?)|(.+?)\s+client)\s+'
             r'(?:(?:in|on|via|through|over)\s+(?:microsoft\s+)?(teams|whatsapp|email|phone|chat)\s+)?'
             r'(?:for|about|regarding|with)\s+(.+?)[.!]?', raw, re.I)
@@ -332,9 +463,13 @@ class DeterministicParser:
             else:
                 client = (client_first_support.group(2) or client_first_support.group(3)).strip()
                 issue, channel = client_first_support.group(5).strip(), client_first_support.group(4)
+            plat = None
+            plat_match = re.search(r'\b(ubuntu(?:\s*\d+)?|macos(?:\s+devices)?|windows(?:\s*\d+)?|linux|android|ios)\b', raw, re.I)
+            if plat_match:
+                plat = plat_match.group(1).replace('devices', '').strip()
             return NLInterpretation(intent=NLIntent.LOG_SUPPORT, confidence=0.95,
                 entities=NLEntities(query=issue, channel=channel.lower() if channel else None,
-                                    client=client, status=outcome),
+                                    client=client, status=outcome, platform=plat),
                 proposed_summary=f'Log {outcome} support interaction for {client}')
 
         # Keep report reminders out of report generation and case follow-ups.
@@ -366,19 +501,19 @@ class DeterministicParser:
             )
 
         # 2. Report requests
-        if re.search(r'\b(?:prepare|generate|create|make|show|get)\s+(?:my\s+)?tod\b|\bstart of day\b', lowered):
+        if lowered in ('tod', 'my tod', 'tod report', '/tod', 'tod draft') or re.search(r'\b(?:prepare|generate|create|make|show|get)\s+(?:my\s+)?tod\b|\bstart of day\b', lowered):
             return NLInterpretation(
                 intent=NLIntent.GENERATE_TOD,
                 confidence=0.95,
                 proposed_summary='Generate Beginning of Day (TOD) report.'
             )
-        if re.search(r'\b(?:prepare|generate|create|make|show|get)\s+(?:my\s+)?(?:lunch\s+update|pre[- ]lunch|pl)\b', lowered):
+        if lowered in ('pl', 'lunch update', 'pre lunch', 'pre-lunch', '/pl') or re.search(r'\b(?:prepare|generate|create|make|show|get)\s+(?:my\s+)?(?:lunch\s+update|pre[- ]lunch|pl)\b', lowered):
             return NLInterpretation(
                 intent=NLIntent.GENERATE_LUNCH_UPDATE,
                 confidence=0.95,
                 proposed_summary='Generate Pre-lunch progress update.'
             )
-        if re.search(r'\b(?:prepare|generate|create|make|show|get)\s+(?:my\s+)?eod\b|\bend of day\b', lowered):
+        if lowered in ('eod', 'my eod', 'eod report', '/eod', 'eod draft') or re.search(r'\b(?:prepare|generate|create|make|show|get)\s+(?:my\s+)?eod\b|\bend of day\b', lowered):
             return NLInterpretation(
                 intent=NLIntent.GENERATE_EOD,
                 confidence=0.95,
@@ -471,12 +606,12 @@ class DeterministicParser:
                 pass
 
         # 6. Shift setting: e.g. "My shift today is 10 to 7 and I'll take lunch around 2"
-        # or "Tomorrow I'm working 8 to 5", "shift 10:00 to 19:00"
+        # or "Tomorrow I'm working 8 to 5", "shift 10:00 to 19:00", "my shift on today ie 11 september is from 12 pm to 9 pm"
+        explicit_date = parse_explicit_date(lowered, ref)
         shift_match = re.search(
-            r'(?:tomorrow\s+(?:i\'m|i\s+am)\s+working\s+(?:from\s+)?|'
+            r'(?:tomorrow\s+(?:i\'m|i\s+am)\s+work(?:ing)?\s+(?:from\s+)?|'
             r'(?:i\s+)?(?:am\s+|might\s+|may\s+|could\s+|will\s+)?work(?:ing)?\s+(?:from\s+)?|'
-            r'working\s+(?:from\s+)?|(?:my\s+)?shift\s+(?:today\s+|tomorrow\s+)?'
-            r'(?:(?:is|was|can\s+be|could\s+be|may\s+be|might\s+be|should\s+be|will\s+be)\s+(?:from\s+)?|(?:started|starts|start)\s+(?:at\s+)?|from\s+)?)\s*'
+            r'working\s+(?:from\s+)?|(?:my\s+)?shift\b.*?\b(?:(?:is|was|can\s+be|could\s+be|may\s+be|might\s+be|should\s+be|will\s+be)\s+(?:from\s+)?|(?:started|starts|start)\s+(?:at\s+)?|from\s+)?)\s*'
             r'(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s*(?:to|-|until|till|and\s+(?:(?:it|my\s+shift)\s+)?(?:ends|end|ended|will\s+end)\s+(?:at\s+)?)\s*(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)'
             r'(?:.*?(?:lunch\s+(?:around|at|is)?\s*(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)))?',
             lowered
@@ -486,7 +621,12 @@ class DeterministicParser:
                 start_str, end_str = parse_shift_time_range(
                     shift_match.group(1), shift_match.group(2))
                 lunch_str = parse_time_token(shift_match.group(3)) if shift_match.group(3) else None
-                date_target = (ref.date() + timedelta(days=1)).isoformat() if 'tomorrow' in lowered else ref.date().isoformat()
+                if explicit_date:
+                    date_target = explicit_date
+                elif 'tomorrow' in lowered:
+                    date_target = (ref.date() + timedelta(days=1)).isoformat()
+                else:
+                    date_target = ref.date().isoformat()
                 return NLInterpretation(
                     intent=NLIntent.SET_SHIFT,
                     confidence=0.95,
@@ -523,22 +663,70 @@ class DeterministicParser:
                 pass
 
         # 7. Multi-task / Plan creation: e.g. "Today I need to test the idle-time issue and follow up with Rahul"
-        plan_match = re.search(r'\b(?:today\s+)?(?:i\s+need\s+to|need\s+to|plan\s+to)\s+(.+)', lowered)
+        # or "today i have to perform testing in ubuntu 22 system for gbb client..."
+        plan_match = re.search(r'\b(?:today\s+)?(?:i\s+)?(?:have\s+to|need\s+to|plan\s+to|must|going\s+to)\s+(?:perform\s+)?(.+)', lowered)
         if plan_match:
             items_text = plan_match.group(1).strip()
             sub_items = [s.strip() for s in re.split(r'\s+and\s+|,\s*', items_text) if s.strip()]
             if sub_items:
+                cl = None
+                cl_m = re.search(r'\bfor\s+([a-zA-Z0-9_\- ]+?)\s+client\b', raw, re.I)
+                if not cl_m:
+                    cl_m = re.search(r'\bclient\s+([a-zA-Z0-9_\- ]+?)(?:\s+for|\s+in|$)', raw, re.I)
+                if cl_m:
+                    cl = cl_m.group(1).strip()
+                plat = None
+                plat_m = re.search(r'\b(ubuntu(?:\s*\d+)?|macos(?:\s+devices)?|windows(?:\s*\d+)?|linux|android|ios)\b', raw, re.I)
+                if plat_m:
+                    plat = plat_m.group(1).replace('devices', '').strip()
                 return NLInterpretation(
                     intent=NLIntent.CREATE_TASK,
-                    confidence=0.9,
+                    confidence=0.95,
                     entities=NLEntities(
                         task_titles=sub_items,
-                        task_title=sub_items[0]
+                        task_title=sub_items[0],
+                        client=cl,
+                        platform=plat,
+                        date=ref.date().isoformat()
                     ),
                     proposed_summary=f'Create {len(sub_items)} planned task(s): ' + ', '.join(sub_items)
                 )
 
-        # 8. Move task forward: e.g. "Move the remaining task to tomorrow", "Carry forward pending tasks"
+        # 8a. Carried tasks into today: e.g. "my carried tasks is to check empmonitor agent issue in ubuntu 22 for gbb client"
+        carried_today_match = re.search(
+            r'\b(?:my\s+)?carried\s+(?:tasks?|issues?|items?|work)\s+(?:is|are|to)\s+(.+)|'
+            r'\b(?:carry|move)\s+(?:the\s+)?(?:unfinished\s+|pending\s+)?(?:tasks?|issues?)\s+(.+?)\s+(?:into|to)\s+today\b|'
+            r'\b(?:yesterday(?:[\'’]s)?\s+unfinished\s+(?:tasks?|work)\s+carried\s+(?:into|to)\s+today)\b',
+            lowered
+        )
+        if carried_today_match:
+            detail = (carried_today_match.group(1) or carried_today_match.group(2) or '').strip()
+            detail = re.sub(r'^(?:to|is|are)\s+', '', detail, flags=re.I).strip()
+            cl = None
+            cl_m = re.search(r'\bfor\s+([a-zA-Z0-9_\- ]+?)\s+client\b', raw, re.I)
+            if not cl_m:
+                cl_m = re.search(r'\bclient\s+([a-zA-Z0-9_\- ]+?)(?:\s+for|\s+in|$)', raw, re.I)
+            if cl_m:
+                cl = cl_m.group(1).strip()
+            plat = None
+            plat_m = re.search(r'\b(ubuntu(?:\s*\d+)?|macos(?:\s+devices)?|windows(?:\s*\d+)?|linux|android|ios)\b', raw, re.I)
+            if plat_m:
+                plat = plat_m.group(1).replace('devices', '').strip()
+            target_date = ref.date().isoformat()
+            return NLInterpretation(
+                intent=NLIntent.CARRY_TASK_FORWARD,
+                confidence=0.95,
+                entities=NLEntities(
+                    date=target_date,
+                    task_title=detail or raw,
+                    reference=detail or raw,
+                    client=cl,
+                    platform=plat
+                ),
+                proposed_summary=f"Carry yesterday's unfinished task into today: {detail or 'open work'}"
+            )
+
+        # 8b. Move task forward: e.g. "Move the remaining task to tomorrow", "Carry forward pending tasks"
         carry_match = re.search(
             r'\b(?:move|carry|push)\s+(?:the\s+)?(?:(?:remaining|pending)\s+)?'
             r'(.+?\s+)?(?:tasks?|issues?|items?)\s+(?:to\s+tomorrow|forward)\b', lowered)
@@ -699,6 +887,32 @@ class DeterministicParser:
                     test_result=test_update_match.group(2)),
                 proposed_summary=f'Update test result to {test_update_match.group(2)}')
 
+        # 16b. Reporting activity to developer: e.g. "I reported the retest test status of Airtel africa client agent 3.8.0 to the developer"
+        dev_report_match = re.search(
+            r'\b(?:i\s+)?(?:reported|shared|forwarded|communicated|sent)\s+(?:the\s+)?'
+            r'(?:(?:retest|test)\s+)*(?:status|results?|findings?|update|notes?|logs?)\s+'
+            r'(?:of|for|about)\s+(.+?)\s+to\s+(?:the\s+)?(?:developer|dev|team|engineer)\b',
+            lowered
+        )
+        if dev_report_match:
+            detail_target = dev_report_match.group(1)
+            cl = None
+            cl_match = re.search(r'\b([a-zA-Z0-9_\-]+(?:\s+[a-zA-Z0-9_\-]+)*?)\s+client\b', detail_target, re.I)
+            if not cl_match:
+                cl_match = re.search(r'\bclient\s+([a-zA-Z0-9_\-]+(?:\s+[a-zA-Z0-9_\-]+)*?)(?:\s+(?:agent|to)|$)', detail_target, re.I)
+            if cl_match:
+                cl = cl_match.group(1).strip()
+            return NLInterpretation(
+                intent=NLIntent.ADD_CASE_EVENT,
+                confidence=0.95,
+                entities=NLEntities(
+                    event_detail=raw,
+                    event_type='status_update',
+                    client=cl
+                ),
+                proposed_summary=f'Record reporting activity: {raw}'
+            )
+
         # 17. Testing: e.g. "I checked it on Windows 11 and reproduced the issue"
         if re.search(r'\b(tested|testing|reproduced|checked\s+it|verified)\b', lowered):
             res = ('failed' if re.search(r'\b(?:failed|reproduced|not working)\b', lowered) else
@@ -780,6 +994,56 @@ class DeterministicParser:
         return None
 
 
+def find_matching_tasks(ref: str, pending_tasks: list) -> list:
+    if not ref or not pending_tasks:
+        return []
+    clean_ref = re.sub(r'^(?:to\s+|check\s+|check\s+if\s+)', '', ref.strip(), flags=re.I).strip().casefold()
+    ref_norm = ref.strip().casefold()
+
+    # 1. Exact match
+    exact = [t for t in pending_tasks if t.title.strip().casefold() in (clean_ref, ref_norm)]
+    if exact:
+        return exact
+
+    # 2. Substring match
+    sub = [t for t in pending_tasks if (
+        t.title.strip().casefold() in ref_norm
+        or t.title.strip().casefold() in clean_ref
+        or ref_norm in t.title.casefold()
+        or (clean_ref and clean_ref in t.title.casefold())
+    )]
+    if sub:
+        return sub
+
+    # 3. Token overlap
+    stop_words = {'the', 'a', 'an', 'to', 'for', 'in', 'on', 'of', 'and', 'or', 'is', 'are', 'issue', 'task', 'check', 'my', 'client', 'if', 'system', 'version'}
+    ref_tokens = set(re.findall(r'[a-zA-Z0-9_\-]+', clean_ref or ref_norm)) - stop_words
+    if not ref_tokens:
+        return []
+
+    scored = []
+    for t in pending_tasks:
+        t_tokens = set(re.findall(r'[a-zA-Z0-9_\-]+', t.title.casefold())) - stop_words
+        if not t_tokens:
+            continue
+        common = ref_tokens & t_tokens
+        if not common:
+            continue
+        ref_containment = len(common) / len(ref_tokens)
+        task_containment = len(common) / len(t_tokens)
+        overlap = len(common) / len(ref_tokens | t_tokens)
+        score = max(ref_containment, task_containment, overlap)
+        if ref_containment >= 0.75 or task_containment >= 0.5 or overlap >= 0.35:
+            scored.append((score, t))
+
+    if scored:
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top_score = scored[0][0]
+        return [t for s, t in scored if s >= top_score - 0.15]
+
+    return []
+
+
 class ContextResolver:
     """Resolves relative references ('that case', 'it', client names) against database state."""
 
@@ -829,8 +1093,7 @@ class ContextResolver:
                         interpretation.clarification_question = 'There is no active or open task to match that reference.'
                         interpretation.reason_codes.append(ReasonCode.AMBIGUOUS_REFERENCE.value)
             elif ref and not carry_all:
-                matches = [item for item in self.db.list_pending()
-                           if ref.casefold() in item.title.casefold()]
+                matches = find_matching_tasks(ref, self.db.list_pending())
                 if len(matches) == 1:
                     task = matches[0]
                 elif len(matches) > 1:
@@ -842,12 +1105,16 @@ class ContextResolver:
                         NLChoice(label=f'Task #{item.id}: {item.title}', task_id=item.id)
                         for item in matches[:4]
                     ]
-                elif not matches:
-                    interpretation.confidence = min(interpretation.confidence, 0.5)
-                    interpretation.needs_confirmation = True
-                    interpretation.ambiguities.append(f'No open task matches "{ref}".')
-                    interpretation.clarification_question = f'I could not find an open task matching "{ref}".'
                     interpretation.reason_codes.append(ReasonCode.AMBIGUOUS_REFERENCE.value)
+                elif not matches:
+                    is_carried_today = (interpretation.intent == NLIntent.CARRY_TASK_FORWARD
+                                        and entities.date == get_tz_today())
+                    if not is_carried_today:
+                        interpretation.confidence = min(interpretation.confidence, 0.5)
+                        interpretation.needs_confirmation = True
+                        interpretation.ambiguities.append(f'No open task matches "{ref}".')
+                        interpretation.clarification_question = f'I could not find an open task matching "{ref}".'
+                        interpretation.reason_codes.append(ReasonCode.AMBIGUOUS_REFERENCE.value)
             if task:
                 entities.reference = f'#{task.id}'
                 entities.task_title = task.title
@@ -1242,6 +1509,66 @@ class NLActionExecutor:
 
         # 6. CARRY TASK FORWARD
         if intent == NLIntent.CARRY_TASK_FORWARD:
+            today_date = get_tz_today()
+            is_carry_to_today = (entities.date == today_date)
+
+            if is_carry_to_today:
+                target_task = None
+                if entities.reference and entities.reference.startswith('#') and entities.reference[1:].isdigit():
+                    target_task = self.db.get_task(int(entities.reference[1:]))
+                elif entities.task_title or entities.reference:
+                    ref_text = entities.task_title or entities.reference
+                    matches = find_matching_tasks(ref_text, self.db.list_pending())
+                    if len(matches) == 1:
+                        target_task = matches[0]
+
+                if target_task:
+                    before = {'planned_shift_id': target_task.planned_shift_id, 'due_date': target_task.due_date}
+                    self.db.update_task(target_task.id, 'due_date', today_date)
+                    if shift_id:
+                        self.db.update_task(target_task.id, 'planned_shift_id', shift_id)
+                        with self.db.connect() as conn:
+                            ex_act = conn.execute(
+                                "SELECT id FROM activities WHERE shift_id=? AND task_id=? AND category='plan'",
+                                (shift_id, target_task.id)
+                            ).fetchone()
+                            if not ex_act:
+                                self.db._activity(conn, shift_id, 'plan', target_task.title,
+                                                  client=target_task.client, task_id=target_task.id, unplanned=0)
+                    self.db.record_audit(
+                        correlation_id=correlation_id,
+                        operation_type='update_task',
+                        actor='nl_engine',
+                        affected_table='tasks',
+                        record_id=target_task.id,
+                        before_state_json=json.dumps(before),
+                        after_state_json=json.dumps({'planned_shift_id': shift_id, 'due_date': today_date})
+                    )
+                    self.db.update_conversation_context('owner', active_task_id=target_task.id, last_intent=intent.value)
+                    return f"Carried Task #{target_task.id} into today's shift (included in TOD):\n• Task #{target_task.id}: {target_task.title}\nUndo: /undo", correlation_id
+                else:
+                    task_title = (entities.task_title or entities.reference or 'Carried work').strip()
+                    new_task = self.db.add_task(
+                        title=task_title,
+                        priority=entities.priority or 1,
+                        due_date=today_date,
+                        client=entities.client,
+                        project=entities.product,
+                        ticket=entities.ticket,
+                        shift_id=shift_id
+                    )
+                    self.db.record_audit(
+                        correlation_id=correlation_id,
+                        operation_type='create_task',
+                        actor='nl_engine',
+                        affected_table='tasks',
+                        record_id=new_task.id,
+                        before_state_json=None,
+                        after_state_json=json.dumps({'title': new_task.title, 'status': new_task.status.value, 'carried': True})
+                    )
+                    self.db.update_conversation_context('owner', active_task_id=new_task.id, last_intent=intent.value)
+                    return f"Carried task into today's shift (included in TOD):\n• Task #{new_task.id}: {new_task.title}\nUndo: /undo", correlation_id
+
             pending = self.db.list_pending()
             if entities.reference and entities.reference.startswith('#') and entities.reference[1:].isdigit():
                 selected = self.db.get_task(int(entities.reference[1:]))
@@ -1637,7 +1964,7 @@ class NaturalLanguagePipeline:
         self.resolver = ContextResolver(db)
         self.executor = NLActionExecutor(db)
 
-    async def process(self, text: str, shift: dict | None, source_update_id: int | None = None) -> tuple[str, NLInterpretation]:
+    async def interpret_message(self, text: str, shift: dict | None = None) -> NLInterpretation:
         normalized = normalize_input(text)
         # 1. Deterministic parsing
         interpretation = DeterministicParser.parse(text)
@@ -1651,16 +1978,58 @@ class NaturalLanguagePipeline:
                 except Exception:
                     pass
 
-        # 2. Context resolution
+        # 2. Relevant corrections matching (when deterministic is None or low confidence < 0.7)
+        if not interpretation or interpretation.confidence < 0.7:
+            rel_corrections = self.db.get_relevant_corrections(text, limit=5, min_score=0.25)
+            if rel_corrections:
+                top_match = rel_corrections[0]
+                top_score = top_match.get('score') if top_match.get('score') is not None else top_match.get('similarity_score', 0.0)
+                # Check for conflicting intents among top matches
+                top_intents = list({
+                    c['corrected_intent'] for c in rel_corrections
+                    if (c.get('score') if c.get('score') is not None else c.get('similarity_score', 0.0)) >= top_score - 0.10 and (c.get('score') if c.get('score') is not None else c.get('similarity_score', 0.0)) >= 0.35
+                })
+                if len(top_intents) > 1:
+                    interpretation = NLInterpretation(
+                        intent=NLIntent.UNKNOWN,
+                        confidence=0.5,
+                        raw_text=text,
+                        explanation=f"Conflicting saved corrections found ({', '.join(top_intents)}).",
+                        needs_confirmation=True,
+                        ambiguities=["Conflicting saved corrections found."],
+                        clarification_question=f"Saved corrections suggest different actions ({', '.join(top_intents)}). Which did you mean?",
+                        choices=[NLChoice(label=f"Action: {intent_name}", intent=intent_name) for intent_name in top_intents],
+                        reason_codes=[ReasonCode.CONFLICTING_CORRECTIONS.value]
+                    )
+                elif top_score >= 0.38:
+                    matched_intent_str = top_match['corrected_intent']
+                    try:
+                        matched_intent = NLIntent(matched_intent_str)
+                        fresh_entities = extract_entities_from_text(text, matched_intent, ref=top_match.get('raw_text'))
+                        safe_conf = min(0.78, max(0.65, 0.55 + top_score * 0.3))
+                        corr_interp = NLInterpretation(
+                            intent=matched_intent,
+                            confidence=safe_conf,
+                            raw_text=text,
+                            entities=fresh_entities,
+                            reason_codes=[ReasonCode.CORRECTION_MATCH.value],
+                            explanation=f"Interpreted via matching saved correction #{top_match['id']}"
+                        )
+                        if not interpretation or corr_interp.confidence > interpretation.confidence:
+                            interpretation = corr_interp
+                    except Exception:
+                        pass
+
+        # 3. Context resolution
         if interpretation and interpretation.intent != NLIntent.UNKNOWN:
             interpretation = self.resolver.resolve(interpretation)
 
-        # 3. Structured Gemini fallback if needed and available
+        # 4. Structured Gemini fallback if needed and available
         if (not interpretation or interpretation.confidence < 0.7) and self.ai:
             day = datetime.now(ZoneInfo(config.TIMEZONE)).date().isoformat()
             if self.db.reserve_ai(day, config.AI_DAILY_LIMIT):
                 context = self.db.get_conversation_context('owner')
-                corrections = self.db.get_approved_corrections(limit=5)
+                corrections = self.db.get_relevant_corrections(text, limit=5)
                 context['approved_corrections'] = [
                     {
                         'example': redact(item.get('raw_text') or ''),
@@ -1688,6 +2057,35 @@ class NaturalLanguagePipeline:
                     interpretation.reason_codes.append(ReasonCode.GEMINI_FALLBACK.value)
                     interpretation.reason_codes = list(dict.fromkeys(interpretation.reason_codes))
                     interpretation = self.resolver.resolve(interpretation)
+
+        return interpretation
+
+    async def interpret_preview(self, text: str, shift: dict | None = None) -> NLInterpretation:
+        interp = await self.interpret_message(text, shift=shift)
+        if not interp:
+            interp = NLInterpretation(
+                intent=NLIntent.UNKNOWN,
+                confidence=0.0,
+                explanation='Could not determine intention with certainty.'
+            )
+        current_shift = shift or self.db.active_shift()
+        has_active_shift = bool(current_shift)
+        normal_decision, normal_mutation, _ = evaluate_action_policy(
+            interp, has_active_shift=has_active_shift)
+        preview_decision, _, preview_reasons = evaluate_action_policy(
+            interp, is_understand=True, has_active_shift=has_active_shift)
+        interp.action_decision = preview_decision.value
+        interp.would_mutate = False
+        all_reasons = list(dict.fromkeys(
+            list(interp.reason_codes) +
+            [str(r.value if hasattr(r, 'value') else r) for r in preview_reasons]
+        ))
+        interp.reason_codes = all_reasons
+        return interp
+
+    async def process(self, text: str, shift: dict | None, source_update_id: int | None = None) -> tuple[str, NLInterpretation]:
+        normalized = normalize_input(text)
+        interpretation = await self.interpret_message(text, shift=shift)
 
         # 4. If still unknown or low confidence (< 0.6) and NOT needing confirmation
         if not interpretation or interpretation.intent == NLIntent.UNKNOWN or (interpretation.confidence < 0.6 and not interpretation.needs_confirmation):

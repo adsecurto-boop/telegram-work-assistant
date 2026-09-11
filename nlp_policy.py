@@ -25,6 +25,8 @@ class ReasonCode(str, Enum):
     INCOMPLETE_INPUT = 'incomplete_input'
     GEMINI_FALLBACK = 'gemini_fallback'
     PARSER_DISAGREEMENT = 'parser_disagreement'
+    CORRECTION_MATCH = 'correction_match'
+    CONFLICTING_CORRECTIONS = 'conflicting_corrections'
 
 
 class ActionDecision(str, Enum):
@@ -98,17 +100,19 @@ def evaluate_action_policy(
     if ReasonCode.INVALID_TIME in reasons or ReasonCode.INVALID_TIME.value in reasons:
         return ActionDecision.REJECT, False, reasons
 
-    # 4. Unknown intent -> Reject / no mutation
+    # 4. Ambiguous reference, conflicting corrections, or choices present -> Require clarification
+    if (getattr(interpretation, 'choices', None)
+            or ReasonCode.AMBIGUOUS_REFERENCE in reasons or ReasonCode.AMBIGUOUS_REFERENCE.value in reasons
+            or ReasonCode.CONFLICTING_CORRECTIONS in reasons or ReasonCode.CONFLICTING_CORRECTIONS.value in reasons):
+        return ActionDecision.REQUIRE_CLARIFICATION, False, reasons
+
+    # 5. Unknown intent without clarification choices -> Reject / no mutation
     if intent_val == 'unknown':
         return ActionDecision.REJECT, False, reasons
 
-    # 5. Read-only query intents -> READ_ONLY, never mutate
+    # 6. Read-only query intents -> READ_ONLY, never mutate
     if intent_val in READ_ONLY_INTENTS:
         return ActionDecision.READ_ONLY, False, reasons
-
-    # 6. Ambiguous reference or choices present -> Require clarification
-    if getattr(interpretation, 'choices', None) or ReasonCode.AMBIGUOUS_REFERENCE in reasons or ReasonCode.AMBIGUOUS_REFERENCE.value in reasons:
-        return ActionDecision.REQUIRE_CLARIFICATION, False, reasons
 
     # 7. Missing required entities -> Cannot execute directly
     missing = getattr(interpretation, 'missing_fields', []) or []

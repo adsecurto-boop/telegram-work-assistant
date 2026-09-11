@@ -1237,54 +1237,25 @@ async def handle(update, context):
         elif command == 'understand':
             if not argument:
                 raise ValueError('Usage: /understand your natural language message')
-            from telegram_import import redact
-            from nlp import (ContextResolver, DeterministicParser, GeminiNLParser,
-                             enrich_interpretation)
-            from nlp_normalizer import normalize_input
-            from nlp_policy import ReasonCode, evaluate_action_policy
-            normalized = normalize_input(argument)
-            interp = DeterministicParser.parse(argument)
-            if (not interp or interp.confidence < 0.7) and config.AI_KEY and config.AI_MODEL:
-                day = datetime.now(ZoneInfo(config.TIMEZONE)).date().isoformat()
-                if await asyncio.to_thread(db(context).reserve_ai, day, config.AI_DAILY_LIMIT):
-                    parser = GeminiNLParser(config.AI_KEY, config.AI_MODEL, config.AI_FALLBACK_MODEL)
-                    ctx = await asyncio.to_thread(db(context).get_conversation_context, 'owner')
-                    corrections = await asyncio.to_thread(db(context).get_approved_corrections, 5)
-                    ctx['approved_corrections'] = [
-                        {'example': redact(item.get('raw_text') or ''),
-                         'intent': item.get('corrected_intent'),
-                         'entities': item.get('corrected_entities') or {}}
-                        for item in corrections if item.get('raw_text')
-                    ]
-                    gemini_res = await parser.interpret(argument, ctx)
-                    succeeded = bool(gemini_res and gemini_res.provider == 'gemini')
-                    await asyncio.to_thread(
-                        db(context).record_ai_event, 'nl_understand', config.AI_PROVIDER,
-                        gemini_res.model if succeeded else config.AI_MODEL,
-                        parser.PROMPT_VERSION, 'success' if succeeded else 'failed',
-                        None if succeeded else 'InterpretationError')
-                    if gemini_res and gemini_res.confidence > (interp.confidence if interp else 0.0):
-                        interp = enrich_interpretation(gemini_res, normalized)
-                        interp.reason_codes.append(ReasonCode.GEMINI_FALLBACK.value)
-            if interp and interp.intent.value != 'unknown':
-                interp = await asyncio.to_thread(ContextResolver(db(context)).resolve, interp)
-            if not interp:
+            from nlp import GeminiNLParser, NaturalLanguagePipeline
+            from nlp_policy import evaluate_action_policy
+            active_shift = await asyncio.to_thread(db(context).active_shift)
+            ai_client = None
+            if config.AI_KEY and config.AI_MODEL:
+                ai_client = GeminiNLParser(config.AI_KEY, config.AI_MODEL, config.AI_FALLBACK_MODEL)
+            pipeline = NaturalLanguagePipeline(db(context), ai_client=ai_client)
+            interp = await pipeline.interpret_preview(argument, shift=active_shift)
+            if not interp or interp.intent.value == 'unknown':
                 await reply(update, 'Could not understand this input with confidence.')
             else:
-                normal_decision, normal_mutation, reasons = evaluate_action_policy(
-                    interp, has_active_shift=bool(await asyncio.to_thread(db(context).active_shift)))
-                preview_decision, _, reasons = evaluate_action_policy(
-                    interp, is_understand=True,
-                    has_active_shift=bool(await asyncio.to_thread(db(context).active_shift)))
-                interp.action_decision = preview_decision.value
-                interp.would_mutate = False
-                interp.reason_codes = list(dict.fromkeys(
-                    str(reason.value if hasattr(reason, 'value') else reason) for reason in reasons))
+                normal_decision, normal_mutation, _ = evaluate_action_policy(
+                    interp, has_active_shift=bool(active_shift))
+                preview_decision = interp.action_decision
                 entities_str = json.dumps(interp.entities.model_dump(exclude_none=True), indent=2)
                 await reply(update, f"Intent: {interp.intent.value} (Confidence: {round(interp.confidence*100)}%)\n"
                                     f"Provider: {interp.provider}\n"
                                     f"Summary: {interp.proposed_summary}\n"
-                                    f"Preview action: {preview_decision.value} (always read-only)\n"
+                                    f"Preview action: {preview_decision} (always read-only)\n"
                                     f"Normal-message policy: {normal_decision.value}\n"
                                     f"Would mutate if sent normally: {'yes' if normal_mutation else 'no'}\n"
                                     f"Reasons: {', '.join(interp.reason_codes) or 'none'}\n"

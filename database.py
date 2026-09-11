@@ -1,5 +1,7 @@
 """Transactional SQLite storage with versioned, backup-first migrations."""
+import difflib
 import json
+import re
 import shutil
 import sqlite3
 import uuid
@@ -2520,7 +2522,80 @@ class Database:
                 'by_intent': by_intent,
             }
 
-    def get_approved_corrections(self, limit: int = 5, intent: str = None) -> list[dict]:
+    def get_relevant_corrections(self, query_text: str, limit: int = 5,
+                                  min_score: float = 0.25, intent: str = None) -> list[dict]:
+        """
+        Search saved corrections by similarity to the incoming message instead of simply
+        selecting the newest. Considers wording, intent, and entities.
+        """
+        def _score(q: str, c: str) -> float:
+            if not q or not c:
+                return 0.0
+            qn = re.sub(r'\s+', ' ', q.strip().casefold())
+            cn = re.sub(r'\s+', ' ', c.strip().casefold())
+            if qn == cn:
+                return 1.0
+            seq = difflib.SequenceMatcher(None, qn, cn).ratio()
+            q_tokens = set(re.findall(r'\b[a-z0-9_#-]+\b', qn))
+            c_tokens = set(re.findall(r'\b[a-z0-9_#-]+\b', cn))
+            if not q_tokens or not c_tokens:
+                return seq
+            jaccard = len(q_tokens & c_tokens) / len(q_tokens | c_tokens)
+            containment = len(q_tokens & c_tokens) / min(len(q_tokens), len(c_tokens))
+            kw_groups = (
+                {'shift', 'working', 'hours', 'extended', 'lunch', 'day off'},
+                {'carried', 'carry', 'yesterday', 'unfinished', 'pending'},
+                {'testing', 'tested', 'retest', 'reproduced', 'verified'},
+                {'addressed', 'resolved', 'assisted', 'query', 'concern', 'issue', 'teams', 'whatsapp'},
+                {'reported', 'shared', 'developer', 'dev', 'confirmed'},
+                {'tod', 'pl', 'eod', 'lunch update', 'start of day', 'end of day'},
+            )
+            bonus = 0.0
+            for g in kw_groups:
+                if (q_tokens & g) and (c_tokens & g):
+                    bonus += 0.08
+                    break
+            return max(0.0, min(1.0, 0.35 * seq + 0.35 * jaccard + 0.20 * containment + bonus))
+
+        with self.connect() as connection:
+            if intent:
+                rows = connection.execute('''
+                    SELECT c.*, i.raw_text
+                    FROM nl_corrections c
+                    LEFT JOIN nl_interactions i ON c.interaction_id = i.id
+                    WHERE c.corrected_intent = ?
+                    ORDER BY c.id DESC LIMIT 200
+                ''', (intent,)).fetchall()
+            else:
+                rows = connection.execute('''
+                    SELECT c.*, i.raw_text
+                    FROM nl_corrections c
+                    LEFT JOIN nl_interactions i ON c.interaction_id = i.id
+                    ORDER BY c.id DESC LIMIT 200
+                ''').fetchall()
+            scored = []
+            for r in rows:
+                d = dict(r)
+                if d.get('corrected_entities_json'):
+                    try:
+                        d['corrected_entities'] = json.loads(d['corrected_entities_json'])
+                    except Exception:
+                        d['corrected_entities'] = {}
+                else:
+                    d['corrected_entities'] = {}
+                raw_text = d.get('raw_text') or ''
+                similarity = _score(query_text, raw_text) if query_text else 0.0
+                d['similarity_score'] = round(similarity, 4)
+                d['score'] = round(similarity, 4)
+                if not query_text or similarity >= min_score:
+                    scored.append(d)
+            if query_text:
+                scored.sort(key=lambda item: (item['similarity_score'], item['id']), reverse=True)
+            return scored[:limit]
+
+    def get_approved_corrections(self, limit: int = 5, intent: str = None, query_text: str = None) -> list[dict]:
+        if query_text:
+            return self.get_relevant_corrections(query_text, limit=limit, intent=intent)
         with self.connect() as connection:
             if intent:
                 rows = connection.execute('''
