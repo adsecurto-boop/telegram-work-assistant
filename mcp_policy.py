@@ -3,9 +3,11 @@ MCP Tool Policy for Security and Confirmation Enforcements.
 Determines whether a tool execution requires user confirmation,
 and formats confirmation previews for external write operations.
 """
+import hashlib
+import json
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
-from mcp_registry import ToolDescriptor, RiskLevel
+from mcp_registry import ToolDescriptor, RiskLevel, effective_risk_for_call, required_capabilities_for_call
 
 
 class PolicyDecision:
@@ -28,8 +30,10 @@ class ToolPolicy:
 
     @staticmethod
     def evaluate(tool_desc: ToolDescriptor, arguments: Dict[str, Any]) -> ToolPolicyResult:
+        effective_risk = effective_risk_for_call(tool_desc, arguments)
+        required = sorted(required_capabilities_for_call(tool_desc, arguments))
         # READ_ONLY tools are automatically allowed
-        if tool_desc.risk_level == RiskLevel.READ_ONLY:
+        if effective_risk == RiskLevel.READ_ONLY:
             return ToolPolicyResult(
                 decision=PolicyDecision.ALLOWED,
                 tool_desc=tool_desc,
@@ -37,7 +41,7 @@ class ToolPolicy:
             )
 
         # EXTERNAL_WRITE and DESTRUCTIVE tools require explicit confirmation
-        if tool_desc.risk_level in [
+        if effective_risk in [
             RiskLevel.EXTERNAL_WRITE, RiskLevel.DESTRUCTIVE,
             RiskLevel.PRIVILEGED, RiskLevel.UNKNOWN_EXTERNAL,
         ]:
@@ -47,12 +51,15 @@ class ToolPolicy:
                 "gemini_name": tool_desc.gemini_name,
                 "server": tool_desc.server_name,
                 "arguments": arguments,
-                "risk_level": tool_desc.risk_level.value
+                "risk_level": effective_risk.value,
+                "required_capabilities": required,
+                "arguments_hash": hashlib.sha256(
+                    json.dumps(arguments, sort_keys=True, default=str).encode()).hexdigest(),
             }
             return ToolPolicyResult(
                 decision=PolicyDecision.CONFIRMATION_REQUIRED,
                 tool_desc=tool_desc,
-                reason=f"Action requires explicit user confirmation ({tool_desc.risk_level.value})",
+                reason=f"Action requires explicit user confirmation ({effective_risk.value})",
                 confirmation_preview=preview,
                 proposal_data=proposal
             )

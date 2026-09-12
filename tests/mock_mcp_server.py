@@ -79,6 +79,36 @@ def main():
                                 },
                                 "required": ["title"]
                             }
+                        },
+                        {
+                            "name": "issue_read",
+                            "description": "Official GitHub MCP issue read operations",
+                            "annotations": {"readOnlyHint": True},
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {"method": {"type": "string", "enum": ["get", "get_labels", "get_comments"]}, "owner": {"type": "string"}, "repo": {"type": "string"}, "issue_number": {"type": "integer"}},
+                                "required": ["method", "owner", "repo", "issue_number"]
+                            }
+                        },
+                        {
+                            "name": "issue_write",
+                            "description": "Official GitHub MCP create or update issue/pull request",
+                            "annotations": {"readOnlyHint": False},
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {"method": {"type": "string", "enum": ["create", "update"]}, "owner": {"type": "string"}, "repo": {"type": "string"}, "issue_number": {"type": "integer"}, "title": {"type": "string"}, "body": {"type": "string"}, "state": {"type": "string"}, "labels": {"type": "array", "items": {"type": "string"}}, "assignees": {"type": "array", "items": {"type": "string"}}},
+                                "required": ["method", "owner", "repo"]
+                            }
+                        },
+                        {
+                            "name": "label_write",
+                            "description": "Official GitHub MCP repository label CRUD",
+                            "annotations": {"readOnlyHint": False},
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {"method": {"type": "string", "enum": ["create", "update", "delete"]}, "owner": {"type": "string"}, "repo": {"type": "string"}, "name": {"type": "string"}, "new_name": {"type": "string"}, "description": {"type": "string"}},
+                                "required": ["method", "owner", "repo", "name"]
+                            }
                         }
                     ]
                 }
@@ -108,6 +138,18 @@ def main():
                 res_content = [{"type": "text", "text": f"Created GitHub issue #{99}: {args.get('title')}"}]
                 structured = {"repository": args.get("repository", "owner/telegram-work-assistant"),
                               "number": 99, "state": "open", "title": args.get("title")}
+            elif t_name == "issue_read":
+                res_content = [{"type": "text", "text": "Official issue read: #61 is open."}]
+                structured = {"repository": f"{args.get('owner')}/{args.get('repo')}",
+                              "number": args.get("issue_number"), "state": "open", "labels": ["bug"]}
+            elif t_name == "issue_write":
+                res_content = [{"type": "text", "text": f"Official issue_write {args.get('method')} accepted."}]
+                structured = {"repository": f"{args.get('owner')}/{args.get('repo')}",
+                              "number": args.get("issue_number", 99), "state": args.get("state", "open"),
+                              "labels": args.get("labels", [])}
+            elif t_name == "label_write":
+                res_content = [{"type": "text", "text": f"Official label_write {args.get('method')} accepted."}]
+                structured = {"name": args.get("name"), "method": args.get("method")}
             else:
                 res_content = [{"type": "text", "text": f"Executed tool {t_name} with args {args}"}]
                 structured = {"tool": t_name, "arguments": args}

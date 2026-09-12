@@ -5,6 +5,7 @@ MCP tool integration, persistent write confirmation, prompt injection isolation,
 FTS case event retrieval, and dashboard 303 token redirects.
 """
 import asyncio
+import hashlib
 import http.client
 import json
 import sys
@@ -206,7 +207,12 @@ class ProductionE2ETests(unittest.IsolatedAsyncioTestCase):
         from types import SimpleNamespace
 
         prop_id = "prop_e2e_confirm"
-        payload = {"gemini_name": "mcp__mock__create_issue", "arguments": {"title": "Confirmed Wayland Issue"}}
+        args = {"title": "Confirmed Wayland Issue"}
+        payload = {"gemini_name": "mcp__mock__create_issue", "tool_id": "mock.create_issue",
+                   "server": "mock", "arguments": args, "risk_level": "EXTERNAL_WRITE",
+                   "required_capabilities": ["github.issue.create"],
+                   "authorization_family": ["github.issue.create"],
+                   "arguments_hash": hashlib.sha256(json.dumps(args, sort_keys=True).encode()).hexdigest()}
         self.db.create_proposal(prop_id, self.owner_id, "mcp_external_write", json.dumps(payload), source_update_id=107)
 
         # Build synthetic Telegram callback update and context
@@ -445,8 +451,13 @@ class ProductionE2ETests(unittest.IsolatedAsyncioTestCase):
             "gemini_tool_model": CompatibleToolModel(ai),
         }
 
-        await handlers.save_plain_message(
-            update, context, "Check GitHub for the Wayland screenshot issue")
+        # Keep this synthetic E2E path offline even when a developer has a live
+        # Gemini key configured: external-continuation planning is separately
+        # exercised with deterministic fixtures in this suite.
+        from unittest.mock import patch
+        with patch.object(config, "AI_KEY", ""), patch.object(config, "AI_MODEL", ""):
+            await handlers.save_plain_message(
+                update, context, "Check GitHub for the Wayland screenshot issue")
 
         sent_reply = msg.reply_text.await_args.args[0]
         self.assertIn("issue #61", sent_reply)
@@ -464,14 +475,10 @@ class ProductionE2ETests(unittest.IsolatedAsyncioTestCase):
         import handlers
         from agent_orchestrator import AgentAuthorization
         from gemini_tool_model import CompatibleToolModel
+        from types import SimpleNamespace
         from unittest.mock import AsyncMock, MagicMock, patch
 
         self.db.update_conversation_context(active_case_id=self.case_id)
-        self.mcp_manager.registry.register_tool(
-            "mock", "add_issue_label", "Add a GitHub issue label",
-            {"type": "object", "properties": {"issue_number": {"type": "integer"},
-                                                "label": {"type": "string"}},
-             "required": ["issue_number", "label"]}, RiskLevel.EXTERNAL_WRITE)
         responses = []
         for call, answer in (
             ({"name": "mcp__mock__search_issues", "args": {"query": "61"}}, "Issue #61 is open."),
@@ -481,8 +488,9 @@ class ProductionE2ETests(unittest.IsolatedAsyncioTestCase):
             ({"name": "mcp__mock__get_issue", "args": {"issue_number": 61}}, "Labels: bug, ubuntu."),
         ):
             responses.extend(({"function_calls": [call]}, {"text": answer}))
-        responses.append({"function_calls": [{"name": "mcp__mock__add_issue_label",
-                                                "args": {"issue_number": 61, "label": "bug"}}]})
+        responses.append({"function_calls": [{"name": "mcp__mock__issue_write", "args": {
+            "method": "update", "owner": "owner", "repo": "repo", "issue_number": 61,
+            "labels": ["bug"]}}]})
         ai = MockGeminiClientForE2E(tool_responses=responses)
         context = MagicMock()
         context.application.bot_data = {
@@ -518,3 +526,17 @@ class ProductionE2ETests(unittest.IsolatedAsyncioTestCase):
             pending = connection.execute(
                 "SELECT * FROM nl_proposals WHERE status='pending'").fetchall()
         self.assertEqual(len(pending), 1)
+        prop_id = pending[0]["id"]
+        callback_msg = MagicMock(reply_text=AsyncMock(), edit_text=AsyncMock(), forward_origin=None)
+        callback = MagicMock(data=f"mcp:confirm:{prop_id}", answer=AsyncMock(),
+                             edit_message_text=AsyncMock(), from_user=SimpleNamespace(id=self.owner_id),
+                             message=callback_msg)
+        callback_update = MagicMock(callback_query=callback, effective_message=callback_msg)
+        original_call = self.mcp_manager.call_tool
+        with patch.object(self.mcp_manager, "call_tool", new=AsyncMock(wraps=original_call)) as call:
+            await handlers.handle_callback(callback_update, context)
+            await handlers.handle_callback(callback_update, context)
+            call.assert_awaited_once_with("mcp__mock__issue_write", {
+                "method": "update", "owner": "owner", "repo": "repo", "issue_number": 61,
+                "labels": ["bug"]})
+        self.assertEqual(self.db.get_nl_proposal(prop_id)["status"], "executed")

@@ -2729,7 +2729,7 @@ class Database:
         """Persist a secret-free record of a confirmed external mutation attempt."""
         safe = {key: metadata.get(key) for key in (
             'server', 'canonical_tool_id', 'arguments_hash', 'risk',
-            'authorization_family', 'execution_timestamp', 'status')}
+            'authorization_family', 'required_capabilities', 'execution_timestamp', 'status')}
         safe['proposal_id'] = proposal_id
         safe['confirmation_owner'] = owner_id
         with self.connect() as connection:

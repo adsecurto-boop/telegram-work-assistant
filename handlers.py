@@ -784,11 +784,24 @@ async def handle_callback(update, context):
                 try:
                     desc = mcp_mgr.validate_tool_call(gemini_name, args)
                     from mcp_policy import ToolPolicy, PolicyDecision
+                    from mcp_registry import effective_risk_for_call, required_capabilities_for_call
                     current_policy = ToolPolicy.evaluate(desc, args)
-                    stored_risk = payload.get('risk_level')
+                    current_required = sorted(required_capabilities_for_call(desc, args))
+                    stored_required = sorted(payload.get('required_capabilities') or [])
+                    authorized = set(payload.get('authorization_family') or [])
+                    expected_hash = payload.get('arguments_hash')
+                    actual_hash = hashlib.sha256(json.dumps(args, sort_keys=True, default=str).encode()).hexdigest()
                     if current_policy.decision != PolicyDecision.CONFIRMATION_REQUIRED:
                         raise ValueError('Tool risk policy changed; create a new proposal.')
-                    if stored_risk and stored_risk != desc.risk_level.value:
+                    if not stored_required or stored_required != current_required:
+                        raise ValueError('Tool capability semantics changed; create a new proposal.')
+                    if not set(current_required) <= authorized:
+                        raise ValueError('Proposal authority no longer covers this exact operation.')
+                    if not expected_hash or expected_hash != actual_hash:
+                        raise ValueError('Proposal arguments changed; create a new proposal.')
+                    current_risk = effective_risk_for_call(desc, args)
+                    stored_risk = payload.get('risk_level')
+                    if stored_risk and stored_risk != current_risk.value:
                         raise ValueError('Tool risk classification changed; create a new proposal.')
                     res = await mcp_mgr.call_tool(gemini_name, args)
                 except Exception as exc:
@@ -798,6 +811,7 @@ async def handle_callback(update, context):
                         'arguments_hash': hashlib.sha256(json.dumps(args, sort_keys=True, default=str).encode()).hexdigest(),
                         'risk': payload.get('risk_level'),
                         'authorization_family': payload.get('authorization_family', []),
+                        'required_capabilities': payload.get('required_capabilities', []),
                         'execution_timestamp': datetime.now(timezone.utc).isoformat(),
                         'status': 'failed',
                     }
@@ -810,8 +824,9 @@ async def handle_callback(update, context):
                     'server': desc.server_name,
                     'canonical_tool_id': desc.canonical_id,
                     'arguments_hash': hashlib.sha256(json.dumps(args, sort_keys=True, default=str).encode()).hexdigest(),
-                    'risk': desc.risk_level.value,
+                    'risk': effective_risk_for_call(desc, args).value,
                     'authorization_family': payload.get('authorization_family', []),
+                    'required_capabilities': sorted(required_capabilities_for_call(desc, args)),
                     'execution_timestamp': datetime.now(timezone.utc).isoformat(),
                     'status': 'success' if res.success else 'failed',
                 }

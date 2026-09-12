@@ -12,7 +12,8 @@ from assistant_orchestrator import AssistantOrchestrator, ExternalFactContinuati
 from agent_orchestrator import AgentAuthorization
 from nlp import ConversationPlan, NLIntent, NLEntities, PlannedAction
 from mcp_manager import MAX_TOOL_DISCOVERY_PAGES, MCPManager, MCPServerConnection, ToolResult
-from mcp_registry import RiskLevel, ToolRegistry
+from mcp_registry import (RiskLevel, ToolDescriptor, ToolRegistry, effective_risk_for_call,
+                          potential_capabilities_for_tool, required_capabilities_for_call)
 
 
 class _PagedClient:
@@ -117,6 +118,38 @@ class AuthorizationAndCapabilityTests(unittest.TestCase):
                      "Never merge the PR; check its status."):
             with self.subTest(text=text):
                 self.assertFalse(AgentAuthorization.from_user_message(text).external_write_allowed)
+
+    def test_clause_level_negation_preserves_an_independent_authorized_action(self):
+        auth = AgentAuthorization.from_user_message("Don't close issue #61, but add the bug label.")
+        self.assertEqual(auth.requested_capabilities, frozenset({"github.issue.label"}))
+        comment = AgentAuthorization.from_user_message(
+            "Don't merge the PR. Just add a comment saying the retest passed.")
+        self.assertEqual(comment.requested_capabilities, frozenset({"github.issue.comment"}))
+
+    def test_official_issue_write_uses_required_call_capabilities(self):
+        tool = ToolDescriptor("github.issue_write", "mcp__github__issue_write", "github", "issue_write",
+                              "Create or update GitHub issue", {}, RiskLevel.EXTERNAL_WRITE)
+        self.assertTrue({"github.issue.create", "github.issue.update", "github.issue.label", "github.issue.assign"}
+                        <= potential_capabilities_for_tool(tool))
+        label_only = {"method": "update", "owner": "owner", "repo": "repo", "issue_number": 61,
+                      "labels": ["bug"]}
+        self.assertEqual(required_capabilities_for_call(tool, label_only),
+                         frozenset({"github.issue.label"}))
+        label_auth = AgentAuthorization.from_user_message("Add the bug label to issue #61.")
+        self.assertTrue(label_auth.allows(tool, label_only))
+        combined = {**label_only, "state": "closed", "assignees": ["someone"]}
+        self.assertEqual(required_capabilities_for_call(tool, combined), frozenset({
+            "github.issue.update", "github.issue.label", "github.issue.assign"}))
+        self.assertFalse(label_auth.allows(tool, combined))
+
+    def test_label_write_is_repository_crud_and_delete_is_destructive(self):
+        tool = ToolDescriptor("github.label_write", "mcp__github__label_write", "github", "label_write",
+                              "Repository label CRUD", {}, RiskLevel.EXTERNAL_WRITE)
+        delete_args = {"method": "delete", "owner": "owner", "repo": "repo", "name": "bug"}
+        self.assertEqual(required_capabilities_for_call(tool, delete_args),
+                         frozenset({"github.label.delete"}))
+        self.assertEqual(effective_risk_for_call(tool, delete_args), RiskLevel.DESTRUCTIVE)
+        self.assertFalse(AgentAuthorization.from_user_message("Update the bug label description.").allows(tool, delete_args))
 
     def test_capability_index_is_cached_and_invalidated(self):
         registry = ToolRegistry()

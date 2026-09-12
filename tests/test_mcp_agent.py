@@ -262,6 +262,27 @@ class TestMCPManagerAndAgentIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res.pending_confirmation.decision, PolicyDecision.CONFIRMATION_REQUIRED)
         self.assertIn("Requires Confirmation", res.final_text)
 
+    async def test_official_issue_write_scope_escalation_is_denied_before_proposal(self):
+        client = MockAiClient(responses=[{"function_calls": [{
+            "name": "mcp__mock__issue_write",
+            "args": {"method": "update", "owner": "owner", "repo": "repo", "issue_number": 61,
+                     "labels": ["bug"], "state": "closed", "assignees": ["someone"]},
+        }]}])
+        result = await GeminiAgent(self.manager, ai_client=client).run("Add the bug label to issue #61.")
+        self.assertIsNone(result.pending_confirmation)
+        self.assertEqual(result.tool_calls_executed, [])
+        self.assertIn("outside the user's authorization scope", json.dumps(client.requests[-1]))
+
+    async def test_official_issue_write_label_only_still_requires_complete_scope(self):
+        client = MockAiClient(responses=[{"function_calls": [{
+            "name": "mcp__mock__issue_write",
+            "args": {"method": "update", "owner": "owner", "repo": "repo", "issue_number": 61,
+                     "labels": ["bug"]},
+        }]}])
+        result = await GeminiAgent(self.manager, ai_client=client).run("Add the bug label to issue #61.")
+        self.assertIsNotNone(result.pending_confirmation)
+        self.assertEqual(result.tool_calls_executed, [])
+
     async def test_agent_duplicate_tool_call_protection(self):
         dup_fn_response = {
             "function_calls": [

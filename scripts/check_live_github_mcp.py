@@ -14,7 +14,7 @@ async def main() -> int:
     if not os.environ.get("GITHUB_TOKEN"):
         print("live_github_smoke=skipped")
         print("reason=GITHUB_TOKEN_not_configured")
-        return 2
+        return 0
     manager = MCPManager()
     config = manager.load_config()
     config["mcpServers"]["github"]["enabled"] = True

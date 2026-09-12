@@ -6,7 +6,7 @@
       "url": "https://api.githubcopilot.com/mcp/",
       "trusted_endpoint": "https://api.githubcopilot.com/mcp/",
       "trust_tool_annotations": true,
-      "read_only_tools": ["get_issue", "search_issues", "list_issues", "get_pull_request", "search_repositories", "get_file_contents", "get_me"],
+      "read_only_tools": ["issue_read", "pull_request_read", "list_label", "get_label", "get_issue", "search_issues", "list_issues", "get_pull_request", "search_repositories", "get_file_contents", "get_me"],
       "headers": {
         "Authorization": "Bearer ${GITHUB_TOKEN}",
         "X-MCP-Toolsets": "issues,pull_requests,repos,users",

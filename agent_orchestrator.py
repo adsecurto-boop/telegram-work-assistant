@@ -50,47 +50,49 @@ class AgentAuthorization:
     external_write_allowed: bool = False
     destructive_allowed: bool = False
     requested_capabilities: frozenset[str] = frozenset()
+    parser_version: str = "authorization-v2"
 
-    _NEGATIONS: ClassVar[tuple[str, ...]] = (
-        r"\bdo\s+not\b", r"\bdon['’]t\b", r"\bnever\b", r"\bread[- ]only\b",
-        r"\bonly\s+(?:read|show|check|tell)\b", r"\bjust\s+(?:read|show|check|tell)\b",
-        r"\bdon['’]t\s+change\b", r"\bdo\s+not\s+change\b",
-    )
     _CAPABILITY_PATTERNS: ClassVar[tuple[tuple[str, str], ...]] = (
-        ("github.issue.create", r"\bcreate\s+(?:an?\s+)?(?:github\s+)?issue\b"),
-        ("github.issue.update", r"\b(?:close|reopen|update|edit)\s+(?:github\s+)?issue\b"),
-        ("github.issue.label", r"\b(?:add|apply|remove)\s+(?:the\s+)?(?:[\w.-]+\s+)?label\b"),
-        ("github.issue.assign", r"\bassign\s+(?:github\s+)?issue\b"),
-        ("github.issue.comment", r"\b(?:add|post|write)\s+(?:an?\s+)?comment\b"),
+        ("github.issue.create", r"\b(?:create|file|open)\s+(?:an?\s+)?(?:new\s+)?(?:github\s+)?issue\b"),
+        ("github.issue.update", r"\b(?:close|reopen|update|edit|mark)\b.*\b(?:issue|closed|open)\b"),
+        ("github.issue.label", r"\b(?:add|apply|remove)\b.*\blabel\b|\btake\b.*\blabel\b.*\boff\b"),
+        ("github.issue.assign", r"\bassign\b.*\bissue\b|\bput\s+\w+\s+on\s+(?:the\s+)?issue\b"),
+        ("github.issue.comment", r"\b(?:add|post|write|leave)\b.*\bcomment\b"),
         ("github.pr.merge", r"\bmerge\s+(?:the\s+)?(?:pull\s+request|pr)\b"),
+        ("github.label.create", r"\bcreate\b.*\blabel\b"),
+        ("github.label.update", r"\bupdate\b.*\blabel\b"),
         ("gmail.message.send", r"\b(?:send|reply\s+to)\s+(?:an?\s+)?(?:email|mail|message)\b"),
         ("calendar.event.create", r"\b(?:create|schedule|book)\s+(?:an?\s+)?(?:calendar\s+)?(?:event|meeting)\b"),
         ("drive.file.write", r"\b(?:create|update|edit|move)\s+(?:the\s+|an?\s+)?(?:drive\s+)?(?:file|document|doc)\b"),
-        ("external.delete", r"\b(?:delete|destroy|purge|remove)\s+(?:the\s+|an?\s+)?(?:comment|file|record|resource)\b"),
+        ("github.label.delete", r"\b(?:delete|destroy|purge)\b.*\blabel\b"),
+        ("external.delete", r"\b(?:delete|destroy|purge)\b"),
     )
 
     @classmethod
     def from_user_message(cls, text: str) -> "AgentAuthorization":
-        low = text.casefold()
-        if any(re.search(pattern, low) for pattern in cls._NEGATIONS):
-            return cls()
-        capabilities = frozenset(
-            capability for capability, pattern in cls._CAPABILITY_PATTERNS
-            if re.search(pattern, low)
-        )
-        destructive = "external.delete" in capabilities
-        return cls(True, bool(capabilities), destructive, capabilities)
+        # "but", punctuation, and sentence boundaries delimit independent commands.
+        clauses = [part.strip().casefold() for part in re.split(r"(?:[.;!?]+|\bbut\b)", text) if part.strip()]
+        capabilities: set[str] = set()
+        for clause in clauses:
+            negated = bool(re.search(r"\b(?:do\s+not|don['’]t|never)\b", clause))
+            for capability, pattern in cls._CAPABILITY_PATTERNS:
+                if re.search(pattern, clause) and not negated:
+                    capabilities.add(capability)
+        destructive = any(capability.endswith(".delete") or capability == "external.delete"
+                          for capability in capabilities)
+        return cls(True, bool(capabilities), destructive, frozenset(capabilities))
 
-    def allows(self, desc: Any) -> bool:
-        if desc.risk_level == RiskLevel.READ_ONLY:
+    def allows(self, desc: Any, arguments: Dict[str, Any]) -> bool:
+        from mcp_registry import effective_risk_for_call, required_capabilities_for_call
+        risk = effective_risk_for_call(desc, arguments)
+        required = required_capabilities_for_call(desc, arguments)
+        if risk == RiskLevel.READ_ONLY:
             return self.external_read_allowed
-        if desc.risk_level in (RiskLevel.DESTRUCTIVE, RiskLevel.PRIVILEGED):
-            return self.destructive_allowed and "external.delete" in self.requested_capabilities
-        if desc.risk_level not in (RiskLevel.EXTERNAL_WRITE, RiskLevel.UNKNOWN_EXTERNAL):
+        if risk in (RiskLevel.DESTRUCTIVE, RiskLevel.PRIVILEGED) and not self.destructive_allowed:
+            return False
+        if not required:
             return True
-        from mcp_registry import ToolRegistry
-        tool_caps = ToolRegistry.capabilities_for_tool(desc)
-        return self.external_write_allowed and bool(tool_caps & self.requested_capabilities)
+        return self.external_write_allowed and required <= self.requested_capabilities
 
     @property
     def external_write_requested(self) -> bool:  # compatibility for callers/tests
@@ -178,7 +180,7 @@ class GeminiAgent:
                         continue
                     policy = ToolPolicy.evaluate(desc, call.arguments)
                     if policy.decision == PolicyDecision.CONFIRMATION_REQUIRED:
-                        if not authorization.allows(desc):
+                        if not authorization.allows(desc, call.arguments):
                             denied = ToolResult(call.name, call.name, False,
                                                 error="Action was outside the user's authorization scope")
                             response_calls.append(call)
@@ -187,6 +189,7 @@ class GeminiAgent:
                         if policy.proposal_data is not None:
                             policy.proposal_data["authorization_family"] = sorted(
                                 authorization.requested_capabilities)
+                            policy.proposal_data["parser_version"] = authorization.parser_version
                         return AgentRunResult(run_id, policy.confirmation_preview or "",
                                               executed, results, policy, iteration)
                     result = await self.mcp_manager.call_tool(call.name, call.arguments)

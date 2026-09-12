@@ -41,11 +41,116 @@ def format_gemini_name(server_name: str, tool_name: str) -> str:
 
 
 _GITHUB_WRITES = {
-    "merge_pull_request", "create_issue", "update_issue", "add_issue_comment",
+    "merge_pull_request", "create_issue", "update_issue", "issue_write", "label_write", "add_issue_comment",
     "create_pull_request", "request_review", "mark_notifications_read",
     "assign_copilot_to_issue", "add_sub_issue", "reprioritize_sub_issue",
     "push_files", "create_or_update_file", "create_branch", "fork_repository",
 }
+
+
+def _github_identity(tool: ToolDescriptor) -> bool:
+    identity = f"{tool.server_name} {tool.original_name} {tool.description}".casefold()
+    return any(token in identity for token in ("github", "repository", "pull request", "issue"))
+
+
+def potential_capabilities_for_tool(tool: ToolDescriptor) -> frozenset[str]:
+    """Capabilities a live tool *may* provide; suitable only for discovery/routing."""
+    service = tool.server_name.casefold().replace('-', '_')
+    name = tool.original_name.casefold().replace('-', '_')
+    if _github_identity(tool):
+        service = "github"
+    caps = {f"{service}.available"}
+    if service == "github":
+        if name in {"issue_read", "pull_request_read", "get_issue", "get_pull_request",
+                    "get_file_contents", "search_issues", "search_repositories", "get_me"}:
+            caps.add("github.read")
+        if name == "issue_write":
+            caps.update({"github.issue.create", "github.issue.update", "github.issue.label",
+                         "github.issue.assign"})
+        elif name == "label_write":
+            caps.update({"github.label.create", "github.label.update", "github.label.delete"})
+        else:
+            mappings = {
+                "create_issue": "github.issue.create", "update_issue": "github.issue.update",
+                "close_issue": "github.issue.update", "reopen_issue": "github.issue.update",
+                "add_issue_comment": "github.issue.comment", "issue_comment_write": "github.issue.comment",
+                "merge_pull_request": "github.pr.merge", "create_pull_request": "github.pr.create",
+                "request_review": "github.pr.review_request", "pull_request_review_write": "github.pr.review",
+                "push_files": "github.file.write", "create_or_update_file": "github.file.write",
+                "mark_notifications_read": "github.notifications.update",
+                "add_issue_label": "github.issue.label", "add_label": "github.issue.label",
+                "remove_label": "github.issue.label", "assign": "github.issue.assign",
+            }
+            for marker, capability in mappings.items():
+                if marker in name:
+                    caps.add(capability)
+    elif service in {"gmail", "email", "mail"}:
+        caps.update({"gmail.available", "gmail.read"})
+        if any(word in name for word in ("send", "reply", "draft")):
+            caps.add("gmail.message.send")
+    elif "calendar" in service:
+        caps.update({"calendar.available", "calendar.read"})
+        if any(word in name for word in ("create", "schedule", "insert")):
+            caps.add("calendar.event.create")
+    elif "drive" in service:
+        caps.update({"drive.available", "drive.read"})
+        if any(word in name for word in ("create", "update", "edit", "move", "write")):
+            caps.add("drive.file.write")
+    if tool.risk_level in (RiskLevel.DESTRUCTIVE, RiskLevel.PRIVILEGED):
+        caps.add("external.delete")
+    if tool.risk_level == RiskLevel.READ_ONLY:
+        caps.add(f"{service}.read")
+    return frozenset(caps)
+
+
+def required_capabilities_for_call(tool: ToolDescriptor, arguments: Dict[str, Any]) -> frozenset[str]:
+    """Exact mutation families required by a validated call; unknown writes fail closed."""
+    if tool.risk_level == RiskLevel.READ_ONLY:
+        return frozenset()
+    name = tool.original_name.casefold().replace('-', '_')
+    if _github_identity(tool):
+        method = str(arguments.get("method", "")).casefold()
+        if name == "issue_write":
+            if method not in {"create", "update"}:
+                return frozenset({"unknown.external.write"})
+            required = {"github.issue.create"} if method == "create" else set()
+            if method == "update" and any(arguments.get(field) is not None for field in (
+                    "title", "body", "state", "state_reason", "type", "milestone", "duplicate_of")):
+                required.add("github.issue.update")
+            if arguments.get("labels") is not None:
+                required.add("github.issue.label")
+            if arguments.get("assignees") is not None:
+                required.add("github.issue.assign")
+            if not required:
+                return frozenset({"unknown.external.write"})
+            return frozenset(required)
+        if name == "label_write":
+            if method not in {"create", "update", "delete"}:
+                return frozenset({"unknown.external.write"})
+            return frozenset({f"github.label.{method}"})
+        direct = {
+            "create_issue": "github.issue.create", "update_issue": "github.issue.update",
+            "add_issue_comment": "github.issue.comment", "merge_pull_request": "github.pr.merge",
+            "create_pull_request": "github.pr.create", "request_review": "github.pr.review_request",
+            "push_files": "github.file.write", "create_or_update_file": "github.file.write",
+            "mark_notifications_read": "github.notifications.update",
+            "add_issue_label": "github.issue.label", "remove_label": "github.issue.label",
+        }
+        if name in direct:
+            return frozenset({direct[name]})
+        if tool.risk_level != RiskLevel.READ_ONLY:
+            return frozenset({"unknown.external.write"})
+    if tool.risk_level in (RiskLevel.EXTERNAL_WRITE, RiskLevel.DESTRUCTIVE,
+                           RiskLevel.PRIVILEGED, RiskLevel.UNKNOWN_EXTERNAL):
+        return frozenset({"unknown.external.write"})
+    return frozenset()
+
+
+def effective_risk_for_call(tool: ToolDescriptor, arguments: Dict[str, Any]) -> RiskLevel:
+    required = required_capabilities_for_call(tool, arguments)
+    if any(capability.endswith(".delete") or capability == "external.delete" for capability in required):
+        return RiskLevel.DESTRUCTIVE
+    return tool.risk_level
 def classify_tool_risk(
     server_name: str,
     tool_name: str,
@@ -87,55 +192,7 @@ class ToolRegistry:
 
     @staticmethod
     def capabilities_for_tool(tool: ToolDescriptor) -> frozenset[str]:
-        """Derive stable routing/authorization capabilities from live tool metadata."""
-        service = tool.server_name.casefold().replace('-', '_')
-        name = tool.original_name.casefold().replace('-', '_')
-        identity = f"{tool.server_name} {tool.original_name} {tool.description}".casefold()
-        if any(token in identity for token in ("github", "repository", "pull request", "issue")):
-            service = "github"
-        elif any(token in identity for token in ("gmail", "email", "inbox")):
-            service = "gmail"
-        elif any(token in identity for token in ("calendar", "meeting")):
-            service = "calendar"
-        elif any(token in identity for token in ("google drive", "document", "drive file")):
-            service = "drive"
-        caps = {f"{service}.available"}
-        if service == "github":
-            if any(word in name for word in ("issue", "pull", "repo", "commit", "branch")):
-                caps.add("github.read")
-            mappings = {
-                "create_issue": "github.issue.create",
-                "update_issue": "github.issue.update",
-                "close_issue": "github.issue.update",
-                "reopen_issue": "github.issue.update",
-                "add_issue_comment": "github.issue.comment",
-                "add_comment": "github.issue.comment",
-                "merge_pull_request": "github.pr.merge",
-                "add_issue_label": "github.issue.label",
-                "add_label": "github.issue.label",
-                "remove_label": "github.issue.label",
-                "assign": "github.issue.assign",
-            }
-            for marker, capability in mappings.items():
-                if marker in name:
-                    caps.add(capability)
-        elif service in {"gmail", "email", "mail"}:
-            caps.update({"gmail.available", "gmail.read"})
-            if any(word in name for word in ("send", "reply", "draft")):
-                caps.add("gmail.message.send")
-        elif "calendar" in service:
-            caps.update({"calendar.available", "calendar.read"})
-            if any(word in name for word in ("create", "schedule", "insert")):
-                caps.add("calendar.event.create")
-        elif "drive" in service:
-            caps.update({"drive.available", "drive.read"})
-            if any(word in name for word in ("create", "update", "edit", "move", "write")):
-                caps.add("drive.file.write")
-        if tool.risk_level in (RiskLevel.DESTRUCTIVE, RiskLevel.PRIVILEGED):
-            caps.add("external.delete")
-        if tool.risk_level == RiskLevel.READ_ONLY:
-            caps.add(f"{service}.read")
-        return frozenset(caps)
+        return potential_capabilities_for_tool(tool)
 
     def capability_index(self) -> Dict[str, tuple[str, ...]]:
         if self._capability_cache is None:
