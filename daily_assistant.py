@@ -17,38 +17,72 @@ from models import Task, TaskStatus
 # ---------------------------------------------------------------------------
 
 def generate_morning_briefing(db) -> str:
-    """Generate a factual morning work briefing."""
+    """Generate a comprehensive morning work briefing."""
     shift = db.active_shift()
     tz_name = getattr(config, 'TIMEZONE', 'Asia/Kolkata')
     now = datetime.now(ZoneInfo(tz_name))
+    today_str = now.date().isoformat()
 
     lines = ["🌅 Personal Work Assistant — Morning Briefing"]
     if shift:
-        lines.append(f"• Shift: {shift.get('start')} to {shift.get('end')} (ID #{shift['id']})")
+        s_start = shift.get('start', '')[:16].replace('T', ' ')
+        s_end = shift.get('end', '')[:16].replace('T', ' ')
+        lines.append(f"• Shift Schedule: {s_start} to {s_end} (ID #{shift['id']})")
     else:
-        lines.append("• Shift: No active shift clocked yet (Use 'Start Shift' or /shift)")
+        lines.append("• Shift Schedule: No active shift clocked yet (Use 'Start Shift' or /shift)")
 
     all_tasks = db.list_tasks() if hasattr(db, 'list_tasks') else []
-    pending_tasks = [t for t in all_tasks if (t.status.value if hasattr(t.status, 'value') else str(t.status)) in ('pending', 'in_progress', 'blocked')]
-    lines.append(f"• Active Tasks: {len(pending_tasks)} pending")
+    open_tasks = [t for t in all_tasks if (t.status.value if hasattr(t.status, 'value') else str(t.status)) in ('pending', 'in_progress', 'blocked')]
+    overdue_tasks = [t for t in open_tasks if t.due_date and t.due_date < today_str]
+    priority_tasks = [t for t in open_tasks if getattr(t, 'priority', 1) >= 2]
+    carry_tasks = [t for t in open_tasks if getattr(t, 'carried_from_id', None) is not None]
 
-    open_cases = db.list_cases(limit=10) if hasattr(db, 'list_cases') else []
-    active_cases = [c for c in open_cases if c.get('status') not in ('closed', 'resolved', 'client_updated')]
-    lines.append(f"• Active Cases: {len(active_cases)} open")
+    lines.append(f"• Tasks & Work Overview: {len(open_tasks)} open ({len(overdue_tasks)} overdue, {len(priority_tasks)} high priority, {len(carry_tasks)} carried forward)")
+
+    all_cases = db.list_cases(limit=30) if hasattr(db, 'list_cases') else []
+    active_cases = [c for c in all_cases if c.get('status') not in ('closed', 'resolved', 'client_updated')]
+    waiting_client = [c for c in active_cases if c.get('status') == 'waiting_client' or c.get('waiting_on') == 'client']
+    waiting_dev = [c for c in active_cases if c.get('status') == 'waiting_internal' or c.get('waiting_on') in ('dev', 'internal', 'development')]
+    waiting_user = [c for c in active_cases if c.get('status') in ('triaged', 'investigating') or c.get('waiting_on') == 'user']
+    retest_cases = [c for c in active_cases if c.get('status') in ('retest_required', 'fix_ready', 'testing')]
+
+    lines.append(f"• Case Breakdown: {len(active_cases)} active ({len(waiting_user)} waiting on you, {len(waiting_client)} waiting on client, {len(waiting_dev)} waiting on dev/internal, {len(retest_cases)} pending retests)")
 
     now_iso_str = now.isoformat()
     followups = db.due_followups(now_iso_str) if hasattr(db, 'due_followups') else []
-    lines.append(f"• Due Follow-ups: {len(followups)} scheduled")
+    lines.append(f"• Scheduled Follow-ups: {len(followups)} due today")
 
-    if active_cases:
-        lines.append("\n📌 Focus Cases:")
-        for c in active_cases[:3]:
-            lines.append(f"  - CASE-{c['id']} [{c.get('client') or 'General'}]: {c['title']} ({c['status']})")
+    if overdue_tasks or priority_tasks or carry_tasks:
+        lines.append("\n📋 Immediate Task Priorities:")
+        shown = set()
+        for t in (overdue_tasks + priority_tasks + carry_tasks)[:5]:
+            if t.id not in shown:
+                shown.add(t.id)
+                tag = "OVERDUE" if t in overdue_tasks else ("HIGH PRIORITY" if t in priority_tasks else "CARRIED")
+                lines.append(f"  - #{t.id} [{tag}] {t.title}")
 
-    if pending_tasks:
-        lines.append("\n📋 Priority Tasks:")
-        for t in pending_tasks[:3]:
-            lines.append(f"  - #{t.id} {t.title} (priority: {t.priority})")
+    if retest_cases or waiting_user:
+        lines.append("\n🔬 Case Action Needed:")
+        for c in (retest_cases + waiting_user)[:4]:
+            lines.append(f"  - CASE-{c['id']} [{c.get('status')}] {c.get('client') or 'General'}: {c['title']}")
+
+    if followups:
+        lines.append("\n⏰ Due Follow-ups:")
+        for f in followups[:3]:
+            f_id = f.get('id') if isinstance(f, dict) else getattr(f, 'id', '')
+            f_note = f.get('note') or f.get('text') if isinstance(f, dict) else getattr(f, 'note', '')
+            lines.append(f"  - Follow-up #{f_id}: {f_note}")
+
+    # First focus suggestion
+    top_task = overdue_tasks[0] if overdue_tasks else (priority_tasks[0] if priority_tasks else (open_tasks[0] if open_tasks else None))
+    top_case = retest_cases[0] if retest_cases else (waiting_user[0] if waiting_user else None)
+    lines.append("\n💡 Recommended First Focus:")
+    if top_task:
+        lines.append(f"  • Task #{top_task.id}: {top_task.title}")
+    elif top_case:
+        lines.append(f"  • CASE-{top_case['id']}: {top_case['title']}")
+    else:
+        lines.append("  • Start by planning today's work with /startday or clocking your shift with /shift.")
 
     return "\n".join(lines)
 

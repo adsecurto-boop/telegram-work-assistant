@@ -339,9 +339,10 @@ async def save_plain_message(update, context, text):
                     corr_id = ops.get('correlation_id')
                 except Exception:
                     pass
-        last_audit = await asyncio.to_thread(database.get_last_reversible_audit)
-        if last_audit and (corr_id is None or last_audit.get('correlation_id') == corr_id):
-            markup = InlineKeyboardMarkup([[InlineKeyboardButton('Undo action', callback_data=f"audit:undo:{last_audit['id']}") ]])
+        if corr_id:
+            last_audit = await asyncio.to_thread(database.get_last_reversible_audit)
+            if last_audit and last_audit.get('correlation_id') == corr_id:
+                markup = InlineKeyboardMarkup([[InlineKeyboardButton('Undo action', callback_data=f"audit:undo:{last_audit['id']}") ]])
 
     await reply(update, reply_text, markup=markup)
 
@@ -351,6 +352,41 @@ async def report_preferences(context, requested=None):
     if style not in ('short', 'standard', 'detailed'):
         raise ValueError('Report style must be short, standard, or detailed.')
     mask = (await asyncio.to_thread(db(context).get_setting, 'mask_client_names')) == 'true'
+    return style, mask
+
+
+async def generate_report_response(update, context, kind):
+    shift = await asyncio.to_thread(db(context).active_shift)
+    if not shift:
+        await reply(update, 'No active shift. Start a shift before generating reports.')
+        return
+    style, mask = await report_preferences(context)
+    activities = await asyncio.to_thread(db(context).activities, shift['id'])
+    tasks = await asyncio.to_thread(db(context).tasks_for_shift, shift['id'])
+    cases = await asyncio.to_thread(db(context).cases_for_shift, shift['id'])
+    sessions = await asyncio.to_thread(db(context).test_sessions_for_shift, shift['id'])
+    followups = await asyncio.to_thread(db(context).due_followups, datetime.now(ZoneInfo(config.TIMEZONE)).isoformat())
+
+    text = reports.generate_report(kind, shift, activities, tasks, cases, sessions, style, mask)
+    facts_hash = hashlib.sha256(text.encode('utf-8')).hexdigest()
+    baseline_tasks = [
+        {'id': t.id, 'title': t.title, 'status': t.status.value if hasattr(t.status, 'value') else str(t.status)}
+        for t in tasks
+    ]
+    facts_snapshot = {
+        'activities_count': len(activities),
+        'tasks_count': len(tasks),
+        'cases_count': len(cases),
+        'sessions_count': len(sessions),
+        'tasks': [t.__dict__ if hasattr(t, '__dict__') else dict(t) for t in tasks],
+        'cases': [dict(c) if isinstance(c, dict) or hasattr(c, 'keys') else c for c in cases],
+        'sessions': [dict(s) if isinstance(s, dict) or hasattr(s, 'keys') else s for s in sessions],
+        'baseline_snapshot': baseline_tasks,
+        'mask': mask
+    }
+    report_id = await asyncio.to_thread(db(context).save_report, shift['id'], kind, text, style,
+                                        facts_hash=facts_hash, facts_snapshot=facts_snapshot)
+    await asyncio.to_thread(db(context).record_delivery, shift['id'], f"report_draft:{kind}")
     return style, mask
 
 
@@ -380,7 +416,7 @@ async def make_report(update, context, kind, requested_style=None):
     }
     report_id = await asyncio.to_thread(db(context).save_report, shift['id'], kind, text, style,
                                         facts_hash=facts_hash, facts_snapshot=facts_snapshot)
-    await asyncio.to_thread(db(context).record_delivery, shift['id'], kind)
+    await asyncio.to_thread(db(context).record_delivery, shift['id'], f"report_draft:{kind}")
 
     # Validate report quality and record provenance
     from report_validator import ReportValidator
@@ -891,6 +927,25 @@ async def handle(update, context):
 
         if command in ('start', 'help'):
             await reply(update, HELP, MENU)
+        elif command == 'briefing':
+            from daily_assistant import generate_morning_briefing
+            text = await asyncio.to_thread(generate_morning_briefing, db(context))
+            await reply(update, text, MENU)
+        elif command in ('integrations', 'tools'):
+            from mcp_manager import MCPManager
+            mgr = MCPManager()
+            mgr.load_config()
+            health = mgr.get_health_status()
+            lines = ['🔌 **Personal Work Assistant — MCP Integrations**\n']
+            if not health:
+                lines.append('No external MCP integrations configured in `mcp_config.json`.')
+            else:
+                for s_name, s_info in health.items():
+                    status_icon = '🟢' if s_info['status'] == 'ready' else ('🟡' if s_info['status'] == 'connecting' else '🔴')
+                    lines.append(f"{status_icon} **{s_name.upper()}**: {s_info['status']} ({s_info['tools']} tools available)")
+                    if s_info.get('last_error'):
+                        lines.append(f"   └ Error: `{s_info['last_error']}`")
+            await reply(update, '\n'.join(lines), MENU)
         elif command in ('shift', 'preset'):
             if command == 'preset':
                 args = (await asyncio.to_thread(db(context).get_setting, 'default_shift') or '12:00 21:00').split()

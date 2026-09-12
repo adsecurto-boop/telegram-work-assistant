@@ -13,7 +13,7 @@ from pathlib import Path
 from models import Task, TaskStatus
 import config
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 
 _last_iso_time = 0.0
@@ -103,6 +103,8 @@ class Database:
                 self._seed_v12_defaults(cursor)
             if version < 13:
                 self._seed_v13_defaults(cursor)
+            if version < 14:
+                self._seed_v14_defaults(cursor)
             self._create_indexes(cursor)
             self._validate_schema_integrity(cursor)
             cursor.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
@@ -607,6 +609,57 @@ class Database:
             connection.execute('''CREATE TABLE IF NOT EXISTS fts_work_memory (
                 source_type TEXT, source_id TEXT, title TEXT, content TEXT, client TEXT, product TEXT, created_at TEXT
             )''')
+
+    def _seed_v14_defaults(self, connection):
+        """Schema v14: Backfill historical work records into fts_work_memory."""
+        try:
+            connection.execute('''CREATE VIRTUAL TABLE IF NOT EXISTS fts_work_memory USING fts5(
+                source_type, source_id, title, content, client, product, created_at
+            )''')
+        except sqlite3.OperationalError:
+            connection.execute('''CREATE TABLE IF NOT EXISTS fts_work_memory (
+                source_type TEXT, source_id TEXT, title TEXT, content TEXT, client TEXT, product TEXT, created_at TEXT
+            )''')
+
+        # Backfill tasks
+        try:
+            cursor = connection.execute("SELECT id, title, client, project, created_at FROM tasks")
+            for row in cursor.fetchall():
+                connection.execute('''INSERT OR IGNORE INTO fts_work_memory (source_type, source_id, title, content, client, product, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                    ('task', str(row['id']), row['title'] or '', f"Task: {row['title'] or ''}", row['client'] or '', row['project'] or '', row['created_at'] or now_iso()))
+        except Exception:
+            pass
+
+        # Backfill cases
+        try:
+            cursor = connection.execute("SELECT id, title, client, product, detail, created_at FROM work_cases")
+            for row in cursor.fetchall():
+                connection.execute('''INSERT OR IGNORE INTO fts_work_memory (source_type, source_id, title, content, client, product, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                    ('case', str(row['id']), row['title'] or '', f"Case #{row['id']}: {row['title'] or ''} {row['detail'] or ''}", row['client'] or '', row['product'] or '', row['created_at'] or now_iso()))
+        except Exception:
+            pass
+
+        # Backfill test sessions
+        try:
+            cursor = connection.execute("SELECT id, scenario, environment, result, defects, created_at FROM test_sessions")
+            for row in cursor.fetchall():
+                connection.execute('''INSERT OR IGNORE INTO fts_work_memory (source_type, source_id, title, content, client, product, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                    ('test_session', str(row['id']), row['scenario'] or '', f"Test Session #{row['id']} [{row['result']}]: {row['scenario']} {row['environment']} {row['defects'] or ''}", '', '', row['created_at'] or now_iso()))
+        except Exception:
+            pass
+
+        # Backfill conversation summaries
+        try:
+            cursor = connection.execute("SELECT id, summary_text, created_at FROM assistant_memory_summaries")
+            for row in cursor.fetchall():
+                connection.execute('''INSERT OR IGNORE INTO fts_work_memory (source_type, source_id, title, content, client, product, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                    ('conversation_summary', str(row['id']), 'Conversation Summary', row['summary_text'] or '', '', '', row['created_at'] or now_iso()))
+        except Exception:
+            pass
 
     def _validate_schema_integrity(self, cursor):
         required_tables = {
@@ -3152,6 +3205,13 @@ class Database:
             raise ValueError(f"Invalid role: {role!r}. Must be 'user', 'assistant', or 'system'.")
         stamp = created_at or now_iso()
         with self.connect() as connection:
+            if source_update_id is not None:
+                existing = connection.execute(
+                    'SELECT id FROM conversation_turns WHERE owner_id=? AND source_update_id=? AND role=?',
+                    (owner_id, source_update_id, role)
+                ).fetchone()
+                if existing:
+                    return existing['id']
             return connection.execute('''INSERT INTO conversation_turns
                 (owner_id, shift_id, role, text, intent, entities_json,
                  case_id, task_id, test_session_id, source_update_id,

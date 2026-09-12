@@ -53,20 +53,28 @@ def required_entities_for_intent(intent: str) -> list[str]:
         return ['shift_start', 'shift_end']
     if intent == 'create_task':
         return ['task_title']
-    if intent == 'complete_task':
+    if intent in ('update_task', 'complete_task', 'carry_task_forward'):
         return ['reference']
     if intent == 'create_case':
         return ['case_title']
-    if intent == 'change_case_status':
+    if intent in ('update_case', 'change_case_status'):
         return ['status']
+    if intent == 'add_case_event':
+        return ['event_detail']
+    if intent == 'add_client_update':
+        return ['client']
     if intent == 'create_test_session':
         return ['test_scenario', 'test_result']
     if intent == 'update_test_session':
         return ['test_result']
+    if intent == 'attach_evidence':
+        return ['reference']
     if intent == 'add_learning':
         return ['learning_topic']
     if intent == 'create_followup':
         return ['notes']
+    if intent in ('complete_followup', 'snooze_followup'):
+        return ['reference']
     if intent == 'log_support':
         return ['client', 'query']
     return []

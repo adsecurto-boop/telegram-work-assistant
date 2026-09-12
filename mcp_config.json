@@ -1,0 +1,27 @@
+{
+  "mcpServers": {
+    "github": {
+      "enabled": false,
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"
+      }
+    },
+    "filesystem": {
+      "enabled": false,
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "./storage"],
+      "env": {}
+    },
+    "mock_test": {
+      "enabled": false,
+      "transport": "stdio",
+      "command": "python",
+      "args": ["-m", "tests.mock_mcp_server"],
+      "env": {}
+    }
+  }
+}

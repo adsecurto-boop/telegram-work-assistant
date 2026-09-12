@@ -45,6 +45,7 @@ async def startup(application):
             logging.getLogger(__name__).warning('Dashboard unavailable: %s', type(exc).__name__)
     await application.bot.set_my_commands([
         BotCommand('shift','Start a flexible shift'), BotCommand('task','Plan a rich task'),
+        BotCommand('briefing','Morning work briefing'), BotCommand('integrations','MCP tool status'),
         BotCommand('startday','Plan today’s work'), BotCommand('checkpoint','Lunch progress report'),
         BotCommand('timeline','Current shift timeline'), BotCommand('resume','Prioritized open tasks'),
         BotCommand('tomorrow','Review unfinished work'), BotCommand('carrytask','Reschedule a task to tomorrow'),
@@ -75,6 +76,17 @@ async def shutdown(application):
         await asyncio.to_thread(service.stop)
 
 
+async def wrap_handle(update, context):
+    try:
+        await handlers.handle(update, context)
+        if update and getattr(update, 'update_id', None):
+            await asyncio.to_thread(context.application.bot_data['db'].complete_update, update.update_id)
+    except Exception as exc:
+        if update and getattr(update, 'update_id', None):
+            await asyncio.to_thread(context.application.bot_data['db'].fail_update, update.update_id, str(exc))
+        raise
+
+
 def build_application():
     config.validate_config()
     database=Database(config.DB_PATH)
@@ -85,9 +97,9 @@ def build_application():
                  .post_shutdown(shutdown).build())
     application.bot_data['db']=database
     application.add_handler(TypeHandler(Update,gate),group=-1)
-    application.add_handler(CallbackQueryHandler(handlers.handle, pattern=CALLBACK_PATTERN))
+    application.add_handler(CallbackQueryHandler(wrap_handle, pattern=CALLBACK_PATTERN))
     supported = filters.TEXT | filters.VOICE | filters.PHOTO | filters.Document.ALL | filters.VIDEO
-    application.add_handler(MessageHandler(supported & ~filters.UpdateType.EDITED_MESSAGE,handlers.handle))
+    application.add_handler(MessageHandler(supported & ~filters.UpdateType.EDITED_MESSAGE,wrap_handle))
     application.add_error_handler(handlers.error_handler)
     return application
 

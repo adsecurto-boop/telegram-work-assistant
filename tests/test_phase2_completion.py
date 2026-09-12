@@ -135,7 +135,7 @@ class DatabaseWalAndFtsTests(unittest.TestCase):
         self.db = Database(self.db_path)
 
     def test_sqlite_wal_mode_enabled(self):
-        self.assertEqual(SCHEMA_VERSION, 13)
+        self.assertGreaterEqual(SCHEMA_VERSION, 13)
         with self.db.connect() as conn:
             mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
             self.assertEqual(mode.lower(), 'wal')

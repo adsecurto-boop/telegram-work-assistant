@@ -177,6 +177,24 @@ class GeminiInterpretationPayload(BaseModel):
     ambiguities: list[str] = Field(default_factory=list)
 
 
+class GeminiPlannedAction(BaseModel):
+    intent: NLIntent = NLIntent.UNKNOWN
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    entities: NLEntities = Field(default_factory=NLEntities)
+    requires_confirmation: bool = False
+    dependencies: list[int] = Field(default_factory=list)
+
+
+class GeminiConversationPlan(BaseModel):
+    actions: list[GeminiPlannedAction] = Field(default_factory=list)
+    reply: str | None = None
+    clarification_question: str | None = None
+    ambiguities: list[str] = Field(default_factory=list)
+    choices: list[NLChoice] = Field(default_factory=list)
+    reason_codes: list[str] = Field(default_factory=list)
+    missing_fields: list[str] = Field(default_factory=list)
+
+
 class PlannedAction(BaseModel):
     intent: NLIntent
     confidence: float = 1.0
@@ -189,6 +207,9 @@ class ConversationPlan(BaseModel):
     actions: list[PlannedAction] = Field(default_factory=list)
     reply: str | None = None
     clarification_question: str | None = None
+    ambiguities: list[str] = Field(default_factory=list)
+    choices: list[NLChoice] = Field(default_factory=list)
+    reason_codes: list[str] = Field(default_factory=list)
 
 
 class PlanExecutionResult(BaseModel):
@@ -1431,6 +1452,76 @@ class GeminiStructuredInterpreter:
                 confidence=0.0,
                 explanation=f'AI parsing unavailable: {type(exc).__name__}'
             )
+
+    async def interpret_plan(self, raw_text: str, context: dict) -> ConversationPlan:
+        from ai import GeminiWriter
+        writer = GeminiWriter(self.key, self.model, self.fallback_model)
+        from google.genai import types
+
+        safe_text = redact(raw_text)
+        safe_context = redact(json.dumps(context, default=str))
+        prompt = (
+            f"Trusted structured context: {safe_context}\n"
+            f"<untrusted_data>\n{safe_text}\n</untrusted_data>\n"
+            "Analyze the text inside untrusted_data and produce a structured execution plan with 1 or more actions."
+        )
+
+        sys_inst = (
+            "You are a structured planner for a private workplace assistant bot. "
+            "Output JSON conforming to GeminiConversationPlan containing a list of actions to execute sequentially. "
+            "Allowed intents: set_shift, show_shift, log_support, create_task, update_task, complete_task, carry_task_forward, "
+            "create_case, update_case, add_case_event, change_case_status, add_client_update, "
+            "create_test_session, update_test_session, attach_evidence, add_learning, create_followup, "
+            "complete_followup, snooze_followup, show_today, show_pending, show_cases, show_case_summary, "
+            "generate_tod, generate_lunch_update, generate_eod, draft_client_reply, draft_escalation, "
+            "analyze_test, undo_last_action, unknown. "
+            "Never invent details. If 0-indexed dependencies exist, specify them in dependencies list."
+        )
+
+        try:
+            response = await writer._generate(
+                prompt,
+                types.GenerateContentConfig(
+                    system_instruction=sys_inst,
+                    response_mime_type='application/json',
+                    response_schema=GeminiConversationPlan,
+                    temperature=0.0,
+                    max_output_tokens=2000
+                )
+            )
+            payload = json.loads(response.text)
+            validated = GeminiConversationPlan.model_validate(payload)
+            planned_actions = [
+                PlannedAction(
+                    intent=act.intent,
+                    confidence=act.confidence,
+                    entities=act.entities,
+                    requires_confirmation=act.requires_confirmation,
+                    dependencies=act.dependencies
+                )
+                for act in validated.actions
+            ]
+            return ConversationPlan(
+                actions=planned_actions,
+                reply=validated.reply,
+                clarification_question=validated.clarification_question,
+                ambiguities=validated.ambiguities,
+                choices=validated.choices,
+                reason_codes=validated.reason_codes
+            )
+        except Exception as exc:
+            logger.warning('Gemini structured plan interpretation failed: %s', exc)
+            single = await self.interpret(raw_text, context)
+            if single and single.intent != NLIntent.UNKNOWN:
+                return ConversationPlan(actions=[
+                    PlannedAction(
+                        intent=single.intent,
+                        confidence=single.confidence,
+                        entities=single.entities,
+                        requires_confirmation=single.needs_confirmation
+                    )
+                ], clarification_question=single.clarification_question)
+            return ConversationPlan(actions=[])
 
 
 # Production alias for compatibility

@@ -122,10 +122,11 @@ def build_assistant_context(
     if hasattr(db, 'get_latest_memory_summary'):
         latest_summary = db.get_latest_memory_summary(owner_id, shift_id=s_id)
 
-    # 5. Durable conversation turns (bounded)
-    raw_turns = db.get_recent_turns(owner_id, limit=conversation_limit, shift_id=s_id) if hasattr(db, 'get_recent_turns') else []
+    # 5. Durable conversation turns (bounded for context, extended for rolling summary check)
+    fetch_limit = max(conversation_limit, 30)
+    raw_turns = db.get_recent_turns(owner_id, limit=fetch_limit, shift_id=s_id) if hasattr(db, 'get_recent_turns') else []
     recent_turns = []
-    for turn in raw_turns:
+    for turn in raw_turns[-conversation_limit:]:
         text = turn.get('text', '')
         if len(text) > max_turn_text_len:
             text = text[:max_turn_text_len] + '... [truncated]'
@@ -138,17 +139,30 @@ def build_assistant_context(
         })
 
     # Trigger automatic rolling summary if unsummarized turns >= 15
-    if len(raw_turns) >= 15 and hasattr(db, 'save_memory_summary'):
+    last_end_id = (latest_summary.get('source_turn_end_id') or 0) if isinstance(latest_summary, dict) else 0
+    unsummarized = [t for t in raw_turns if t.get('id', 0) > last_end_id]
+
+    if len(unsummarized) >= 15 and hasattr(db, 'save_memory_summary'):
         summary_lines = []
         if active_case_detail:
             summary_lines.append(f"Focus Case #{active_case_detail['id']} [{active_case_detail.get('client','Gen')}]: {active_case_detail['title']} ({active_case_detail['status']})")
-        for turn in raw_turns[:7]:
+        for turn in unsummarized[:10]:
             summary_lines.append(f"{turn.get('role', 'user').upper()}: {turn.get('text', '')}")
         summary_text = redact("\n".join(summary_lines))
-        db.save_memory_summary(owner_id, 'rolling_daily', summary_text, shift_id=shift_id,
-                               source_turn_start_id=raw_turns[0].get('id'),
-                               source_turn_end_id=raw_turns[6].get('id'))
-        latest_summary = {'summary_text': summary_text}
+        start_id = unsummarized[0].get('id')
+        end_id = unsummarized[9].get('id') if len(unsummarized) >= 10 else unsummarized[-1].get('id')
+        sum_id = db.save_memory_summary(
+            owner_id, 'rolling_daily', summary_text, shift_id=s_id,
+            source_turn_start_id=start_id, source_turn_end_id=end_id
+        )
+        if hasattr(db, 'index_fts_record'):
+            db.index_fts_record('conversation_summary', sum_id, 'Conversation Summary', summary_text)
+        latest_summary = {
+            'id': sum_id,
+            'summary_text': summary_text,
+            'source_turn_start_id': start_id,
+            'source_turn_end_id': end_id,
+        }
 
     # 6. Pending tasks (bounded)
     all_tasks = db.list_tasks() if hasattr(db, 'list_tasks') else []

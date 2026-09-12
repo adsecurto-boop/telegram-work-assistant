@@ -1,0 +1,108 @@
+"""
+Tool Registry module for Personal Work Assistant MCP Integration.
+Maintains namespaced tool definitions, Gemini function names, and security risk levels.
+"""
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Dict, List, Optional
+
+
+class RiskLevel(Enum):
+    READ_ONLY = "READ_ONLY"
+    LOCAL_WRITE = "LOCAL_WRITE"
+    EXTERNAL_WRITE = "EXTERNAL_WRITE"
+    DESTRUCTIVE = "DESTRUCTIVE"
+    PRIVILEGED = "PRIVILEGED"
+
+
+@dataclass
+class ToolDescriptor:
+    canonical_id: str          # e.g., "github.search_issues"
+    gemini_name: str           # e.g., "mcp__github__search_issues"
+    server_name: str           # e.g., "github"
+    original_name: str         # e.g., "search_issues"
+    description: str
+    input_schema: Dict[str, Any]
+    risk_level: RiskLevel = RiskLevel.READ_ONLY
+    external: bool = True
+    enabled: bool = True
+
+
+def format_gemini_name(server_name: str, tool_name: str) -> str:
+    """Format a valid Gemini function name from server and tool names."""
+    clean_server = server_name.replace('-', '_').replace('.', '_')
+    clean_tool = tool_name.replace('-', '_').replace('.', '_')
+    return f"mcp__{clean_server}__{clean_tool}"
+
+
+def classify_tool_risk(server_name: str, tool_name: str) -> RiskLevel:
+    """Classify tool risk level based on server and operation semantics."""
+    name_lower = tool_name.lower()
+    
+    # Destructive keywords
+    if any(k in name_lower for k in ['delete', 'destroy', 'drop', 'purge', 'remove', 'unlink']):
+        return RiskLevel.DESTRUCTIVE
+    
+    # Write keywords
+    if any(k in name_lower for k in ['create', 'add', 'insert', 'update', 'edit', 'patch', 'send', 'post', 'put', 'write', 'move']):
+        if server_name in ['local', 'assistant', 'system']:
+            return RiskLevel.LOCAL_WRITE
+        return RiskLevel.EXTERNAL_WRITE
+    
+    return RiskLevel.READ_ONLY
+
+
+class ToolRegistry:
+    def __init__(self):
+        self._tools_by_gemini_name: Dict[str, ToolDescriptor] = {}
+        self._tools_by_canonical_id: Dict[str, ToolDescriptor] = {}
+
+    def register_tool(
+        self,
+        server_name: str,
+        original_name: str,
+        description: str,
+        input_schema: Dict[str, Any],
+        risk_level: Optional[RiskLevel] = None,
+        external: bool = True
+    ) -> ToolDescriptor:
+        canonical_id = f"{server_name}.{original_name}"
+        gemini_name = format_gemini_name(server_name, original_name)
+        
+        if risk_level is None:
+            risk_level = classify_tool_risk(server_name, original_name)
+
+        desc = ToolDescriptor(
+            canonical_id=canonical_id,
+            gemini_name=gemini_name,
+            server_name=server_name,
+            original_name=original_name,
+            description=description,
+            input_schema=input_schema or {},
+            risk_level=risk_level,
+            external=external,
+            enabled=True
+        )
+
+        self._tools_by_gemini_name[gemini_name] = desc
+        self._tools_by_canonical_id[canonical_id] = desc
+        return desc
+
+    def get_by_gemini_name(self, gemini_name: str) -> Optional[ToolDescriptor]:
+        return self._tools_by_gemini_name.get(gemini_name)
+
+    def get_by_canonical_id(self, canonical_id: str) -> Optional[ToolDescriptor]:
+        return self._tools_by_canonical_id.get(canonical_id)
+
+    def list_tools(self, server_name: Optional[str] = None) -> List[ToolDescriptor]:
+        tools = list(self._tools_by_gemini_name.values())
+        if server_name:
+            tools = [t for t in tools if t.server_name == server_name]
+        return [t for t in tools if t.enabled]
+
+    def clear_server_tools(self, server_name: str):
+        to_remove = [k for k, v in self._tools_by_gemini_name.items() if v.server_name == server_name]
+        for k in to_remove:
+            desc = self._tools_by_gemini_name.pop(k, None)
+            if desc:
+                self._tools_by_canonical_id.pop(desc.canonical_id, None)

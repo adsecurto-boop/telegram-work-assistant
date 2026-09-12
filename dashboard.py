@@ -307,26 +307,51 @@ th{{background:#f8f9fa;font-weight:600}}
                     category_filter = (params.get('classification') or [''])[0]
                     search_q = (params.get('q') or [''])[0]
                     review_status = (params.get('review_status') or ['pending'])[0]
+                    date_from = (params.get('date_from') or [''])[0]
+                    date_to = (params.get('date_to') or [''])[0]
+                    min_conf_str = (params.get('min_confidence') or [''])[0]
+                    cluster_id_str = (params.get('cluster_id') or [''])[0]
+                    import_id_str = (params.get('import_id') or [''])[0]
+                    has_media_str = (params.get('has_media') or [''])[0]
+                    has_ticket_str = (params.get('has_ticket') or [''])[0]
+                    ext_author = (params.get('external_author') or [''])[0]
+
                     page_num = max(1, int((params.get('page') or ['1'])[0]))
                     limit = 50
                     offset = (page_num - 1) * limit
 
                     status_query = review_status if review_status != 'all' else None
+                    min_conf = float(min_conf_str) if min_conf_str else None
+                    c_id = int(cluster_id_str) if cluster_id_str else None
+                    imp_id = int(import_id_str) if import_id_str else None
+                    h_media = True if has_media_str == '1' else None
+                    h_ticket = True if has_ticket_str == '1' else None
+                    author_owner = False if ext_author == '1' else None
 
                     filtered_items, total_count = service.database.filter_inbox(
                         review_status=status_query,
+                        author_is_owner=author_owner,
+                        import_id=imp_id,
+                        start_date=date_from or None,
+                        end_date=date_to or None,
                         client=client_filter or None,
                         product=product_filter or None,
                         classification=category_filter or None,
+                        min_confidence=min_conf,
+                        cluster_id=c_id,
+                        has_media=h_media,
+                        has_ticket=h_ticket,
                         search_text=search_q or None,
                         offset=offset,
                         limit=limit
                     )
 
-                    filter_form = f'''<form class="filter-bar" method="get" action="/inbox">
-<input name="q" placeholder="Text search..." value="{h(search_q)}">
-<input name="client" placeholder="Client..." value="{h(client_filter)}">
-<input name="product" placeholder="Product..." value="{h(product_filter)}">
+                    filter_form = f'''<form class="filter-bar" method="get" action="/inbox" style="display:flex;gap:8px;flex-wrap:wrap;">
+<input name="q" placeholder="Text search..." value="{h(search_q)}" style="width:140px">
+<input name="client" placeholder="Client..." value="{h(client_filter)}" style="width:110px">
+<input name="product" placeholder="Product..." value="{h(product_filter)}" style="width:110px">
+<input type="date" name="date_from" value="{h(date_from)}" title="Date From">
+<input type="date" name="date_to" value="{h(date_to)}" title="Date To">
 <select name="classification">
 <option value="">All Categories</option>
 <option value="support" {"selected" if category_filter=="support" else ""}>Support</option>
@@ -339,8 +364,10 @@ th{{background:#f8f9fa;font-weight:600}}
 <option value="ignored" {"selected" if review_status=="ignored" else ""}>Ignored</option>
 <option value="all" {"selected" if review_status=="all" else ""}>All Statuses</option>
 </select>
+<input name="min_confidence" placeholder="Min Conf (0.0-1.0)..." value="{h(min_conf_str)}" style="width:120px">
+<input name="cluster_id" placeholder="Cluster ID..." value="{h(cluster_id_str)}" style="width:90px">
 <button class="primary">Filter</button>
-<a href="/inbox">Reset</a>
+<a href="/inbox" class="button">Reset</a>
 </form>'''
 
                     rows_html = []
@@ -358,8 +385,11 @@ th{{background:#f8f9fa;font-weight:600}}
 </tr>''')
 
                     total_pages = max(1, (total_count + limit - 1) // limit)
-                    prev_link = f'<a href="/inbox?page={page_num-1}&q={h(search_q)}&client={h(client_filter)}&review_status={h(review_status)}">« Previous</a>' if page_num > 1 else '<span class="muted">« Previous</span>'
-                    next_link = f'<a href="/inbox?page={page_num+1}&q={h(search_q)}&client={h(client_filter)}&review_status={h(review_status)}">Next »</a>' if page_num < total_pages else '<span class="muted">Next »</span>'
+                    active_query = {k: v[0] for k, v in params.items() if v and v[0] and k != 'page'}
+                    prev_query = {**active_query, 'page': page_num - 1}
+                    next_query = {**active_query, 'page': page_num + 1}
+                    prev_link = f'<a href="/inbox?{urlencode(prev_query)}">« Previous</a>' if page_num > 1 else '<span class="muted">« Previous</span>'
+                    next_link = f'<a href="/inbox?{urlencode(next_query)}">Next »</a>' if page_num < total_pages else '<span class="muted">Next »</span>'
                     pagination_html = f'<div style="margin-top:12px;display:flex;gap:16px;align-items:center;">{prev_link} <span>Page {page_num} of {total_pages}</span> {next_link}</div>'
 
                     bulk_actions = f'''<form method="post" action="/inbox/bulk/preview"><input type="hidden" name="csrf_token" value="{csrf_token}">

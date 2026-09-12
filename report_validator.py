@@ -216,7 +216,7 @@ class ReportValidator:
         for f in followups:
             if f.get('status') == 'pending':
                 f_due = f.get('due_at') or ''
-                if shift_end and f_due and f_due <= shift_end:
+                if shift_start and shift_end and f_due and shift_start <= f_due <= shift_end:
                     f_note = (f.get('note') or '').casefold()
                     if f_note and f_note not in lowered_report and f"case-{f.get('case_id')}" not in lowered_report:
                         warnings.append(ReportWarning(
