@@ -3,14 +3,13 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import config
-from models import TaskStatus
+from models import CASE_LIFECYCLE, CaseLifecycleSpec, CaseStatus, TaskStatus, TestResult
 
 PRIORITIES = {'low': 0, 'normal': 1, 'high': 2, 'urgent': 3}
 PRIORITY_NAMES = {value: key for key, value in PRIORITIES.items()}
 OUTCOMES = {'resolved', 'investigated', 'escalated', 'pending', 'assisted'}
-TEST_RESULTS = {'passed', 'failed', 'partial', 'blocked', 'not_run'}
-CASE_STATUSES = {'new','triaged','investigating','waiting_client','waiting_internal',
-                 'fix_ready','testing','retest_required','resolved','client_updated','closed'}
+TEST_RESULTS = {r.value for r in TestResult}
+CASE_STATUSES = {s.value for s in CaseStatus}
 PARTICIPATION = {'owned','handled','assisted','assigned','observed'}
 
 

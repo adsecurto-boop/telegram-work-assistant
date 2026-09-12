@@ -4,6 +4,7 @@ import json
 import re
 import shutil
 import sqlite3
+import threading
 import uuid
 from contextlib import contextmanager, closing
 from datetime import datetime, timedelta, timezone
@@ -12,19 +13,21 @@ from pathlib import Path
 from models import Task, TaskStatus
 import config
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 
 _last_iso_time = 0.0
+_iso_time_lock = threading.Lock()
 
 
 def now_iso():
     global _last_iso_time
-    t = datetime.now(timezone.utc).timestamp()
-    if t <= _last_iso_time:
-        t = _last_iso_time + 0.001
-    _last_iso_time = t
-    return datetime.fromtimestamp(t, timezone.utc).isoformat()
+    with _iso_time_lock:
+        t = datetime.now(timezone.utc).timestamp()
+        if t <= _last_iso_time:
+            t = _last_iso_time + 0.001
+        _last_iso_time = t
+        return datetime.fromtimestamp(t, timezone.utc).isoformat()
 
 
 
@@ -91,6 +94,8 @@ class Database:
                 self._seed_v10_defaults(cursor)
             if version < 11:
                 self._seed_v11_defaults(cursor)
+            if version < 12:
+                self._seed_v12_defaults(cursor)
             self._create_indexes(cursor)
             self._validate_schema_integrity(cursor)
             cursor.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
@@ -204,7 +209,13 @@ class Database:
                 provider TEXT,model TEXT,prompt_version TEXT,source_report_id INTEGER);
             CREATE TABLE IF NOT EXISTS deliveries (
                 shift_id INTEGER NOT NULL,kind TEXT NOT NULL,PRIMARY KEY(shift_id,kind));
-            CREATE TABLE IF NOT EXISTS updates (id INTEGER PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS updates (
+                id INTEGER PRIMARY KEY,
+                status TEXT NOT NULL DEFAULT 'completed',
+                claimed_at TEXT,
+                completed_at TEXT,
+                attempts INTEGER NOT NULL DEFAULT 1,
+                last_error TEXT);
             CREATE TABLE IF NOT EXISTS ai_usage (day TEXT PRIMARY KEY,requests INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS ai_events (
                 id INTEGER PRIMARY KEY,created_at TEXT NOT NULL,operation TEXT NOT NULL,
@@ -401,6 +412,20 @@ class Database:
                 notes TEXT,
                 is_active INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS conversation_turns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_id INTEGER NOT NULL,
+                shift_id INTEGER REFERENCES shifts(id),
+                role TEXT NOT NULL CHECK(role IN ('user','assistant','system')),
+                text TEXT NOT NULL,
+                intent TEXT,
+                entities_json TEXT,
+                case_id INTEGER REFERENCES work_cases(id),
+                task_id INTEGER REFERENCES tasks(id),
+                test_session_id INTEGER REFERENCES test_sessions(id),
+                source_update_id INTEGER,
+                correlation_id TEXT,
+                created_at TEXT NOT NULL);
         ''')
 
     def _create_indexes(self, connection):
@@ -433,6 +458,8 @@ class Database:
             CREATE INDEX IF NOT EXISTS record_links_source_idx ON record_links(source_type, source_id);
             CREATE INDEX IF NOT EXISTS record_links_target_idx ON record_links(target_type, target_id);
             CREATE INDEX IF NOT EXISTS planning_active_idx ON planning_conversations(owner_id, status);
+            CREATE INDEX IF NOT EXISTS conversation_turns_owner_idx ON conversation_turns(owner_id, created_at);
+            CREATE INDEX IF NOT EXISTS conversation_turns_shift_idx ON conversation_turns(shift_id, created_at);
         ''')
 
     def _ensure_columns(self, connection):
@@ -471,6 +498,12 @@ class Database:
                 'normalized_text': 'TEXT'},
             'nl_corrections': {
                 'is_active': 'INTEGER NOT NULL DEFAULT 1'},
+            'updates': {
+                'status': "TEXT NOT NULL DEFAULT 'completed'",
+                'claimed_at': 'TEXT',
+                'completed_at': 'TEXT',
+                'attempts': 'INTEGER NOT NULL DEFAULT 1',
+                'last_error': 'TEXT'},
         }
         for table, columns in additions.items():
             current = {row['name'] for row in connection.execute(f'PRAGMA table_info({table})')}
@@ -532,6 +565,10 @@ class Database:
             connection.execute('ALTER TABLE nl_corrections ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1')
         connection.execute('UPDATE nl_corrections SET is_active=1 WHERE is_active IS NULL')
 
+    def _seed_v12_defaults(self, connection):
+        # v12 introduces conversation_turns table (created by _create_schema)
+        pass
+
     def _validate_schema_integrity(self, cursor):
         required_tables = {
             'tasks', 'settings', 'shifts', 'activities', 'clients',
@@ -544,7 +581,7 @@ class Database:
             'bulk_operations', 'shift_templates', 'shift_calendar',
             'report_provenance', 'nl_proposals', 'report_validations',
             'nl_corrections', 'plan_snapshots', 'record_links',
-            'planning_conversations'
+            'planning_conversations', 'conversation_turns'
         }
         rows = cursor.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         existing = {r['name'] if isinstance(r, sqlite3.Row) else r[0] for r in rows}
@@ -1145,18 +1182,64 @@ class Database:
             if not row:
                 return None
             res = dict(row)
-            if not res.get('finalized') and res.get('facts_hash') and not res.get('is_stale'):
+            if not res.get('finalized') and res.get('facts_hash') and not res.get('is_stale') and not res.get('source_report_id'):
                 live_hash = self.compute_live_facts_hash(res['shift_id'])
                 if live_hash != res['facts_hash']:
                     connection.execute('UPDATE reports SET is_stale=1 WHERE id=?', (report_id,))
                     res['is_stale'] = 1
             return res
 
-    def finalize(self, report_id, acknowledge_errors=False, require_validation=False):
+    def finalize(self, report_id, acknowledge_errors=False, require_validation=False,
+                 acknowledge_stale=False):
+        """Finalize a report.
+
+        Staleness check: if the report's stored facts_hash no longer matches the
+        live state of the shift, the report is marked stale and finalization is
+        rejected.  Pass ``acknowledge_stale=True`` only as an emergency override
+        (e.g. the shift is already closed and re-generation is impossible).
+
+        Args:
+            report_id: Primary key of the report to finalize.
+            acknowledge_errors: If True, bypass error-level validation warnings.
+            require_validation: If True, reject if no validation record exists.
+            acknowledge_stale: If True, allow finalizing a stale report (use
+                sparingly; the report text may not reflect current facts).
+
+        Raises:
+            ValueError: For missing report, staleness, or validation failures.
+        """
         with self.connect() as connection:
-            report = connection.execute('SELECT 1 FROM reports WHERE id=?', (report_id,)).fetchone()
-            if not report:
+            row = connection.execute('SELECT * FROM reports WHERE id=?', (report_id,)).fetchone()
+            if not row:
                 raise ValueError('Report not found.')
+            report = dict(row)
+
+            # --- Staleness check (Product Invariant 4.1 Truthfulness) ---
+            # Re-check is_stale flag first (may already be set by report() or
+            # mark_report_stale()).  For PRIMARY reports (no source_report_id),
+            # also recompute the live hash inside this transaction to catch any
+            # changes since the flag was last evaluated.
+            #
+            # REVISION reports (source_report_id set) carry a FROZEN snapshot and
+            # intentionally represent a subset of facts (e.g. wording edits that
+            # don't pull in late-logged activities).  Their staleness is governed
+            # exclusively by the explicit is_stale flag.
+            already_stale = bool(report.get('is_stale'))
+            is_revision = bool(report.get('source_report_id'))
+            if not already_stale and not is_revision and report.get('facts_hash') and not report.get('finalized'):
+                live_hash = self.compute_live_facts_hash(report['shift_id'])
+                if live_hash != report['facts_hash']:
+                    connection.execute('UPDATE reports SET is_stale=1 WHERE id=?', (report_id,))
+                    already_stale = True
+
+            if already_stale and not acknowledge_stale:
+                raise ValueError(
+                    'Report is stale: facts changed since it was generated '
+                    '(tasks, cases, or test sessions were modified). '
+                    'Regenerate the report or use a revision before finalizing.'
+                )
+
+            # --- Validation check ---
             validation = connection.execute(
                 'SELECT is_valid FROM report_validations WHERE report_id=? ORDER BY id DESC LIMIT 1',
                 (report_id,)).fetchone()
@@ -1164,6 +1247,7 @@ class Database:
                 raise ValueError('Report has not been validated. Regenerate or validate it before finalizing.')
             if validation and not validation['is_valid'] and not acknowledge_errors:
                 raise ValueError('Report contains error-level validation warnings. Review or acknowledge them before finalizing.')
+
             connection.execute('UPDATE reports SET finalized=1 WHERE id=?', (report_id,))
 
     def history(self):
@@ -1180,10 +1264,47 @@ class Database:
         with self.connect() as connection:
             connection.execute('INSERT OR IGNORE INTO deliveries VALUES (?,?)', (shift_id, kind))
 
-    def claim_update(self, update_id):
+    def claim_update(self, update_id: int, timeout_seconds: float = 60.0) -> bool:
         with self.connect() as connection:
-            return connection.execute('INSERT OR IGNORE INTO updates VALUES (?)',
-                                      (update_id,)).rowcount == 1
+            row = connection.execute('SELECT * FROM updates WHERE id=?', (update_id,)).fetchone()
+            now = now_iso()
+            if not row:
+                connection.execute('''INSERT INTO updates
+                    (id, status, claimed_at, attempts) VALUES (?, 'processing', ?, 1)''',
+                    (update_id, now))
+                return True
+            status = row['status']
+            if status == 'completed':
+                return False
+            if status == 'failed':
+                attempts = (row['attempts'] or 1) + 1
+                connection.execute('''UPDATE updates SET status='processing',
+                    claimed_at=?, attempts=? WHERE id=?''', (now, attempts, update_id))
+                return True
+            if status == 'processing':
+                claimed_at = row['claimed_at']
+                if claimed_at:
+                    try:
+                        diff = (datetime.now(timezone.utc) - datetime.fromisoformat(claimed_at)).total_seconds()
+                        if diff > timeout_seconds:
+                            attempts = (row['attempts'] or 1) + 1
+                            connection.execute('''UPDATE updates SET claimed_at=?, attempts=?
+                                WHERE id=?''', (now, attempts, update_id))
+                            return True
+                    except Exception:
+                        pass
+                return False
+            return False
+
+    def complete_update(self, update_id: int):
+        with self.connect() as connection:
+            connection.execute('''UPDATE updates SET status='completed', completed_at=?
+                WHERE id=?''', (now_iso(), update_id))
+
+    def fail_update(self, update_id: int, error: str | None = None):
+        with self.connect() as connection:
+            connection.execute('''UPDATE updates SET status='failed', last_error=?
+                WHERE id=?''', (str(error) if error else None, update_id))
 
     def reserve_ai(self, day, limit):
         with self.connect() as connection:
@@ -1417,7 +1538,7 @@ class Database:
 
     def inbox(self, limit=20, include_observed=False):
         with self.connect() as connection:
-            owner_filter = '' if include_observed else ' AND author_is_owner=1'
+            owner_filter = '' if include_observed else " AND (author_is_owner=1 OR source_type IN ('csv', 'freshdesk', 'freshchat'))"
             return [dict(row) for row in connection.execute('''SELECT * FROM source_messages
                 WHERE review_status='pending' ''' + owner_filter + '''
                 ORDER BY COALESCE(occurred_at,created_at) DESC,id DESC LIMIT ?''', (limit,))]
@@ -1439,8 +1560,10 @@ class Database:
             if review_status:
                 where_clauses.append('review_status=?')
                 params.append(review_status)
-            if author_is_owner:
-                where_clauses.append('author_is_owner=1')
+            if author_is_owner is True:
+                where_clauses.append("(author_is_owner=1 OR source_type IN ('csv', 'freshdesk', 'freshchat'))")
+            elif author_is_owner is False:
+                where_clauses.append("author_is_owner=0 AND source_type NOT IN ('csv', 'freshdesk', 'freshchat')")
             if import_id is not None:
                 where_clauses.append('import_id=?')
                 params.append(import_id)
@@ -2198,6 +2321,24 @@ class Database:
     def add_evidence(self, kind, shift_id=None, case_id=None, test_session_id=None, path=None,
                      telegram_file_id=None, caption=None, sha256=None, mime_type=None):
         with self.connect() as connection:
+            if test_session_id is not None:
+                ts = connection.execute('SELECT id, case_id FROM test_sessions WHERE id=?', (test_session_id,)).fetchone()
+                if not ts:
+                    raise ValueError(f'Test session {test_session_id} not found.')
+                if case_id is not None and ts['case_id'] != case_id:
+                    raise ValueError(f'Test session {test_session_id} does not belong to case {case_id}.')
+            if case_id is not None:
+                c = connection.execute('SELECT 1 FROM work_cases WHERE id=?', (case_id,)).fetchone()
+                if not c:
+                    raise ValueError(f'Case {case_id} not found.')
+
+            if sha256:
+                existing = connection.execute('''SELECT id FROM evidence WHERE sha256=?
+                    AND case_id IS ? AND test_session_id IS ?''',
+                    (sha256, case_id, test_session_id)).fetchone()
+                if existing:
+                    return existing[0]
+
             evidence_id = connection.execute('''INSERT OR IGNORE INTO evidence
                 (case_id,test_session_id,shift_id,kind,path,telegram_file_id,caption,sha256,mime_type,created_at)
                 VALUES (?,?,?,?,?,?,?,?,?,?)''',
@@ -2862,31 +3003,62 @@ class Database:
     # --- Phase 4: Conversation Context ---
 
     def get_conversation_context(self, context_key='owner') -> dict:
+        """Return the current conversation context.
+
+        Canonical return shape::
+
+            {
+                "active_case_id": int | None,
+                "active_task_id": int | None,
+                "active_test_session_id": int | None,
+                "active_client": str | None,
+                "last_intent": str | None,
+                "expires_at": str,
+                "data": {          # ← nested custom data (was flat in older versions)
+                    "expecting_blocker_reason_for": int | None,
+                    "pending_clarification": str | None,
+                    ...
+                }
+            }
+
+        The "data" key always exists (defaulting to {}) so callers can safely
+        do ``ctx.get("data", {})`` or ``ctx["data"]`` without a KeyError.
+        """
         now = now_iso()
         with self.connect() as connection:
             row = connection.execute('SELECT * FROM conversation_context WHERE context_key=?', (context_key,)).fetchone()
             if not row:
-                return {}
+                return {'data': {}}
             if row['expires_at'] < now:
-                return {}
-            data = json.loads(row['context_data_json']) if row['context_data_json'] else {}
-            data.update({
+                return {'data': {}}
+            raw_data = json.loads(row['context_data_json']) if row['context_data_json'] else {}
+            return {
                 'active_case_id': row['active_case_id'],
                 'active_task_id': row['active_task_id'],
                 'active_test_session_id': row['active_test_session_id'],
                 'active_client': row['active_client'],
                 'last_intent': row['last_intent'],
-                'expires_at': row['expires_at']
-            })
-            return data
+                'expires_at': row['expires_at'],
+                'data': raw_data,  # canonical nested key — no longer merged flat
+            }
 
     def update_conversation_context(self, context_key='owner', active_case_id=None, active_task_id=None,
                                     active_test_session_id=None, active_client=None, last_intent=None,
                                     context_data=None, ttl_minutes=60):
+        """Update (or create) the conversation context for context_key.
+
+        ``context_data`` is a dict of custom fields (e.g. clarification state).
+        It is MERGED with the existing custom data in the "data" nested key.
+        """
         now = datetime.now(timezone.utc)
         expires = (now + timedelta(minutes=ttl_minutes)).isoformat()
         current = self.get_conversation_context(context_key)
-        merged_data = current.get('data', {})
+
+        # Correctly extract existing custom data from the canonical nested key.
+        # Previously this was current.get('data', {}) which always returned {}
+        # because old get_conversation_context() returned a flat dict without
+        # a 'data' key.  Now it is always present as a nested dict.
+        merged_data = dict(current.get('data') or {})
         if context_data:
             merged_data.update(context_data)
 
@@ -2912,6 +3084,56 @@ class Database:
         now = now_iso()
         with self.connect() as connection:
             connection.execute('DELETE FROM conversation_context WHERE expires_at < ?', (now,))
+
+    # --- Durable Conversation Memory (conversation_turns) ---
+
+    def record_conversation_turn(self, owner_id: int, role: str, text: str,
+                                 shift_id: int | None = None,
+                                 intent: str | None = None,
+                                 entities_json: str | None = None,
+                                 case_id: int | None = None,
+                                 task_id: int | None = None,
+                                 test_session_id: int | None = None,
+                                 source_update_id: int | None = None,
+                                 correlation_id: str | None = None,
+                                 created_at: str | None = None) -> int:
+        """Record a single conversational turn (user, assistant, or system)."""
+        if role not in ('user', 'assistant', 'system'):
+            raise ValueError(f"Invalid role: {role!r}. Must be 'user', 'assistant', or 'system'.")
+        stamp = created_at or now_iso()
+        with self.connect() as connection:
+            return connection.execute('''INSERT INTO conversation_turns
+                (owner_id, shift_id, role, text, intent, entities_json,
+                 case_id, task_id, test_session_id, source_update_id,
+                 correlation_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                (owner_id, shift_id, role, text, intent, entities_json,
+                 case_id, task_id, test_session_id, source_update_id,
+                 correlation_id, stamp)).lastrowid
+
+    def get_recent_turns(self, owner_id: int, limit: int = 20,
+                         shift_id: int | None = None) -> list[dict]:
+        """Retrieve recent conversation turns in chronological order (oldest to newest)."""
+        query = 'SELECT * FROM conversation_turns WHERE owner_id=?'
+        params: list = [owner_id]
+        if shift_id is not None:
+            query += ' AND shift_id=?'
+            params.append(shift_id)
+        query += ' ORDER BY id DESC LIMIT ?'
+        params.append(limit)
+        with self.connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+            return [dict(r) for r in reversed(rows)]
+
+    def count_conversation_turns(self, owner_id: int | None = None) -> int:
+        """Return the total number of recorded conversation turns."""
+        with self.connect() as connection:
+            if owner_id is not None:
+                row = connection.execute(
+                    'SELECT COUNT(*) FROM conversation_turns WHERE owner_id=?', (owner_id,)).fetchone()
+            else:
+                row = connection.execute('SELECT COUNT(*) FROM conversation_turns').fetchone()
+            return row[0] if row else 0
 
     # --- Phase 4: Client Normalization ---
 

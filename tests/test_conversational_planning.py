@@ -1126,7 +1126,7 @@ class ConversationalPlanningTests(unittest.IsolatedAsyncioTestCase):
         upgraded_db = Database(v10_db_path)
         with upgraded_db.connect() as connection:
             ver = connection.execute('PRAGMA user_version').fetchone()[0]
-            self.assertEqual(ver, 11)
+            self.assertEqual(ver, SCHEMA_VERSION)
             cols = {row['name'] for row in connection.execute('PRAGMA table_info(nl_corrections)')}
             self.assertIn('is_active', cols)
             c = connection.execute("SELECT is_active FROM nl_corrections WHERE corrected_intent='create_task'").fetchone()

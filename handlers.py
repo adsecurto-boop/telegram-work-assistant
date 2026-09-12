@@ -181,8 +181,6 @@ async def capture_voice(update, context):
         author_name='owner', author_is_owner=True, text=transcript, redacted_text=redact(transcript),
         message_kind='voice', media=[telegram_file_id], classification='note', confidence=.9,
         review_status='accepted', shift_id=shift['id'])
-    activity_id = await asyncio.to_thread(db(context).add_activity, shift['id'], 'note', transcript,
-                                          None, None, None, source['id'])
     voice_path = voice_hash = None
     if not config.DELETE_VOICE_AFTER_TRANSCRIPTION:
         voice_path, voice_hash = await asyncio.to_thread(

@@ -4,6 +4,7 @@ models.py
 Plain data structures used across the application. Kept dependency-free
 (no DB or Telegram imports) so they can be reused/tested in isolation.
 """
+from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
@@ -27,6 +28,53 @@ class TaskStatus(str, Enum):
     COMPLETED = "completed"
     BLOCKED = "blocked"
     CANCELLED = "cancelled"
+
+
+class CaseStatus(str, Enum):
+    NEW = "new"
+    TRIAGED = "triaged"
+    INVESTIGATING = "investigating"
+    WAITING_CLIENT = "waiting_client"
+    WAITING_INTERNAL = "waiting_internal"
+    FIX_READY = "fix_ready"
+    TESTING = "testing"
+    RETEST_REQUIRED = "retest_required"
+    RESOLVED = "resolved"
+    CLIENT_UPDATED = "client_updated"
+    CLOSED = "closed"
+
+
+class TestResult(str, Enum):
+    PASSED = "passed"
+    FAILED = "failed"
+    PARTIAL = "partial"
+    BLOCKED = "blocked"
+    NOT_RUN = "not_run"
+
+
+@dataclass(frozen=True)
+class CaseLifecycleSpec:
+    status: CaseStatus
+    display_name: str
+    is_terminal: bool
+    is_active: bool
+    kanban_column: str
+    display_order: int
+
+
+CASE_LIFECYCLE: dict[CaseStatus, CaseLifecycleSpec] = {
+    CaseStatus.NEW: CaseLifecycleSpec(CaseStatus.NEW, "New", False, True, "New", 1),
+    CaseStatus.TRIAGED: CaseLifecycleSpec(CaseStatus.TRIAGED, "Triaged", False, True, "Triaged", 2),
+    CaseStatus.INVESTIGATING: CaseLifecycleSpec(CaseStatus.INVESTIGATING, "Investigating", False, True, "Investigating", 3),
+    CaseStatus.WAITING_CLIENT: CaseLifecycleSpec(CaseStatus.WAITING_CLIENT, "Waiting Client", False, True, "Waiting Client", 4),
+    CaseStatus.WAITING_INTERNAL: CaseLifecycleSpec(CaseStatus.WAITING_INTERNAL, "Waiting Internal", False, True, "Waiting Internal", 5),
+    CaseStatus.FIX_READY: CaseLifecycleSpec(CaseStatus.FIX_READY, "Fix Ready", False, True, "Fix Ready", 6),
+    CaseStatus.TESTING: CaseLifecycleSpec(CaseStatus.TESTING, "Testing", False, True, "Testing", 7),
+    CaseStatus.RETEST_REQUIRED: CaseLifecycleSpec(CaseStatus.RETEST_REQUIRED, "Retest Required", False, True, "Retest Required", 8),
+    CaseStatus.RESOLVED: CaseLifecycleSpec(CaseStatus.RESOLVED, "Resolved", True, False, "Resolved", 9),
+    CaseStatus.CLIENT_UPDATED: CaseLifecycleSpec(CaseStatus.CLIENT_UPDATED, "Client Updated", True, False, "Client Updated", 10),
+    CaseStatus.CLOSED: CaseLifecycleSpec(CaseStatus.CLOSED, "Closed", True, False, "Closed", 11),
+}
 
 
 @dataclass

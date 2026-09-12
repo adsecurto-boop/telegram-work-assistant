@@ -381,9 +381,11 @@ class Phase4RepairTests(unittest.IsolatedAsyncioTestCase):
         rep, _ = await pipeline.process("Learned that Linux silent install requires flags", self.shift)
         self.assertIn("learning record", rep.lower())
 
-        # analyze_test
+        # analyze_test — uses _optional_ai; patch AI_KEY/AI_MODEL to '' so the
+        # guard short-circuits to the deterministic fallback (no google.genai import).
         self.db.add_test_session("Login retest", self.sid, result="passed")
-        rep, _ = await pipeline.process("Analyze the last test", self.shift)
+        with patch.object(config, 'AI_KEY', ''), patch.object(config, 'AI_MODEL', ''):
+            rep, _ = await pipeline.process("Analyze the last test", self.shift)
         self.assertIn("Test Analysis", rep)
 
     # 19. Low-confidence no-mutation behavior

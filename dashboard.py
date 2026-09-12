@@ -4,6 +4,7 @@ from __future__ import annotations
 import html
 import json
 import mimetypes
+import re
 import secrets
 import threading
 import time
@@ -15,18 +16,33 @@ from urllib.parse import parse_qs, urlencode, urlparse
 from zoneinfo import ZoneInfo
 
 import config
+from domain import CASE_STATUSES
 from shifts import assign_template_range, check_missing_shift_assignments, format_shift_preview, preview_calendar_week
 
-STATUSES = ('new', 'investigating', 'waiting_client', 'waiting_internal', 'testing', 'resolved', 'closed')
+STATUSES = (
+    'new', 'triaged', 'investigating', 'waiting_client', 'waiting_internal',
+    'fix_ready', 'testing', 'retest_required', 'resolved', 'client_updated', 'closed'
+)
+
 KANBAN_COLUMNS = [
     ('new', 'New'),
+    ('triaged', 'Triaged'),
     ('investigating', 'Investigating'),
     ('waiting_client', 'Waiting Client'),
     ('waiting_internal', 'Waiting Internal'),
+    ('fix_ready', 'Fix Ready'),
     ('testing', 'Testing'),
+    ('retest_required', 'Retest Required'),
     ('resolved', 'Resolved'),
+    ('client_updated', 'Client Updated'),
     ('closed', 'Closed'),
 ]
+
+SAFE_INLINE_MIME_TYPES = {
+    'image/png', 'image/jpeg', 'image/gif', 'image/webp',
+    'audio/ogg', 'audio/mpeg', 'audio/wav',
+    'video/mp4', 'video/webm'
+}
 
 
 def h(value):
@@ -42,6 +58,7 @@ class DashboardService:
         database.set_setting('dashboard_token', self.token)
         self.server = None
         self.thread = None
+        self._lock = threading.RLock()
         self.sessions: dict[str, dict] = {}
         self.bulk_tokens: dict[str, dict] = {}
         self.session_ttl_seconds = 8 * 60 * 60
@@ -52,33 +69,56 @@ class DashboardService:
         return f'http://{self.host}:{self.port}/?token={self.token}'
 
     def create_session(self) -> tuple[str, str]:
-        self.cleanup_tokens()
-        sid = secrets.token_urlsafe(32)
-        csrf = secrets.token_urlsafe(24)
-        now = time.time()
-        self.sessions[sid] = {
-            'csrf_token': csrf, 'created_at': now,
-            'expires_at': now + self.session_ttl_seconds
-        }
-        return sid, csrf
+        with self._lock:
+            self.cleanup_tokens()
+            sid = secrets.token_urlsafe(32)
+            csrf = secrets.token_urlsafe(24)
+            now = time.time()
+            self.sessions[sid] = {
+                'csrf_token': csrf, 'created_at': now,
+                'expires_at': now + self.session_ttl_seconds
+            }
+            return sid, csrf
 
     def get_session(self, sid: str) -> dict | None:
-        session = self.sessions.get(sid)
-        if session and session.get('expires_at', 0) > time.time():
-            return session
-        self.sessions.pop(sid, None)
-        return None
+        with self._lock:
+            session = self.sessions.get(sid)
+            if session and session.get('expires_at', 0) > time.time():
+                return session
+            self.sessions.pop(sid, None)
+            return None
 
     def cleanup_tokens(self):
-        now = time.time()
-        self.sessions = {
-            key: value for key, value in self.sessions.items()
-            if value.get('expires_at', 0) > now
-        }
-        self.bulk_tokens = {
-            key: value for key, value in self.bulk_tokens.items()
-            if value.get('expires_at', 0) > now
-        }
+        with self._lock:
+            now = time.time()
+            self.sessions = {
+                key: value for key, value in self.sessions.items()
+                if value.get('expires_at', 0) > now
+            }
+            self.bulk_tokens = {
+                key: value for key, value in self.bulk_tokens.items()
+                if value.get('expires_at', 0) > now
+            }
+
+    def create_bulk_token(self, data: dict, session_id: str) -> str:
+        with self._lock:
+            self.cleanup_tokens()
+            bulk_token = secrets.token_urlsafe(16)
+            self.bulk_tokens[bulk_token] = {
+                **data,
+                'session_id': session_id,
+                'expires_at': time.time() + self.bulk_token_ttl_seconds
+            }
+            return bulk_token
+
+    def consume_bulk_token(self, bulk_token: str, session_id: str) -> dict | None:
+        with self._lock:
+            bulk_data = self.bulk_tokens.pop(bulk_token, None)
+            if not bulk_data:
+                return None
+            if bulk_data.get('session_id') != session_id or bulk_data.get('expires_at', 0) <= time.time():
+                return None
+            return bulk_data
 
     def start(self):
         service = self
@@ -133,6 +173,7 @@ class DashboardService:
             def page(self, content, title='Work Assistant', csrf_token: str = ''):
                 return f'''<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<script>if(window.location.search.includes('token=')){{const u=new URL(window.location);u.searchParams.delete('token');window.history.replaceState({{}},document.title,u.pathname+(u.search?u.search:''));}}</script>
 <title>{h(title)}</title><style>
 body{{font:14px system-ui,-apple-system,sans-serif;margin:0;background:#f4f6f8;color:#17212b}}
 header{{background:#17212b;color:white;padding:14px 4%;box-shadow:0 2px 4px rgba(0,0,0,0.1)}}
@@ -183,15 +224,35 @@ th{{background:#f8f9fa;font-weight:600}}
                 if not path.is_file():
                     self.send_error(404)
                     return
-                data = path.read_bytes()
+                raw_mime = item.get('mime_type') or mimetypes.guess_type(path.name)[0] or 'application/octet-stream'
+                mime = raw_mime.lower().split(';')[0].strip()
+                safe_filename = re.sub(r'[\r\n"\\\x00-\x1f]', '_', path.name)
+
+                # Safe inline media: only safe images, audio, and video render inline.
+                # All potentially active content (HTML, SVG, XML, JS, EXE, PDF) is forced to download.
+                if mime in SAFE_INLINE_MIME_TYPES:
+                    disposition = f'inline; filename="{safe_filename}"'
+                else:
+                    disposition = f'attachment; filename="{safe_filename}"'
+
+                try:
+                    file_size = path.stat().st_size
+                except OSError:
+                    self.send_error(404)
+                    return
+
                 self.send_response(200)
-                self.send_header('Content-Type', item.get('mime_type') or mimetypes.guess_type(path.name)[0] or 'application/octet-stream')
-                self.send_header('Content-Length', str(len(data)))
-                self.send_header('Content-Disposition', f'inline; filename="{h(path.name)}"')
-                self.send_header('Cache-Control', 'no-store')
+                self.send_header('Content-Type', mime)
+                self.send_header('Content-Length', str(file_size))
+                self.send_header('Content-Disposition', disposition)
+                self.send_header('Content-Security-Policy', "default-src 'none'; sandbox")
                 self.send_header('X-Content-Type-Options', 'nosniff')
+                self.send_header('Cache-Control', 'no-store')
                 self.end_headers()
-                self.wfile.write(data)
+
+                with path.open('rb') as f:
+                    while chunk := f.read(65536):
+                        self.wfile.write(chunk)
 
             def do_GET(self):
                 parsed = urlparse(self.path)
@@ -598,15 +659,12 @@ Source case <input name="source" type="number" min="1" required> into target <in
                         m_ids = [int(x) for x in form.get('message_ids', []) if x.isdigit()]
                         if not m_ids:
                             raise ValueError('No messages selected.')
-                        bulk_token = secrets.token_urlsafe(16)
-                        service.bulk_tokens[bulk_token] = {
+                        bulk_token = service.create_bulk_token({
                             'action': action,
                             'message_ids': m_ids,
                             'target_case_id': (form.get('target_case_id') or [''])[0],
                             'assign_client': (form.get('assign_client') or [''])[0],
-                            'session_id': set_sid,
-                            'expires_at': time.time() + service.bulk_token_ttl_seconds
-                        }
+                        }, set_sid)
                         preview_html = f'''<h1>Confirm Bulk Action</h1>
 <div class="card">
 <p><strong>Action:</strong> {h(action.replace('_', ' ').title())}</p>
@@ -625,9 +683,8 @@ Source case <input name="source" type="number" min="1" required> into target <in
                     # 4. INBOX BULK CONFIRM
                     elif parsed.path == '/inbox/bulk/confirm':
                         bulk_token = form.get('bulk_token', [''])[0]
-                        bulk_data = service.bulk_tokens.pop(bulk_token, None)
-                        if (not bulk_data or bulk_data.get('session_id') != set_sid
-                                or bulk_data.get('expires_at', 0) <= time.time()):
+                        bulk_data = service.consume_bulk_token(bulk_token, set_sid)
+                        if not bulk_data:
                             raise ValueError('Invalid or expired bulk confirmation token.')
                         action = bulk_data['action']
                         m_ids = bulk_data['message_ids']

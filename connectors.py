@@ -10,7 +10,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-import requests
+try:
+    import requests
+except ImportError:
+    requests = None  # type: ignore[assignment]  # Only needed for HTTP-based connectors
 
 import config
 from telegram_import import classify, extract_metadata, redact
@@ -38,25 +41,38 @@ class FreshdeskConnector(Connector):
     def __init__(self, domain, api_key, agent_id):
         if not domain or not api_key or not agent_id:
             raise ValueError('Set FRESHDESK_DOMAIN, FRESHDESK_API_KEY, and FRESHDESK_AGENT_ID.')
-        self.base = domain.rstrip('/') if domain.startswith('http') else f'https://{domain}.freshdesk.com'
+        if domain.startswith('http://'):
+            raise ValueError('Insecure HTTP protocol rejected. Freshdesk requires HTTPS.')
+        self.base = domain.rstrip('/') if domain.startswith('https://') else f'https://{domain}.freshdesk.com'
         self.agent_id = int(agent_id)
         token = base64.b64encode(f'{api_key}:X'.encode()).decode()
         self.headers = {'Authorization': f'Basic {token}', 'Accept': 'application/json'}
 
     def fetch(self, cursor=None, limit=100):
-        params = {'per_page': min(limit, 100), 'order_by': 'updated_at', 'order_type': 'asc'}
-        if cursor:
-            params['updated_since'] = cursor
-        response = requests.get(self.base + '/api/v2/tickets', headers=self.headers,
-                                params=params, timeout=25)
-        response.raise_for_status()
-        rows = [row for row in response.json() if row.get('responder_id') == self.agent_id]
         items = []
-        for row in rows[:limit]:
-            description = row.get('description_text') or row.get('subject') or 'Freshdesk ticket update'
-            text = f"{row.get('subject') or 'Ticket'} — {description} — status {row.get('status')}"
-            items.append(ConnectorItem(str(row['id']), row.get('updated_at'), text, [], {
-                'ticket': str(row['id']), 'status': row.get('status'), 'priority': row.get('priority')}))
+        page = 1
+        while len(items) < limit:
+            batch_size = min(limit - len(items), 100)
+            params = {'page': page, 'per_page': batch_size, 'order_by': 'updated_at', 'order_type': 'asc'}
+            if cursor:
+                params['updated_since'] = cursor
+            response = requests.get(self.base + '/api/v2/tickets', headers=self.headers,
+                                    params=params, timeout=25)
+            response.raise_for_status()
+            batch = response.json()
+            if not batch:
+                break
+            rows = [row for row in batch if row.get('responder_id') == self.agent_id]
+            for row in rows:
+                description = row.get('description_text') or row.get('subject') or 'Freshdesk ticket update'
+                text = f"{row.get('subject') or 'Ticket'} — {description} — status {row.get('status')}"
+                items.append(ConnectorItem(str(row['id']), row.get('updated_at'), text, [], {
+                    'ticket': str(row['id']), 'status': row.get('status'), 'priority': row.get('priority')}))
+                if len(items) >= limit:
+                    break
+            if len(batch) < batch_size:
+                break
+            page += 1
         next_cursor = max((item.occurred_at for item in items if item.occurred_at), default=cursor)
         return items, next_cursor
 
@@ -67,6 +83,8 @@ class FreshchatConnector(Connector):
     def __init__(self, base_url, api_key, agent_id):
         if not base_url or not api_key or not agent_id:
             raise ValueError('Set FRESHCHAT_BASE_URL, FRESHCHAT_API_KEY, and FRESHCHAT_AGENT_ID.')
+        if base_url.startswith('http://'):
+            raise ValueError('Insecure HTTP protocol rejected. Freshchat requires HTTPS.')
         self.base = base_url.rstrip('/')
         self.agent_id = str(agent_id)
         self.headers = {'Authorization': f'Bearer {api_key}', 'Accept': 'application/json'}
@@ -145,10 +163,10 @@ def sync_connector(database, connector: Connector, limit=100):
             _, created = database.add_source_message(
                 source_type=connector.name, source_key=key, chat_name=connector.name,
                 external_message_id=item.external_id, occurred_at=item.occurred_at,
-                author_name=connector.name, author_is_owner=True, text=item.text,
+                author_name=connector.name, author_is_owner=False, text=item.text,
                 redacted_text=redact(item.text), message_kind='connector', media=item.media,
                 classification=category, confidence=confidence, review_status='pending',
-                metadata={**extract_metadata(item.text), **item.metadata})
+                metadata={**extract_metadata(item.text), **item.metadata, 'trusted': False})
             inserted += int(created)
         database.save_connector_state(connector.name, cursor, None,
                                       {'fetched': len(items), 'inserted': inserted})

@@ -22,7 +22,7 @@ from models import TaskStatus
 from shifts import assign_template_range, clock_on_shift, format_shift_preview, new_shift, preview_calendar_week, validate_schedule
 from telegram_import import redact
 from nlp_normalizer import NormalizedInput, normalize_input
-from nlp_policy import ActionDecision, ReasonCode, evaluate_action_policy, required_entities_for_intent
+from nlp_policy import ActionDecision, READ_ONLY_INTENTS, ReasonCode, evaluate_action_policy, required_entities_for_intent
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +146,7 @@ class NLInterpretation(BaseModel):
     normalized_text: str | None = None
     has_negation: bool = False
     current_date: str | None = None
+    correlation_id: str | None = None
 
 
 class GeminiInterpretationPayload(BaseModel):
@@ -161,6 +162,29 @@ class GeminiInterpretationPayload(BaseModel):
     reason_codes: list[str] = Field(default_factory=list)
     missing_fields: list[str] = Field(default_factory=list)
     ambiguities: list[str] = Field(default_factory=list)
+
+
+class PlannedAction(BaseModel):
+    intent: NLIntent
+    confidence: float = 1.0
+    entities: NLEntities = Field(default_factory=NLEntities)
+    requires_confirmation: bool = False
+    dependencies: list[int] = Field(default_factory=list)
+
+
+class ConversationPlan(BaseModel):
+    actions: list[PlannedAction] = Field(default_factory=list)
+    reply: str | None = None
+    clarification_question: str | None = None
+
+
+class PlanExecutionResult(BaseModel):
+    success: bool
+    correlation_id: str | None = None
+    executed_actions: list[dict] = Field(default_factory=list)
+    reply: str = ''
+    error: str | None = None
+    rolled_back: bool = False
 
 
 def enrich_interpretation(
@@ -243,7 +267,7 @@ def parse_time_token(token: str) -> str:
         raise ValueError(f'Invalid time format: {token}')
 
     if meridiem:
-        if hour > 12:
+        if hour < 1 or hour > 12:
             raise ValueError(f'Invalid 12-hour time: {token}')
         if meridiem == 'pm' and hour < 12:
             hour += 12
@@ -267,6 +291,8 @@ def parse_shift_time_range(start_token: str, end_token: str) -> tuple[str, str]:
     if ('am' not in end_text and 'pm' not in end_text
             and int(end[:2]) <= int(start[:2]) and int(end[:2]) < 12):
         end = f'{int(end[:2]) + 12:02d}:{end[3:]}'
+    if start == end:
+        raise ValueError(f'Contradictory shift time range: {start_token} to {end_token}')
     return start, end
 
 
@@ -1271,6 +1297,19 @@ class ContextResolver:
                 if entities.case_id is None and ref in ('it', 'that case', 'this case', 'the case', 'active', ''):
                     if context.get('active_case_id'):
                         entities.case_id = context['active_case_id']
+                    else:
+                        open_cases = [c for c in self.db.list_cases(limit=10) if c.get('status') not in ('resolved', 'closed')]
+                        if len(open_cases) == 1:
+                            entities.case_id = open_cases[0]['id']
+                            entities.case_title = open_cases[0].get('title')
+                        elif len(open_cases) > 1:
+                            interpretation.confidence = 0.5
+                            interpretation.needs_confirmation = True
+                            interpretation.clarification_question = 'Multiple cases are open. Which one did you mean?'
+                            interpretation.choices = [
+                                NLChoice(label=f"CASE-{c['id']}: {c['title']}", case_id=c['id'])
+                                for c in open_cases[:4]
+                            ]
 
                 # 3. Client or keyword search across open cases
                 if entities.case_id is None and ref:
@@ -1412,12 +1451,14 @@ class NLActionExecutor:
             prompt_version, 'success')
         return result
 
-    async def execute(self, interpretation: NLInterpretation, shift: dict | None) -> tuple[str, str | None]:
+    async def execute(self, interpretation: NLInterpretation, shift: dict | None, correlation_id: str | None = None) -> tuple[str, str | None]:
         intent = interpretation.intent
         entities = interpretation.entities
         if intent == NLIntent.SET_SHIFT:
             normalize_shift_times(entities)
-        correlation_id = f'nl-{uuid.uuid4().hex[:12]}'
+        if not correlation_id:
+            correlation_id = f'nl-{uuid.uuid4().hex[:12]}'
+        interpretation.correlation_id = correlation_id
         tz = ZoneInfo(config.TIMEZONE)
         today_date = datetime.now(tz).date().isoformat()
 
@@ -2405,3 +2446,116 @@ class NaturalLanguagePipeline:
         )
 
         return reply_text, interpretation
+
+    async def execute_plan(self, plan: ConversationPlan, shift: dict | None) -> PlanExecutionResult:
+        if not plan.actions:
+            return PlanExecutionResult(
+                success=True,
+                reply=plan.reply or "No actions in plan."
+            )
+
+        # 1. Evaluate policy and confirmation requirements for each action
+        for idx, action in enumerate(plan.actions):
+            action_interp = NLInterpretation(
+                intent=action.intent,
+                confidence=action.confidence,
+                entities=action.entities,
+            )
+            decision, would_mutate, reasons = evaluate_action_policy(
+                action_interp,
+                has_active_shift=shift is not None
+            )
+            if action.requires_confirmation or decision in (
+                ActionDecision.PROPOSE_CONFIRMATION,
+                ActionDecision.REQUIRE_CLARIFICATION,
+                ActionDecision.REJECT
+            ):
+                q = plan.clarification_question or f"Action #{idx+1} ({action.intent.value}) requires confirmation before proceeding."
+                return PlanExecutionResult(
+                    success=False,
+                    reply=q,
+                    error="confirmation_required"
+                )
+
+        # 2. Atomic multi-action execution with shared correlation ID
+        plan_correlation_id = f"nl-plan-{uuid.uuid4().hex[:12]}"
+        applied_audit_ids: list[int] = []
+        action_results = []
+        created_context: dict[int, dict] = {}
+
+        try:
+            for idx, action in enumerate(plan.actions):
+                # Propagate dependent entity IDs from earlier actions
+                action_entities = action.entities.model_copy()
+                if action.dependencies:
+                    for dep_idx in action.dependencies:
+                        if dep_idx in created_context:
+                            for key, val in created_context[dep_idx].items():
+                                if getattr(action_entities, key, None) is None:
+                                    setattr(action_entities, key, val)
+
+                action_interp = NLInterpretation(
+                    intent=action.intent,
+                    confidence=action.confidence,
+                    entities=action_entities,
+                    proposed_summary=f"Action {idx+1} of plan",
+                    provider="plan_executor"
+                )
+
+                action_reply, corr_id = await self.executor.execute(
+                    action_interp, shift, correlation_id=plan_correlation_id
+                )
+
+                if corr_id is None and action.intent.value not in READ_ONLY_INTENTS:
+                    raise ValueError(action_reply or f"Failed to execute action #{idx+1} ({action.intent.value})")
+
+                # Record newly generated audits under this correlation ID
+                with self.db.connect() as conn:
+                    rows = conn.execute(
+                        "SELECT id, affected_table, record_id FROM audit_log WHERE correlation_id=? ORDER BY id ASC",
+                        (plan_correlation_id,)
+                    ).fetchall()
+                    new_audits = [r['id'] for r in rows if r['id'] not in applied_audit_ids]
+                    applied_audit_ids.extend(new_audits)
+
+                    action_ctx = {}
+                    for r in rows:
+                        if r['id'] in new_audits:
+                            if r['affected_table'] == 'work_cases':
+                                action_ctx['case_id'] = r['record_id']
+                            elif r['affected_table'] == 'test_sessions':
+                                action_ctx['test_session_id'] = r['record_id']
+                            elif r['affected_table'] == 'tasks':
+                                action_ctx['task_id'] = r['record_id']
+                    created_context[idx] = action_ctx
+
+                action_results.append({
+                    'action_index': idx,
+                    'intent': action.intent.value,
+                    'reply': action_reply
+                })
+
+            combined_reply = plan.reply or ("\n".join(f"• {ar['reply']}" for ar in action_results) + f"\nUndo: /undo")
+            return PlanExecutionResult(
+                success=True,
+                correlation_id=plan_correlation_id,
+                executed_actions=action_results,
+                reply=combined_reply
+            )
+
+        except Exception as exc:
+            # Transactional rollback: undo all operations applied under plan_correlation_id
+            logger.warning("Plan execution failed at action %d; rolling back: %s", idx, exc)
+            for audit_id in reversed(applied_audit_ids):
+                try:
+                    self.db.undo_audit_record(audit_id)
+                except Exception as undo_err:
+                    logger.error("Failed to undo audit record %d: %s", audit_id, undo_err)
+
+            return PlanExecutionResult(
+                success=False,
+                correlation_id=plan_correlation_id,
+                error=str(exc),
+                rolled_back=True,
+                reply=f"Plan execution failed and was rolled back safely: {exc}"
+            )

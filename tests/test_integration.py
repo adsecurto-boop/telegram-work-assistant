@@ -125,6 +125,42 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                 await app.bot.shutdown()
 
 class AiFallbackTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        # google-genai is not installed in this environment.  Inject minimal stubs
+        # so the test-local 'from google.genai import errors' works.  The stubs
+        # match the real error hierarchy used by GeminiWriter._generate().
+        import sys, types
+        if 'google' not in sys.modules:
+            google_stub = types.ModuleType('google')
+            sys.modules['google'] = google_stub
+        else:
+            google_stub = sys.modules['google']
+        if 'google.genai' not in sys.modules:
+            genai_stub = types.ModuleType('google.genai')
+            google_stub.genai = genai_stub
+            sys.modules['google.genai'] = genai_stub
+
+        class APIError(Exception):
+            def __init__(self, code, payload): self.code = code; self.payload = payload
+        class ServerError(APIError): pass
+        class ClientError(APIError): pass
+
+        errors_stub = types.ModuleType('google.genai.errors')
+        errors_stub.APIError = APIError
+        errors_stub.ServerError = ServerError
+        errors_stub.ClientError = ClientError
+        sys.modules['google.genai.errors'] = errors_stub
+        sys.modules['google.genai'].errors = errors_stub
+
+        if 'google.genai.types' not in sys.modules:
+            from types import SimpleNamespace
+            types_stub = types.ModuleType('google.genai.types')
+            types_stub.HttpOptions = lambda **kw: None
+            types_stub.GenerateContentConfig = lambda **kw: SimpleNamespace(**kw)
+            sys.modules['google.genai.types'] = types_stub
+            sys.modules['google.genai'].types = types_stub
+        self._google_stubs_injected = True
+
     async def test_transient_primary_failure_uses_fallback(self):
         from ai import GeminiWriter
         from google.genai import errors
@@ -141,6 +177,7 @@ class AiFallbackTests(unittest.IsolatedAsyncioTestCase):
         engine=object.__new__(GeminiWriter)
         engine.client=SimpleNamespace(aio=Aio())
         engine.model='primary'; engine.fallback_model='fallback'; engine.last_model=None
+        engine.retries=1  # 1 attempt per model to avoid sleep in retry loop
         response=await engine._generate('facts',None)
         self.assertEqual(response.text,'ok')
         self.assertEqual(calls,['primary','fallback'])
@@ -160,5 +197,6 @@ class AiFallbackTests(unittest.IsolatedAsyncioTestCase):
         engine=object.__new__(GeminiWriter)
         engine.client=SimpleNamespace(aio=Aio())
         engine.model='primary'; engine.fallback_model='fallback'; engine.last_model=None
+        engine.retries=1
         with self.assertRaises(errors.ClientError): await engine._generate('facts',None)
         self.assertEqual(calls,['primary'])

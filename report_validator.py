@@ -63,12 +63,12 @@ class ReportValidator:
         # 1. Structured Metrics Calculation
         support_activities = [a for a in activities if a.get('category') == 'support']
         unique_support_clients = {
-            a['client'].strip()
-            for a in support_activities if a.get('client')
+            (a.get('client') or '').strip()
+            for a in support_activities if (a.get('client') or '').strip()
         }
         case_clients = {
-            c['client'].strip()
-            for c in cases if c.get('client')
+            (c.get('client') or '').strip()
+            for c in cases if (c.get('client') or '').strip()
         }
         all_unique_clients = {c for c in (unique_support_clients | case_clients) if c.casefold() not in ('general', 'none', 'unknown')}
         lowered_clients = {c.casefold(): c for c in all_unique_clients}
@@ -281,11 +281,14 @@ class ReportValidator:
                 ))
 
         # 11. Hallucinated Client Detection (Rule 12)
-        client_line_matches = re.findall(r'(?:client|handled|customer)[:\s]+([A-Za-z0-9_\-]+)', report_text, re.I)
-        for_client_matches = re.findall(r'\bfor\s+([A-Z][A-Za-z0-9_\-]+)\b', report_text)
+        client_line_matches = re.findall(r'(?:client|handled|customer)[:\s]+([A-Za-z0-9_\-]+(?:\s+\d+)?)', report_text, re.I)
+        for_client_matches = re.findall(r'\bfor\s+([A-Z][A-Za-z0-9_\-]+(?:\s+\d+)?)\b', report_text)
         for cl_token in client_line_matches + for_client_matches:
             cl_token_clean = cl_token.strip().casefold()
-            if cl_token_clean not in ('none', 'unspecified', 'general', 'support', 'various', 'the', 'this', 'a', 'an'):
+            if cl_token_clean not in ('none', 'unspecified', 'general', 'support', 'various', 'the', 'this', 'a', 'an', 'query', 'queries', 'task', 'case'):
+                # Ignore digits, masked clients ("client 1", "client 10", "client-a"), redacted tokens
+                if cl_token_clean.isdigit() or re.match(r'^client[\s_-]?(?:\d+|[a-z])$', cl_token_clean) or cl_token_clean in ('client', '[client_redacted]', '[client]'):
+                    continue
                 if cl_token_clean not in lowered_clients:
                     warnings.append(ReportWarning(
                         code='HALLUCINATED_CLIENT',
@@ -305,11 +308,13 @@ class ReportValidator:
                 # Legacy timestamps without offsets are interpreted in shift-local time.
                 if occurred_dt.tzinfo is None:
                     occurred_dt = occurred_dt.replace(tzinfo=start_dt.tzinfo)
-                local_day = occurred_dt.astimezone(start_dt.tzinfo).date() if start_dt.tzinfo else occurred_dt.date()
-                if not start_dt.date() <= local_day <= end_dt.date():
+                occurred_aligned = occurred_dt.astimezone(start_dt.tzinfo) if start_dt.tzinfo else occurred_dt
+                start_aligned = start_dt
+                end_aligned = end_dt.astimezone(start_dt.tzinfo) if start_dt.tzinfo else end_dt
+                if not (start_aligned <= occurred_aligned <= end_aligned):
                     warnings.append(ReportWarning(
                         code='RECORD_OUTSIDE_SHIFT',
-                        message=f"Activity #{a.get('id')} occurred on {local_day}, outside the shift date window.",
+                        message=f"Activity #{a.get('id')} occurred at {occurred_aligned.isoformat()}, outside the shift window ({start_dt} to {end_dt}).",
                         severity='info',
                         record_ref=f"activity:{a.get('id')}"
                     ))

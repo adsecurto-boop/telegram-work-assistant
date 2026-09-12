@@ -6,20 +6,25 @@ from zoneinfo import ZoneInfo
 import config
 from maintenance import create_rotating_backup, prune_evidence_files
 
-_last_tick_time = None
+# _last_tick_time was previously a module global which caused:
+# 1. Test isolation failures (state leaking between tests)
+# 2. Incorrect is_resume detection (different per-process invocation)
+# It is now stored in context.application.bot_data['last_tick_time'] so each
+# application instance tracks its own tick history independently.
+
 
 async def tick(context):
-    global _last_tick_time
     db = context.application.bot_data['db']
     shift = await asyncio.to_thread(db.active_shift)
     if not shift or not config.REMINDERS_ENABLED:
-        _last_tick_time = datetime.now(timezone.utc)
+        context.application.bot_data['last_tick_time'] = datetime.now(timezone.utc)
         return
     current = datetime.now(timezone.utc)
+    last_tick = context.application.bot_data.get('last_tick_time')
     is_resume = False
-    if _last_tick_time is not None and (current - _last_tick_time) > timedelta(minutes=5):
+    if last_tick is not None and (current - last_tick) > timedelta(minutes=5):
         is_resume = True
-    _last_tick_time = current
+    context.application.bot_data['last_tick_time'] = current
 
     due = []
     for kind,stamp in [('tod',shift['start']),('pl',shift['lunch']),('eod',shift.get('eod_reminder') or shift['end'])]:
@@ -29,10 +34,12 @@ async def tick(context):
     if is_resume:
         end_utc = datetime.fromisoformat(shift['end']).astimezone(timezone.utc)
         if current >= end_utc:
-            for obsolete in ('tod', 'pl'):
-                if obsolete in due:
-                    due.remove(obsolete)
-                    await asyncio.to_thread(db.record_delivery, shift['id'], obsolete)
+            # Shift is over: include all overdue items in the combined message
+            # (no silent suppression — user should see what was missed) then
+            # mark them all delivered so they don't repeat on the next tick.
+            # tod and pl are included in 'due' already; no removal needed.
+            pass  # All items remain in `due` for the combined message below.
+
     followups = await asyncio.to_thread(
         db.due_followups, datetime.now(ZoneInfo(config.TIMEZONE)).isoformat())
     review_cases = []
@@ -60,6 +67,7 @@ async def tick(context):
         await asyncio.to_thread(db.remind_followups, [item['id'] for item in followups])
     if review_cases:
         await asyncio.to_thread(db.record_delivery, shift['id'], 'case_review')
+
 
 async def maintenance(context):
     db = context.application.bot_data['db']

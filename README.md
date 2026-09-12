@@ -1,8 +1,44 @@
-# Telegram Work Assistant
+# Personal Work Assistant
 
-A private Windows Telegram bot for flexible shifts, task plans, support work,
-testing, learning, and TOD / pre-lunch / EOD reports. SQLite is the source of
-truth; Gemini drafts and natural-language categorization are optional.
+A private, context-aware, persistent assistant for Windows that understands your work, remembers relevant dialogue, safely performs structured operations, and helps you throughout your working day.
+
+Telegram is one interface to the assistant. The localhost dashboard is another. Voice, scheduler, connectors, and AI reasoning all connect to the same unified assistant core.
+
+```text
+                     PERSONAL WORK ASSISTANT
+                              │
+          ┌───────────────────┼───────────────────┐
+          │                   │                   │
+      Telegram            Dashboard             Voice
+          │                   │                   │
+          └───────────────────┼───────────────────┘
+                              │
+                    Assistant Core Engine
+                              │
+       ┌──────────────┬───────┼────────┬──────────────┐
+       │              │       │        │              │
+     Tasks          Cases  Testing  Follow-ups    Reports
+       │              │       │        │              │
+       └──────────────┴───────┼────────┴──────────────┘
+                              │
+                     Memory & Intelligence
+        (Conversation Turns · Rolling Summary · Gemini Planning)
+                              │
+                        SQLite + Audit
+                              │
+                  Durable Personal Work Memory
+```
+
+---
+
+## Primary Product Motto
+
+> **This is my Personal Work Assistant at work.**
+
+- **Truthfulness**: The assistant never falsely claims an action succeeded, a report is fresh, or an operation is undoable when reality differs.
+- **Data Integrity**: Every state mutation is deterministic, validated, atomic, audited, and recoverable where applicable.
+- **Durable Dialogue Memory**: Conversation turns (`conversation_turns`) persist across restarts and provide contextual pronoun resolution across dialogue turns.
+- **AI as Brain, Python as Hands**: Gemini proposes structured multi-action plans; Python validates policies, verifies context, and executes transactions in SQLite.
 
 ---
 
@@ -10,24 +46,26 @@ truth; Gemini drafts and natural-language categorization are optional.
 
 | Feature Area | Status | Notes / Pre-requisites |
 |---|---|---|
-| **Shift Management & Overrides** | **Implemented & Tested** | Daily shifts (08:00–17:00, 10:00–19:00, 12:00–21:00, custom). Future shifts stored in `shift_calendar` without activating today. Day-off markers. |
+| **Durable Dialogue Memory** | **Implemented & Tested** | Multi-turn conversational memory (`conversation_turns`), rolling daily summaries, and restart-resilient pronoun resolution. |
+| **Multi-Action Planning** | **Implemented & Tested** | `ConversationPlan` with atomic transactions, dependency propagation, confirmation gates, and audit-backed rollback. |
+| **Shift Management & Overrides** | **Implemented & Tested** | Daily shifts (08:00–17:00, 10:00–19:00, 12:00–21:00, custom). Future shifts stored in `shift_calendar` without activating today. Strict time validation (`0am`/`0pm` and invalid bounds rejected). |
 | **Conversational Daily Planning** | **Implemented & Tested** | Persistent multi-turn wizard (`planning_conversations`), similar-task duplicate review, confirmed versioned baseline snapshots (`plan_snapshots`), and TOD draft generation. |
 | **Task-to-Request Linking** | **Implemented & Tested** | Explicit many-to-many relationships (`record_links`) linking tasks to work drafts and cases with independent lifecycles. |
 | **Work Time vs. Logged Time** | **Implemented & Tested** | Late entries with `occurred_at` and `time_precision`, overnight shift interval matching, and finalized report immutability. |
 | **Shift Templates & Rotational Schedule** | **Implemented & Tested** | Named templates (`Morning`, `General`, `Evening`). Date-range assignments enforce `active_weekdays`. Daily overrides take priority. |
 | **Task Lifecycle & Tracking** | **Implemented & Tested** | Create, update, complete, reopen, carry forward. Scoped to shift/date. |
-| **Case Management & Evidence** | **Implemented & Tested** | Full lifecycle: new, investigating, waiting_client, waiting_internal, testing, resolved, closed. Attached photos, videos, documents with SHA-256 deduplication. |
-| **Test Sessions & Learning Records** | **Implemented & Tested** | Captures scenarios, builds, environments, defect IDs, retest states, and learning takeaways. |
-| **Report Generation & Validation** | **Implemented & Tested** | Shift-scoped TOD, Pre-Lunch (PL), and EOD reports. Error-level validation findings block finalization unless explicitly acknowledged in the dashboard. |
-| **Natural Language Interaction** | **Implemented & Tested** | 27 intents supported via deterministic rules and shared domain services. Bounded fallback to Gemini structured interpreter. |
+| **Case Management & Evidence** | **Implemented & Tested** | 11 canonical statuses (`new`, `triaged`, `investigating`, `waiting_client`, `waiting_internal`, `fix_ready`, `testing`, `retest_required`, `resolved`, `client_updated`, `closed`). Attached media with NULL-safe SHA-256 deduplication and relational verification. |
+| **Test Sessions & Learning Records** | **Implemented & Tested** | Captures scenarios, builds, environments, defect IDs, retest states, and learning takeaways. Cross-case test linking strictly prevented. |
+| **Report Generation & Finalization Guard** | **Implemented & Tested** | Shift-scoped TOD, Pre-Lunch (PL), and EOD reports. Live facts hash re-verified at finalization time; stale reports rejected until refreshed. |
+| **Natural Language Interaction** | **Implemented & Tested** | 27+ intents supported via deterministic rules and shared domain services. Bounded context builder for Gemini reasoning. |
 | **Confidence Policy & Proposals** | **Implemented & Tested** | High confidence: direct execution. Medium confidence: stored proposal in `nl_proposals` with 1-click confirmation or interactive choices. Low confidence: zero mutations. |
-| **Atomic & Compound Undo** | **Implemented & Tested** | `/undo`, Telegram undo buttons, natural-language "undo", dashboard audit undo. Correlation-based multi-record atomic rollback with tamper detection. |
+| **Atomic & Compound Undo** | **Implemented & Tested** | `/undo`, Telegram undo buttons, natural-language "undo", dashboard audit undo. Correlation-based multi-record atomic rollback with tamper detection. Undo button is never displayed without a verifiable audit entry. |
 | **Historical Clustering** | **Implemented & Tested** | CLI & Dashboard. SHA-256 fingerprint (`cluster-v1:...`) prevents duplicate suggestions. Supports Accept, Reject, Split, Merge, Attach to case. |
 | **Bulk Review Inbox** | **Implemented & Tested** | 12 filters in web dashboard. Two-phase preview and confirm with one-time tokens, atomic execution, and single-correlation undo. |
-| **Localhost Web Dashboard** | **Implemented & Tested** | Bound strictly to `127.0.0.1`. Token exchange for session cookie, per-session CSRF tokens, secure headers, button-based Kanban column movement, full audit log. |
-| **Gemini Copilot Tools** | **Requires Credentials** | Optional `/casesummary`, `/nextaction`, `/draftclient`, `/draftescalation`, `/analyzetest`, and report polishing. Works with fallback deterministic text when offline. |
-| **Voice Transcription** | **Requires Credentials** | Voice messages transcribed via Gemini API and routed to NLP pipeline. Captured and stored locally when offline. |
-| **Read-Only Connectors** | **Requires Credentials** | Optional Freshdesk and Freshchat pollers. CSV sync via CLI. Strictly read-only; records enter review inbox. |
+| **Localhost Web Dashboard** | **Implemented & Tested** | Bound strictly to `127.0.0.1`. Thread-safe session management, cookie auth with instant URL history cleaning, CSRF tokens, strict CSP (`default-src 'none'; sandbox`), safe inline media allowlist, and chunked streaming. |
+| **Gemini Copilot Tools** | **Requires Credentials** | Optional `/casesummary`, `/nextaction`, `/draftclient`, `/draftescalation`, `/analyzetest`, and report polishing. Works with fallback deterministic text when offline. Bounded, field-allowlisted context payloads. |
+| **Voice Transcription & Single-Logging** | **Requires Credentials** | Voice messages transcribed via Gemini and routed cleanly to semantic NLP execution without phantom duplicate notes. Captured locally when offline. |
+| **Read-Only Connectors** | **Requires Credentials** | Freshdesk and Freshchat pollers with HTTPS enforcement, pagination, and untrusted payload tagging (`author_is_owner=False`, `trusted=False`). CSV sync via CLI. |
 | **Multi-User / Public Cloud** | **Planned or Unavailable** | Designed exclusively as a private, single-owner assistant on a local Windows PC. Access is restricted to `OWNER_ID` in private chats. |
 
 ---
@@ -321,10 +359,16 @@ The complete test suite runs against temporary databases using mocked Telegram a
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-The suite includes unit and integration tests covering:
-- **Telegram Handlers**: Plain natural language, voice routing, `/understand`, `/undo`, and callbacks.
+The suite includes 289 unit and integration tests covering:
+- **Durable Dialogue Memory & Pronoun Resolution**: `conversation_turns` persistence across restarts, context building, rolling summaries, and unambiguous pronoun resolution (`tests/test_assistant_correctness.py`).
+- **Multi-Action Planning**: `ConversationPlan` with atomic transactions, dependency propagation, confirmation requirements for high-risk actions, and full rollback on partial failure (`tests/test_mission_hardening.py`).
+- **Stale Report Finalization Guard**: Live facts hash recomputation at finalization time, rejection of stale reports, and shift close validation (`tests/test_assistant_correctness.py`).
+- **Undo Integrity & Verification**: Real audit verification; Undo buttons derived solely from verifiable mutation results (`tests/test_mission_hardening.py`).
+- **Dashboard & Evidence Security**: XSS protection (forced download of HTML, SVG, XML, executables; safe inline allowlist for images/audio/video), CSP sandbox, thread-safe sessions, and NULL-safe evidence deduplication (`tests/test_mission_hardening.py`).
+- **Connector Security**: HTTPS enforcement, pagination, and untrusted payload tagging (`tests/test_mission_hardening.py`).
+- **Telegram Handlers**: Plain natural language, voice routing without phantom notes, `/understand`, `/undo`, and callbacks.
 - **Undo & Cascades**: Multi-task correlation undo, compound test sessions, standalone follow-ups, cluster acceptance undo, and atomic rollback on tamper.
-- **Shift Engine**: Schedule validation, invalid time rejection (`99:80`), future shifts, day-off overrides, template range weekday enforcement, and cross-midnight shifts.
+- **Shift Engine**: Schedule validation, invalid time rejection (`99:80`, `25:00`, `10:99`, `0am`, `0pm`, `10am to 10am`), future shifts, day-off overrides, template range weekday enforcement, and cross-midnight shifts.
 - **Natural Language Dispatch**: Conversational TOD, PL, EOD generation, Copilot dispatch, medium-confidence proposals, and low-confidence no-mutation safety.
 - **Dashboard Security**: Authenticated routes, unauthenticated 403 rejection, CSRF rejection, cluster acceptance POST, and bulk preview/confirm.
 - **Clustering**: SHA-256 fingerprint idempotency, duplicate prevention, and repeated suggestion replay.

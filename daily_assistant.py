@@ -25,12 +25,22 @@ def parse_time_flexible(text: str) -> str | None:
     hour = int(m.group(1))
     minute = int(m.group(2) or 0)
     meridiem = m.group(3)
-    if meridiem == 'pm' and hour < 12:
-        hour += 12
-    elif meridiem == 'am' and hour == 12:
-        hour = 0
-    elif not meridiem and hour < 7:
-        hour += 12
+    if minute < 0 or minute > 59:
+        return None
+    if meridiem:
+        if hour < 1 or hour > 12:
+            return None
+        if meridiem == 'pm' and hour < 12:
+            hour += 12
+        elif meridiem == 'am' and hour == 12:
+            hour = 0
+    else:
+        if hour < 0 or hour > 23:
+            return None
+        if hour < 7:
+            hour += 12
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
     return f'{hour:02d}:{minute:02d}'
 
 
@@ -49,6 +59,8 @@ def parse_shift_range_flexible(text: str) -> tuple[str, str] | None:
             eh += 12
             if eh < 24:
                 end = f'{eh:02d}:{em:02d}'
+        if start == end:
+            return None
         return start, end
     return None
 

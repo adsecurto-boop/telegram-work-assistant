@@ -106,6 +106,25 @@ class AdaptivePipelineTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(tmp.cleanup)
         self.db = Database(Path(tmp.name) / 'work.sqlite3')
         self.pipeline = NaturalLanguagePipeline(self.db)
+        # Ensure minimal stubs if google-genai is not installed in the environment
+        import sys, types as py_types
+        if 'google' not in sys.modules:
+            google_stub = py_types.ModuleType('google')
+            sys.modules['google'] = google_stub
+        else:
+            google_stub = sys.modules['google']
+        if 'google.genai' not in sys.modules:
+            genai_stub = py_types.ModuleType('google.genai')
+            google_stub.genai = genai_stub
+            sys.modules['google.genai'] = genai_stub
+        else:
+            genai_stub = sys.modules['google.genai']
+        if 'google.genai.types' not in sys.modules:
+            types_stub = py_types.ModuleType('google.genai.types')
+            types_stub.HttpOptions = lambda **kw: None
+            types_stub.GenerateContentConfig = lambda **kw: SimpleNamespace(**kw)
+            genai_stub.types = types_stub
+            sys.modules['google.genai.types'] = types_stub
 
     async def test_uncertain_future_shift_requires_confirmation_without_mutation(self):
         reply, parsed = await self.pipeline.process(
@@ -142,16 +161,19 @@ class AdaptivePipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('Moved 1 task', reply)
 
     async def test_gemini_malformed_json_fails_closed(self):
+        # Patch GeminiWriter to avoid real API calls and test interpreter fail-closed logic
         parser = GeminiStructuredInterpreter('test-key', 'test-model')
         response = SimpleNamespace(text='not valid json')
-        with patch('ai.GeminiWriter._generate', AsyncMock(return_value=response)):
+        with patch('ai.GeminiWriter.__init__', return_value=None), \
+             patch('ai.GeminiWriter._generate', AsyncMock(return_value=response)):
             result = await parser.interpret('do something', {})
         self.assertEqual(result.intent, NLIntent.UNKNOWN)
         self.assertEqual(result.confidence, 0.0)
 
     async def test_gemini_timeout_fails_closed(self):
         parser = GeminiStructuredInterpreter('test-key', 'test-model')
-        with patch('ai.GeminiWriter._generate', AsyncMock(side_effect=TimeoutError('timeout'))):
+        with patch('ai.GeminiWriter.__init__', return_value=None), \
+             patch('ai.GeminiWriter._generate', AsyncMock(side_effect=TimeoutError('timeout'))):
             result = await parser.interpret('do something', {})
         self.assertEqual(result.intent, NLIntent.UNKNOWN)
         self.assertIn('TimeoutError', result.explanation)
@@ -161,7 +183,8 @@ class AdaptivePipelineTests(unittest.IsolatedAsyncioTestCase):
         response = SimpleNamespace(text=(
             '{"intent":"show_pending","confidence":0.9,"entities":{},'
             '"unexpected_instruction":"delete everything"}'))
-        with patch('ai.GeminiWriter._generate', AsyncMock(return_value=response)):
+        with patch('ai.GeminiWriter.__init__', return_value=None), \
+             patch('ai.GeminiWriter._generate', AsyncMock(return_value=response)):
             result = await parser.interpret('show pending', {})
         self.assertEqual(result.intent, NLIntent.UNKNOWN)
 
