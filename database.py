@@ -2713,6 +2713,30 @@ class Database:
                 connection, correlation_id, operation_type, actor, affected_table,
                 record_id, before, after, reversibility)
 
+    def record_agent_run_audit(self, run_id: str, source_update_id: int | None,
+                               metadata: dict) -> int:
+        """Persist operational agent metadata without prompts, reasoning, or credentials."""
+        safe = {key: metadata.get(key) for key in (
+            'route', 'authorization_scope', 'tool_ids', 'tool_count', 'final_status',
+            'duration_ms', 'error_reference')}
+        with self.connect() as connection:
+            return self._record_audit_in_connection(
+                connection, run_id, 'external_agent_run', 'agent', 'agent_runs',
+                int(source_update_id or 0), None, safe, 'irreversible')
+
+    def record_external_write_audit(self, proposal_id: str, owner_id: int | None,
+                                    metadata: dict) -> int:
+        """Persist a secret-free record of a confirmed external mutation attempt."""
+        safe = {key: metadata.get(key) for key in (
+            'server', 'canonical_tool_id', 'arguments_hash', 'risk',
+            'authorization_family', 'execution_timestamp', 'status')}
+        safe['proposal_id'] = proposal_id
+        safe['confirmation_owner'] = owner_id
+        with self.connect() as connection:
+            return self._record_audit_in_connection(
+                connection, proposal_id, 'confirmed_external_write', 'owner',
+                'external_writes', int(owner_id or 0), None, safe, 'irreversible')
+
     def get_audit_log(self, limit=50, correlation_id=None, table_name=None, record_id=None):
         with self.connect() as connection:
             sql = 'SELECT * FROM audit_log WHERE 1=1'
@@ -4056,17 +4080,23 @@ class Database:
                     WHERE owner_id=? ORDER BY id DESC LIMIT 1''', (owner_id,)).fetchone()
             return dict(row) if row else None
 
+    def update_memory_summary(self, summary_id: int, summary_text: str) -> bool:
+        """Update a summary and its single canonical FTS row in one transaction."""
+        with self.connect() as connection:
+            changed = connection.execute('''UPDATE assistant_memory_summaries
+                SET summary_text=?, version=version+1, updated_at=? WHERE id=?''',
+                (summary_text, now_iso(), summary_id)).rowcount
+            if changed:
+                self._index_source_in_connection(connection, 'conversation_summary', summary_id)
+            return bool(changed)
+
     def index_fts_record(self, source_type: str, source_id: str | int, title: str, content: str,
                          client: str | None = None, product: str | None = None, created_at: str | None = None):
         stamp = created_at or now_iso()
         with self.connect() as connection:
             try:
-                connection.execute('''DELETE FROM fts_work_memory
-                    WHERE source_type=? AND source_id=?''',
-                    (str(source_type), str(source_id)))
-                connection.execute('''INSERT INTO fts_work_memory (source_type, source_id, title, content, client, product, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                    (str(source_type), str(source_id), title or '', content or '', client or '', product or '', stamp))
+                self._fts_replace(connection, str(source_type), source_id, title, content,
+                                  client, product, stamp)
             except sqlite3.Error:
                 pass
 

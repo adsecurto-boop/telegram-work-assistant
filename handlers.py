@@ -792,9 +792,31 @@ async def handle_callback(update, context):
                         raise ValueError('Tool risk classification changed; create a new proposal.')
                     res = await mcp_mgr.call_tool(gemini_name, args)
                 except Exception as exc:
+                    audit = {
+                        'server': payload.get('server'),
+                        'canonical_tool_id': payload.get('tool_id'),
+                        'arguments_hash': hashlib.sha256(json.dumps(args, sort_keys=True, default=str).encode()).hexdigest(),
+                        'risk': payload.get('risk_level'),
+                        'authorization_family': payload.get('authorization_family', []),
+                        'execution_timestamp': datetime.now(timezone.utc).isoformat(),
+                        'status': 'failed',
+                    }
+                    await asyncio.to_thread(db(context).record_external_write_audit,
+                                            prop_id, owner_id, audit)
                     await asyncio.to_thread(db(context).finish_nl_proposal, prop_id, 'failed')
                     await reply(update, f"❌ **External Tool Action Failed**\n\n{exc}")
                     return
+                audit = {
+                    'server': desc.server_name,
+                    'canonical_tool_id': desc.canonical_id,
+                    'arguments_hash': hashlib.sha256(json.dumps(args, sort_keys=True, default=str).encode()).hexdigest(),
+                    'risk': desc.risk_level.value,
+                    'authorization_family': payload.get('authorization_family', []),
+                    'execution_timestamp': datetime.now(timezone.utc).isoformat(),
+                    'status': 'success' if res.success else 'failed',
+                }
+                await asyncio.to_thread(db(context).record_external_write_audit,
+                                        prop_id, owner_id, audit)
                 if res.success:
                     await asyncio.to_thread(db(context).finish_nl_proposal, prop_id, 'executed')
                     await reply(update, f"✅ **External Tool Action Executed**\n\n{res.text}")

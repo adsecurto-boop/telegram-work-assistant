@@ -8,10 +8,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from database import Database, SCHEMA_VERSION
-from assistant_orchestrator import ExternalFactContinuationPlanner
-from nlp import NLIntent
-from mcp_manager import MAX_TOOL_DISCOVERY_PAGES, MCPManager, MCPServerConnection
-from mcp_registry import RiskLevel
+from assistant_orchestrator import AssistantOrchestrator, ExternalFactContinuationPlanner
+from agent_orchestrator import AgentAuthorization
+from nlp import ConversationPlan, NLIntent, NLEntities, PlannedAction
+from mcp_manager import MAX_TOOL_DISCOVERY_PAGES, MCPManager, MCPServerConnection, ToolResult
+from mcp_registry import RiskLevel, ToolRegistry
 
 
 class _PagedClient:
@@ -76,6 +77,56 @@ class MCPDiscoveryHardeningTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(MCPManager._annotations_are_trusted(exact))
         self.assertFalse(MCPManager._annotations_are_trusted(renamed))
 
+    async def test_rediscovery_replaces_stale_tools_without_duplicates(self):
+        manager = MCPManager()
+        server = MCPServerConnection("github", {"enabled": True, "read_only_tools": ["get_issue"]})
+        server.status = "ready"
+        server.client = _PagedClient({None: _page(["old_tool", "get_issue"])})
+        manager.servers["github"] = server
+        await manager.discover_server_tools("github")
+        server.client = _PagedClient({None: _page(["get_issue", "new_tool"])})
+        await manager.discover_server_tools("github")
+        self.assertEqual([t.original_name for t in manager.registry.list_tools("github")],
+                         ["get_issue", "new_tool"])
+
+
+class AuthorizationAndCapabilityTests(unittest.TestCase):
+    def test_read_questions_never_grant_write_authority(self):
+        for text in ("Is issue #61 closed?", "What labels does it have?",
+                     "Who assigned it?", "Was it merged?"):
+            with self.subTest(text=text):
+                auth = AgentAuthorization.from_user_message(text)
+                self.assertFalse(auth.external_write_allowed)
+                self.assertEqual(auth.requested_capabilities, frozenset())
+
+    def test_explicit_writes_are_capability_scoped(self):
+        expected = {
+            "Close issue #61": "github.issue.update",
+            "Add the bug label": "github.issue.label",
+            "Merge PR #8": "github.pr.merge",
+        }
+        for text, capability in expected.items():
+            with self.subTest(text=text):
+                auth = AgentAuthorization.from_user_message(text)
+                self.assertTrue(auth.external_write_allowed)
+                self.assertIn(capability, auth.requested_capabilities)
+
+    def test_negation_wins_globally(self):
+        for text in ("Don't close it; just tell me whether it is closed.",
+                     "Do not add a label, only show the labels.",
+                     "Never merge the PR; check its status."):
+            with self.subTest(text=text):
+                self.assertFalse(AgentAuthorization.from_user_message(text).external_write_allowed)
+
+    def test_capability_index_is_cached_and_invalidated(self):
+        registry = ToolRegistry()
+        registry.register_tool("github", "get_issue", "Get an issue", {}, RiskLevel.READ_ONLY)
+        self.assertTrue(registry.supports("github.read"))
+        registry.clear_server_tools("github")
+        self.assertFalse(registry.supports("github.read"))
+        registry.register_tool("mail", "send_email", "Send email", {}, RiskLevel.EXTERNAL_WRITE)
+        self.assertTrue(registry.supports("gmail.message.send"))
+
 
 class FTSV15HardeningTests(unittest.TestCase):
     def setUp(self):
@@ -119,6 +170,27 @@ class FTSV15HardeningTests(unittest.TestCase):
         self.assertEqual(db.search_historical_memory("obsoletealpha"), [])
         self.assertEqual(db.search_historical_memory("currentbeta")[0]["source_id"], str(task.id))
 
+    def test_all_five_source_types_are_singleton_and_updates_replace_text(self):
+        db = Database(self.path)
+        task = db.add_task("task_oldtoken")
+        case_id = db.create_case("case_oldtoken", detail="event_uniquetoken")
+        test_id = db.add_test_session("test_oldtoken")
+        summary_id = db.save_memory_summary(1, "rolling", "summary_oldtoken")
+        db.update_task(task.id, "title", "task_newtoken")
+        db.update_case(case_id, "title", "case_newtoken", detail="case renamed")
+        db.update_test_session(test_id, "scenario", "test_newtoken")
+        db.update_memory_summary(summary_id, "summary_newtoken")
+        for old in ("task_oldtoken", "case_oldtoken", "test_oldtoken", "summary_oldtoken"):
+            self.assertEqual(db.search_historical_memory(old), [])
+        db.rebuild_work_memory_index()
+        with db.connect() as connection:
+            counts = connection.execute('''SELECT source_type, source_id, count(*) AS n
+                FROM fts_work_memory GROUP BY source_type, source_id''').fetchall()
+        self.assertTrue(counts)
+        self.assertTrue(all(row["n"] == 1 for row in counts))
+        self.assertEqual({row["source_type"] for row in counts},
+                         {"task", "case", "case_event", "test_session", "conversation_summary"})
+
     def test_migration_failure_rolls_back_and_keeps_backup(self):
         Database(self.path)
         with closing(sqlite3.connect(self.path)) as connection:
@@ -134,6 +206,65 @@ class FTSV15HardeningTests(unittest.TestCase):
 
 
 class ExternalContinuationHardeningTests(unittest.IsolatedAsyncioTestCase):
+    async def test_semantic_planner_is_invoked_and_validated(self):
+        class SemanticPlanner:
+            def __init__(self):
+                self.calls = []
+
+            async def interpret_external_continuation(self, text, facts, context, allowed):
+                self.calls.append((text, facts, context, allowed))
+                return ConversationPlan(actions=[PlannedAction(
+                    intent=NLIntent.CREATE_TASK,
+                    entities=NLEntities(task_title="Verified retest"))])
+
+        semantic = SemanticPlanner()
+        plan = await ExternalFactContinuationPlanner(semantic).plan(
+            "Create a local retest task", [{"success": True, "data": {"state": "open"}}],
+            {"active_case": {"id": 3}}, 3)
+        self.assertEqual(plan.actions[0].intent, NLIntent.CREATE_TASK)
+        self.assertEqual(len(semantic.calls), 1)
+
+    async def test_semantic_planner_rejects_non_allowlisted_intent(self):
+        class UnsafePlanner:
+            async def interpret_external_continuation(self, *_args):
+                return ConversationPlan(actions=[PlannedAction(
+                    intent=NLIntent.SET_SHIFT, entities=NLEntities(
+                        shift_start="10:00", shift_end="19:00"))])
+
+        with self.assertRaises(ValueError):
+            await ExternalFactContinuationPlanner(UnsafePlanner()).plan(
+                "Change my shift", [{"success": True, "data": {"state": "open"}}], {}, 1)
+
+    def test_operational_audits_exclude_payloads_and_secrets(self):
+        temp = tempfile.TemporaryDirectory()
+        try:
+            db = Database(Path(temp.name) / "audit.sqlite3")
+            db.record_agent_run_audit("agent_1", 77, {
+                "route": "gemini_mcp_agent", "authorization_scope": ["github.read"],
+                "tool_ids": ["github.get_issue"], "tool_count": 1,
+                "final_status": "success", "duration_ms": 12.3,
+                "error_reference": None, "raw_api_key": "SECRET",
+            })
+            row = db.get_audit_log(1)[0]
+            self.assertEqual(row["operation_type"], "external_agent_run")
+            self.assertNotIn("SECRET", row["after_state_json"])
+            self.assertNotIn("raw_api_key", row["after_state_json"])
+        finally:
+            temp.cleanup()
+
+    def test_structured_external_reference_is_canonical_and_fresh(self):
+        orchestrator = AssistantOrchestrator.__new__(AssistantOrchestrator)
+        result = ToolResult("github.get_issue", "mcp__github__get_issue", True, data={
+            "number": 61, "repository": "owner/repo", "state": "open",
+            "html_url": "https://github.com/owner/repo/issues/61", "title": "Wayland",
+            "user": {"login": "alice"}, "labels": [{"name": "bug"}],
+        })
+        ref = orchestrator._external_refs_from_results({}, [result], "")["github_issue"]
+        self.assertEqual(ref["canonical_id"], "github:owner/repo:issue:61")
+        self.assertEqual(ref["creator"], "alice")
+        self.assertEqual(ref["labels"], ["bug"])
+        self.assertTrue(datetime.fromisoformat(ref["fetched_at"]).tzinfo)
+
     async def test_verified_state_can_only_produce_allowlisted_local_actions(self):
         planner = ExternalFactContinuationPlanner()
         facts = [{"success": True, "data": {"number": 61, "state": "open"}}]

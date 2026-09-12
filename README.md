@@ -107,6 +107,17 @@ The supplied GitHub entry uses GitHub's official hosted MCP endpoint in server-s
 read-only mode and is disabled by default. To enable it, set `GITHUB_TOKEN` in the
 environment and change only `enabled` to `true`. The token is expanded into an HTTP
 authorization header at runtime and is never stored in JSON or sent to Gemini.
+External reads and writes are separated by an immutable, capability-scoped authorization
+snapshot derived only from the current user message. Questions never authorize mutations,
+negation wins, and every authorized external mutation still becomes a persistent confirmation
+proposal. Live MCP tool metadata is compiled into a cached capability index and invalidated on
+discovery or reconnect; stale tools are removed rather than accumulated.
+
+Successful structured MCP results produce typed, freshness-bearing external entity references
+(`provider`, `entity_type`, canonical ID, source tool, and fetch time). Verified facts can feed the
+Gemini structured planner only through an allowlist of local `ConversationPlan` intents. Agent runs
+and confirmed external mutations write secret-free operational audit metadata; hidden reasoning,
+headers, credentials, and raw payloads are never stored.
 For a local installation, use GitHub's official `ghcr.io/github/github-mcp-server`
 Docker image or official binary with `transport: "stdio"`; do not use the repository
 name as an npm package. Keep `GITHUB_READ_ONLY=1` and limit toolsets for read-first use.
@@ -394,13 +405,17 @@ The complete test suite runs against temporary databases using mocked Telegram a
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-The suite includes more than 353 unit and integration tests covering:
+The suite includes 378 unit and integration tests covering:
 - **Durable Dialogue Memory & Pronoun Resolution**: `conversation_turns` persistence across restarts, context building, rolling summaries, and unambiguous pronoun resolution (`tests/test_assistant_correctness.py`).
 - **Multi-Action Planning**: `ConversationPlan` with atomic transactions, dependency propagation, confirmation requirements for high-risk actions, and full rollback on partial failure (`tests/test_mission_hardening.py`).
 - **Stale Report Finalization Guard**: Live facts hash recomputation at finalization time, rejection of stale reports, and shift close validation (`tests/test_assistant_correctness.py`).
 - **Undo Integrity & Verification**: Real audit verification; Undo buttons derived solely from verifiable mutation results (`tests/test_mission_hardening.py`).
 - **Dashboard & Evidence Security**: XSS protection (forced download of HTML, SVG, XML, executables; safe inline allowlist for images/audio/video), CSP sandbox, thread-safe sessions, and NULL-safe evidence deduplication (`tests/test_mission_hardening.py`).
 - **Connector Security**: HTTPS enforcement, pagination, and untrusted payload tagging (`tests/test_mission_hardening.py`).
+- **External Architecture Closure**: capability-scoped authorization, provider-role fallback with
+  call-ID preservation, reconnect replacement, typed external references, semantic external-to-local
+  continuation, operational audits, and a six-turn synthetic Telegram acceptance conversation
+  (`tests/test_final_hardening.py`, `tests/test_gemini_tool_roundtrip.py`, `tests/test_production_e2e.py`).
 - **Telegram Handlers**: Plain natural language, voice routing without phantom notes, `/understand`, `/undo`, and callbacks.
 - **Undo & Cascades**: Multi-task correlation undo, compound test sessions, standalone follow-ups, cluster acceptance undo, and atomic rollback on tamper.
 - **Shift Engine**: Schedule validation, invalid time rejection (`99:80`, `25:00`, `10:99`, `0am`, `0pm`, `10am to 10am`), future shifts, day-off overrides, template range weekday enforcement, and cross-midnight shifts.

@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, ClassVar, Dict, List, Optional
 
 from gemini_tool_model import CompatibleToolModel, ModelFunctionCall, ToolCallingModel
 from ai import AIPayloadBuilder
@@ -46,17 +47,58 @@ class AgentRunResult:
 class AgentAuthorization:
     """Authority derived only from the user's request, never from tool output."""
     external_read_allowed: bool = True
-    external_write_requested: bool = False
-    destructive_requested: bool = False
+    external_write_allowed: bool = False
+    destructive_allowed: bool = False
+    requested_capabilities: frozenset[str] = frozenset()
+
+    _NEGATIONS: ClassVar[tuple[str, ...]] = (
+        r"\bdo\s+not\b", r"\bdon['’]t\b", r"\bnever\b", r"\bread[- ]only\b",
+        r"\bonly\s+(?:read|show|check|tell)\b", r"\bjust\s+(?:read|show|check|tell)\b",
+        r"\bdon['’]t\s+change\b", r"\bdo\s+not\s+change\b",
+    )
+    _CAPABILITY_PATTERNS: ClassVar[tuple[tuple[str, str], ...]] = (
+        ("github.issue.create", r"\bcreate\s+(?:an?\s+)?(?:github\s+)?issue\b"),
+        ("github.issue.update", r"\b(?:close|reopen|update|edit)\s+(?:github\s+)?issue\b"),
+        ("github.issue.label", r"\b(?:add|apply|remove)\s+(?:the\s+)?(?:[\w.-]+\s+)?label\b"),
+        ("github.issue.assign", r"\bassign\s+(?:github\s+)?issue\b"),
+        ("github.issue.comment", r"\b(?:add|post|write)\s+(?:an?\s+)?comment\b"),
+        ("github.pr.merge", r"\bmerge\s+(?:the\s+)?(?:pull\s+request|pr)\b"),
+        ("gmail.message.send", r"\b(?:send|reply\s+to)\s+(?:an?\s+)?(?:email|mail|message)\b"),
+        ("calendar.event.create", r"\b(?:create|schedule|book)\s+(?:an?\s+)?(?:calendar\s+)?(?:event|meeting)\b"),
+        ("drive.file.write", r"\b(?:create|update|edit|move)\s+(?:the\s+|an?\s+)?(?:drive\s+)?(?:file|document|doc)\b"),
+        ("external.delete", r"\b(?:delete|destroy|purge|remove)\s+(?:the\s+|an?\s+)?(?:comment|file|record|resource)\b"),
+    )
 
     @classmethod
     def from_user_message(cls, text: str) -> "AgentAuthorization":
         low = text.casefold()
-        read_only = any(phrase in low for phrase in ("read only", "only read", "don't change", "do not change"))
-        write_words = ("create", "update", "edit", "post", "send", "merge", "close", "reopen",
-                       "comment", "assign", "label", "publish", "deploy", "delete", "remove")
-        destructive = any(word in low for word in ("delete", "remove", "destroy", "purge"))
-        return cls(True, (not read_only and any(word in low for word in write_words)), destructive)
+        if any(re.search(pattern, low) for pattern in cls._NEGATIONS):
+            return cls()
+        capabilities = frozenset(
+            capability for capability, pattern in cls._CAPABILITY_PATTERNS
+            if re.search(pattern, low)
+        )
+        destructive = "external.delete" in capabilities
+        return cls(True, bool(capabilities), destructive, capabilities)
+
+    def allows(self, desc: Any) -> bool:
+        if desc.risk_level == RiskLevel.READ_ONLY:
+            return self.external_read_allowed
+        if desc.risk_level in (RiskLevel.DESTRUCTIVE, RiskLevel.PRIVILEGED):
+            return self.destructive_allowed and "external.delete" in self.requested_capabilities
+        if desc.risk_level not in (RiskLevel.EXTERNAL_WRITE, RiskLevel.UNKNOWN_EXTERNAL):
+            return True
+        from mcp_registry import ToolRegistry
+        tool_caps = ToolRegistry.capabilities_for_tool(desc)
+        return self.external_write_allowed and bool(tool_caps & self.requested_capabilities)
+
+    @property
+    def external_write_requested(self) -> bool:  # compatibility for callers/tests
+        return self.external_write_allowed
+
+    @property
+    def destructive_requested(self) -> bool:
+        return self.destructive_allowed
 
 
 class GeminiAgent:
@@ -136,20 +178,15 @@ class GeminiAgent:
                         continue
                     policy = ToolPolicy.evaluate(desc, call.arguments)
                     if policy.decision == PolicyDecision.CONFIRMATION_REQUIRED:
-                        if (desc.risk_level in (RiskLevel.EXTERNAL_WRITE, RiskLevel.UNKNOWN_EXTERNAL)
-                                and not authorization.external_write_requested):
+                        if not authorization.allows(desc):
                             denied = ToolResult(call.name, call.name, False,
                                                 error="Action was outside the user's authorization scope")
                             response_calls.append(call)
                             response_payloads.append(denied.model_payload())
                             continue
-                        if (desc.risk_level in (RiskLevel.DESTRUCTIVE, RiskLevel.PRIVILEGED)
-                                and not authorization.destructive_requested):
-                            denied = ToolResult(call.name, call.name, False,
-                                                error="Destructive action was not requested by the user")
-                            response_calls.append(call)
-                            response_payloads.append(denied.model_payload())
-                            continue
+                        if policy.proposal_data is not None:
+                            policy.proposal_data["authorization_family"] = sorted(
+                                authorization.requested_capabilities)
                         return AgentRunResult(run_id, policy.confirmation_preview or "",
                                               executed, results, policy, iteration)
                     result = await self.mcp_manager.call_tool(call.name, call.arguments)

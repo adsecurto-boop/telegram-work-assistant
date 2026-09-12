@@ -11,10 +11,13 @@ import asyncio
 import json
 import logging
 import re
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+
+from pydantic import BaseModel, Field
 
 from database import Database
 from models import TaskStatus
@@ -24,7 +27,7 @@ from memory_service import build_assistant_context
 from mcp_manager import MCPManager, ToolResult
 from mcp_registry import ToolRegistry, RiskLevel
 from mcp_policy import ToolPolicy, PolicyDecision
-from agent_orchestrator import GeminiAgent, AgentRunResult, SYSTEM_INSTRUCTION_MCP_AGENT
+from agent_orchestrator import AgentAuthorization, GeminiAgent, AgentRunResult, SYSTEM_INSTRUCTION_MCP_AGENT
 from gemini_tool_model import ToolCallingModel
 from domain import parse_due
 import config
@@ -53,11 +56,28 @@ class AgentContinuationResult:
     local_action_executed: Optional[Dict[str, Any]] = None
 
 
+class ExternalEntityRef(BaseModel):
+    """Canonical, freshness-bearing reference to an externally verified entity."""
+    provider: str
+    entity_type: str
+    canonical_id: str
+    repository: Optional[str] = None
+    number: Optional[int] = None
+    url: Optional[str] = None
+    title: Optional[str] = None
+    state: Optional[str] = None
+    creator: Optional[str] = None
+    labels: List[str] = Field(default_factory=list)
+    fetched_at: str
+    source_tool: str
+
+
 class ExternalFactContinuationPlanner:
     """Turns verified external facts into a strictly allowlisted local plan."""
     ALLOWED_INTENTS = {
         NLIntent.ADD_CASE_EVENT, NLIntent.CREATE_TASK, NLIntent.CREATE_FOLLOWUP,
-        NLIntent.UPDATE_CASE,
+        NLIntent.UPDATE_CASE, NLIntent.CHANGE_CASE_STATUS, NLIntent.ADD_CLIENT_UPDATE,
+        NLIntent.CREATE_TEST_SESSION, NLIntent.UPDATE_TEST_SESSION,
     }
 
     def __init__(self, semantic_planner: Any = None):
@@ -71,7 +91,8 @@ class ExternalFactContinuationPlanner:
             if hasattr(candidate, "__await__"):
                 candidate = await candidate
             if candidate:
-                plan = candidate if isinstance(candidate, ConversationPlan) else ConversationPlan.model_validate(candidate)
+                raw_candidate = candidate.model_dump() if hasattr(candidate, "model_dump") else candidate
+                plan = ConversationPlan.model_validate(raw_candidate)
                 if any(action.intent not in self.ALLOWED_INTENTS for action in plan.actions):
                     raise ValueError("External continuation proposed a non-local or unsupported action")
                 return plan
@@ -80,7 +101,9 @@ class ExternalFactContinuationPlanner:
         state = self._state(facts)
         low = user_message.casefold()
         actions: List[PlannedAction] = []
-        if any(phrase in low for phrase in ("add its current state", "add its current status", "save the issue number")):
+        if any(phrase in low for phrase in ("add its current state", "add its current status",
+                                            "add the current state", "add the current status",
+                                            "save the issue number")):
             if not case_id:
                 return ConversationPlan(
                     clarification_question=("I found the external issue, but I don't know which local case "
@@ -188,6 +211,7 @@ class AssistantOrchestrator:
         if active_refs and any(w in low for w in [
             "who created", "who opened", "what labels", "assignee", "comment",
             "is it", "does it", "still open", "closed now", "its state", "its status",
+            "current state", "current status", "label",
         ]):
             return True
         return False
@@ -214,17 +238,13 @@ class AssistantOrchestrator:
             requested = "GitHub"
         if not requested:
             return False
-        needles = {
-            "GitHub": ("github", "issue", "pull", "repository", "repo"),
-            "Gmail": ("gmail", "email", "mail", "inbox"),
-            "Google Calendar": ("calendar", "meeting", "event"),
-            "Google Drive": ("drive", "document", "file"),
+        capabilities = {
+            "GitHub": ("github.available", "github.read"),
+            "Gmail": ("gmail.available", "gmail.read"),
+            "Google Calendar": ("calendar.available", "calendar.read"),
+            "Google Drive": ("drive.available", "drive.read"),
         }[requested]
-        for tool in self.mcp_manager.registry.list_tools():
-            haystack = f"{tool.server_name} {tool.original_name} {tool.description}".casefold()
-            if any(needle in haystack for needle in needles):
-                return True
-        return False
+        return self.mcp_manager.registry.supports(*capabilities)
 
     def _detect_plan_need(self, text: str) -> bool:
         low = text.lower()
@@ -265,7 +285,21 @@ class AssistantOrchestrator:
             f"Recent Context:\n{context_data.get('recent_turns')}"
         )
 
+        started = time.perf_counter()
         res: AgentRunResult = await agent.run(user_message=text, context_prompt=context_prompt)
+        authorization = AgentAuthorization.from_user_message(text)
+        audit_metadata = {
+            "route": "gemini_mcp_agent",
+            "authorization_scope": sorted(authorization.requested_capabilities),
+            "tool_ids": [call["tool_id"] for call in res.tool_calls_executed],
+            "tool_count": len(res.tool_calls_executed),
+            "final_status": ("confirmation_required" if res.pending_confirmation else
+                             "success" if res.success else "failed"),
+            "duration_ms": round((time.perf_counter() - started) * 1000, 3),
+            "error_reference": res.error,
+        }
+        await asyncio.to_thread(self.db.record_agent_run_audit, res.run_id,
+                                source_update_id, audit_metadata)
 
         # Handle write confirmation required
         if res.pending_confirmation:
@@ -322,14 +356,22 @@ class AssistantOrchestrator:
                     match = re.search(r"github\.com/([^/]+/[^/]+)/(?:issues|pull)/\d+", url)
                     repository = match.group(1) if match else None
                 if number and repository:
-                    refs["github_issue"] = {
-                        "provider": "github", "repository": repository,
-                        "number": int(number), "url": url,
-                        "title": item.get("title"),
-                        "state": item.get("state") or item.get("status"),
-                        "fetched_at": datetime.now(timezone.utc).isoformat(),
-                        "source_tool": result.tool_id,
-                    }
+                    creator = item.get("user") or item.get("author") or item.get("creator")
+                    if isinstance(creator, dict):
+                        creator = creator.get("login") or creator.get("name")
+                    raw_labels = item.get("labels") or []
+                    labels = [str(label.get("name") if isinstance(label, dict) else label)
+                              for label in raw_labels]
+                    entity_type = "pull_request" if "/pull/" in str(url or "") else "issue"
+                    ref = ExternalEntityRef(
+                        provider="github", entity_type=entity_type,
+                        canonical_id=f"github:{repository}:{entity_type}:{int(number)}",
+                        repository=repository, number=int(number), url=url,
+                        title=item.get("title"), state=item.get("state") or item.get("status"),
+                        creator=creator, labels=labels,
+                        fetched_at=datetime.now(timezone.utc).isoformat(), source_tool=result.tool_id,
+                    )
+                    refs["github_issue"] = ref.model_dump()
                     return refs
         match = re.search(r'issue\s+#?(\d+)', final_text, re.IGNORECASE)
         old_repo = (existing.get("github_issue") or {}).get("repository")

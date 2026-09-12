@@ -12,7 +12,10 @@ class _FakeModels:
 
     async def generate_content(self, **kwargs):
         self.requests.append(kwargs)
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 class _FakeClient:
@@ -22,6 +25,28 @@ class _FakeClient:
 
 
 class GeminiNativeRoundTripTests(unittest.IsolatedAsyncioTestCase):
+    async def test_provider_role_fallback_preserves_call_id_and_does_not_replan(self):
+        final_content = types.Content(role="model", parts=[types.Part(text="Done")])
+        final_response = types.GenerateContentResponse(candidates=[types.Candidate(content=final_content)])
+        adapter = GeminiToolModel.__new__(GeminiToolModel)
+        adapter.model = "gemini-test"
+        adapter.last_function_response_role = "tool"
+        adapter._types = types
+        adapter._client = _FakeClient([ValueError("Role 'tool' is not supported"), final_response])
+        from gemini_tool_model import ModelFunctionCall
+        call = ModelFunctionCall("mcp__github__get_issue", {"number": 61}, "call-61")
+        contents = [adapter.user_content("Get it"),
+                    types.Content(role="model", parts=[types.Part(function_call=types.FunctionCall(
+                        id="call-61", name=call.name, args=call.arguments))]),
+                    adapter.function_response_content([call], [{"success": True}])]
+        turn = await adapter.generate(contents, [], "secure")
+        self.assertEqual(turn.text, "Done")
+        self.assertEqual(len(adapter._client.aio.models.requests), 2)
+        retried = adapter._client.aio.models.requests[1]["contents"]
+        self.assertEqual(retried[-1].role, "user")
+        self.assertEqual(retried[-1].parts[0].function_response.id, "call-61")
+        self.assertEqual(adapter.last_function_response_role, "user(provider-compat)")
+
     async def test_native_model_content_and_function_response_round_trip(self):
         model_call = types.Content(role="model", parts=[types.Part(function_call=types.FunctionCall(
             id="call-61", name="mcp__github__get_issue",

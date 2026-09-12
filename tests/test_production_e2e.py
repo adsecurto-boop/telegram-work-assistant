@@ -459,3 +459,62 @@ class ProductionE2ETests(unittest.IsolatedAsyncioTestCase):
         function_responses = [part["function_response"] for msg_request in ai.tool_requests[1]
                               for part in msg_request.get("parts", []) if "function_response" in part]
         self.assertTrue(function_responses[0]["response"]["success"])
+
+    async def test_17_complete_synthetic_telegram_external_conversation(self):
+        import handlers
+        from agent_orchestrator import AgentAuthorization
+        from gemini_tool_model import CompatibleToolModel
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        self.db.update_conversation_context(active_case_id=self.case_id)
+        self.mcp_manager.registry.register_tool(
+            "mock", "add_issue_label", "Add a GitHub issue label",
+            {"type": "object", "properties": {"issue_number": {"type": "integer"},
+                                                "label": {"type": "string"}},
+             "required": ["issue_number", "label"]}, RiskLevel.EXTERNAL_WRITE)
+        responses = []
+        for call, answer in (
+            ({"name": "mcp__mock__search_issues", "args": {"query": "61"}}, "Issue #61 is open."),
+            ({"name": "mcp__mock__get_issue", "args": {"issue_number": 61}}, "Issue #61 is still open."),
+            ({"name": "mcp__mock__get_issue", "args": {"issue_number": 61}}, "Issue #61 is open."),
+            ({"name": "mcp__mock__get_issue", "args": {"issue_number": 61}}, "Issue #61 is open."),
+            ({"name": "mcp__mock__get_issue", "args": {"issue_number": 61}}, "Labels: bug, ubuntu."),
+        ):
+            responses.extend(({"function_calls": [call]}, {"text": answer}))
+        responses.append({"function_calls": [{"name": "mcp__mock__add_issue_label",
+                                                "args": {"issue_number": 61, "label": "bug"}}]})
+        ai = MockGeminiClientForE2E(tool_responses=responses)
+        context = MagicMock()
+        context.application.bot_data = {
+            "mcp_manager": self.mcp_manager, "db": self.db,
+            "gemini_tool_model": CompatibleToolModel(ai),
+        }
+
+        async def send(text, update_id):
+            msg = MagicMock(forward_origin=None, reply_text=AsyncMock())
+            update = MagicMock(update_id=update_id, effective_message=msg, message=msg)
+            await handlers.save_plain_message(update, context, text)
+            return msg.reply_text.await_args.args[0]
+
+        with patch.object(config, "AI_KEY", ""), patch.object(config, "AI_MODEL", ""):
+            first = await send("Check issue #61 in owner/repo.", 1701)
+            fresh = await send("Is it still open now?", 1702)
+            await send(f"Add the current status to CASE-{self.case_id}.", 1703)
+            await send("If it's still open create a retest task tomorrow.", 1704)
+            labels = await send("What labels does it have?", 1705)
+            proposal_reply = await send("Add the bug label.", 1706)
+
+        self.assertIn("#61", first)
+        self.assertIn("still open", fresh)
+        self.assertIn("bug", labels)
+        self.assertFalse(AgentAuthorization.from_user_message("What labels does it have?").external_write_allowed)
+        self.assertTrue(AgentAuthorization.from_user_message("Add the bug label.").external_write_allowed)
+        self.assertTrue(any("External issue current state" in e["detail"]
+                            for e in self.db.case_events(self.case_id)))
+        self.assertTrue(any(task.title == "Retest external issue" for task in self.db.list_tasks()))
+        self.assertIn("Requires Confirmation", proposal_reply)
+        self.assertEqual(ai.tool_count, 11)
+        with self.db.connect() as connection:
+            pending = connection.execute(
+                "SELECT * FROM nl_proposals WHERE status='pending'").fetchall()
+        self.assertEqual(len(pending), 1)

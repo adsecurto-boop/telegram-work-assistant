@@ -83,6 +83,75 @@ class ToolRegistry:
     def __init__(self):
         self._tools_by_gemini_name: Dict[str, ToolDescriptor] = {}
         self._tools_by_canonical_id: Dict[str, ToolDescriptor] = {}
+        self._capability_cache: Optional[Dict[str, tuple[str, ...]]] = None
+
+    @staticmethod
+    def capabilities_for_tool(tool: ToolDescriptor) -> frozenset[str]:
+        """Derive stable routing/authorization capabilities from live tool metadata."""
+        service = tool.server_name.casefold().replace('-', '_')
+        name = tool.original_name.casefold().replace('-', '_')
+        identity = f"{tool.server_name} {tool.original_name} {tool.description}".casefold()
+        if any(token in identity for token in ("github", "repository", "pull request", "issue")):
+            service = "github"
+        elif any(token in identity for token in ("gmail", "email", "inbox")):
+            service = "gmail"
+        elif any(token in identity for token in ("calendar", "meeting")):
+            service = "calendar"
+        elif any(token in identity for token in ("google drive", "document", "drive file")):
+            service = "drive"
+        caps = {f"{service}.available"}
+        if service == "github":
+            if any(word in name for word in ("issue", "pull", "repo", "commit", "branch")):
+                caps.add("github.read")
+            mappings = {
+                "create_issue": "github.issue.create",
+                "update_issue": "github.issue.update",
+                "close_issue": "github.issue.update",
+                "reopen_issue": "github.issue.update",
+                "add_issue_comment": "github.issue.comment",
+                "add_comment": "github.issue.comment",
+                "merge_pull_request": "github.pr.merge",
+                "add_issue_label": "github.issue.label",
+                "add_label": "github.issue.label",
+                "remove_label": "github.issue.label",
+                "assign": "github.issue.assign",
+            }
+            for marker, capability in mappings.items():
+                if marker in name:
+                    caps.add(capability)
+        elif service in {"gmail", "email", "mail"}:
+            caps.update({"gmail.available", "gmail.read"})
+            if any(word in name for word in ("send", "reply", "draft")):
+                caps.add("gmail.message.send")
+        elif "calendar" in service:
+            caps.update({"calendar.available", "calendar.read"})
+            if any(word in name for word in ("create", "schedule", "insert")):
+                caps.add("calendar.event.create")
+        elif "drive" in service:
+            caps.update({"drive.available", "drive.read"})
+            if any(word in name for word in ("create", "update", "edit", "move", "write")):
+                caps.add("drive.file.write")
+        if tool.risk_level in (RiskLevel.DESTRUCTIVE, RiskLevel.PRIVILEGED):
+            caps.add("external.delete")
+        if tool.risk_level == RiskLevel.READ_ONLY:
+            caps.add(f"{service}.read")
+        return frozenset(caps)
+
+    def capability_index(self) -> Dict[str, tuple[str, ...]]:
+        if self._capability_cache is None:
+            index: Dict[str, List[str]] = {}
+            for tool in self.list_tools():
+                for capability in self.capabilities_for_tool(tool):
+                    index.setdefault(capability, []).append(tool.canonical_id)
+            self._capability_cache = {
+                capability: tuple(sorted(tool_ids))
+                for capability, tool_ids in sorted(index.items())
+            }
+        return dict(self._capability_cache)
+
+    def supports(self, *capabilities: str) -> bool:
+        index = self.capability_index()
+        return any(capability in index for capability in capabilities)
 
     def register_tool(
         self,
@@ -129,6 +198,7 @@ class ToolRegistry:
 
         self._tools_by_gemini_name[gemini_name] = desc
         self._tools_by_canonical_id[canonical_id] = desc
+        self._capability_cache = None
         return desc
 
     def get_by_gemini_name(self, gemini_name: str) -> Optional[ToolDescriptor]:
@@ -149,3 +219,4 @@ class ToolRegistry:
             desc = self._tools_by_gemini_name.pop(k, None)
             if desc:
                 self._tools_by_canonical_id.pop(desc.canonical_id, None)
+        self._capability_cache = None

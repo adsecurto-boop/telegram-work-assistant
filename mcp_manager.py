@@ -222,6 +222,18 @@ class MCPManager:
             if await server.start(timeout=timeout):
                 await self.discover_server_tools(name, timeout=timeout)
 
+    async def reconnect_server(self, server_name: str, timeout: float = 10.0) -> bool:
+        """Reconnect one server and atomically replace its discovered tool set."""
+        server = self.servers.get(server_name)
+        if not server:
+            return False
+        self.registry.clear_server_tools(server_name)
+        await server.shutdown()
+        if not await server.start(timeout=timeout):
+            return False
+        await self.discover_server_tools(server_name, timeout=timeout)
+        return server.status == "ready"
+
     async def discover_server_tools(self, server_name: str, timeout: float = 10.0) -> None:
         server = self.servers.get(server_name)
         if not server or server.status != "ready":
@@ -257,6 +269,7 @@ class MCPManager:
                     risk_level=risk,
                 )
         except Exception as exc:
+            self.registry.clear_server_tools(server_name)
             server.status = "degraded"
             server.last_error = f"Tool discovery failed: {type(exc).__name__}: {exc}"
             logger.warning("Error discovering tools for %s: %s", server_name, exc)
