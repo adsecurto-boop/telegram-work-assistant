@@ -1,0 +1,13 @@
+{
+  "name": "work-operations-hub",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node server.ts",
+    "build": "node -e \"console.log('Build completed')\"",
+    "lint": "node --check server.ts && python3 -m py_compile dashboard.py",
+    "start": "node server.ts"
+  },
+  "dependencies": {}
+}

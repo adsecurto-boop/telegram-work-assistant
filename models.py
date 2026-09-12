@@ -116,3 +116,222 @@ class Task:
             tags=data.get("tags"),
             completion_note=data.get("completion_note"),
         )
+
+
+# ==============================================================================
+# Work Item, Workflow, Member, Role, Requirement & Testware Domain Models
+# ==============================================================================
+
+class WorkItemType(str, Enum):
+    TASK = "task"
+    CASE = "case"
+    REQUIREMENT = "requirement"
+    DEFECT = "defect"
+    INVESTIGATION = "investigation"
+    DEVOPS = "devops"
+
+
+class OperationalStatus(str, Enum):
+    PLANNED = "planned"
+    PENDING = "pending"
+    ACTIVE = "active"
+    WAITING = "waiting"
+    BLOCKED = "blocked"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+    ARCHIVED = "archived"
+
+
+class DependencyType(str, Enum):
+    MEMBER = "member"
+    ROLE = "role"
+    BUILD = "build"
+    DEVELOPMENT = "development"
+    CLIENT = "client"
+    ENVIRONMENT = "environment"
+    CREDENTIALS = "credentials"
+    EXTERNAL_TICKET = "external_ticket"
+    WORK_ITEM = "work_item"
+    OTHER = "other"
+
+
+@dataclass
+class Member:
+    id: int
+    name: str
+    email: Optional[str] = None
+    telegram_handle: Optional[str] = None
+    notes: Optional[str] = None
+    created_at: Optional[str] = None
+    roles: list[str] = None
+
+    def __post_init__(self):
+        if self.roles is None:
+            self.roles = []
+
+
+@dataclass
+class Role:
+    id: int
+    name: str
+    description: Optional[str] = None
+    created_at: Optional[str] = None
+
+
+@dataclass
+class WorkflowStage:
+    id: int
+    template_id: int
+    name: str
+    stage_order: int
+    description: Optional[str] = None
+    expected_role: Optional[str] = None
+    expected_duration_hours: Optional[float] = None
+    is_waiting: bool = False
+    is_active: bool = True
+    required_artifacts: list[str] = None
+    checklist_items: list[str] = None
+
+    def __post_init__(self):
+        if self.required_artifacts is None:
+            self.required_artifacts = []
+        if self.checklist_items is None:
+            self.checklist_items = []
+
+
+@dataclass
+class WorkflowTemplate:
+    id: int
+    name: str
+    description: Optional[str] = None
+    work_type: str = "requirement"
+    is_default: bool = False
+    created_at: Optional[str] = None
+    stages: list[WorkflowStage] = None
+
+    def __post_init__(self):
+        if self.stages is None:
+            self.stages = []
+
+
+@dataclass
+class BlockerDependency:
+    id: int
+    entity_type: str
+    entity_id: int
+    dependency_type: DependencyType
+    description: str
+    waiting_on_member_id: Optional[int] = None
+    waiting_on_role: Optional[str] = None
+    target_entity_type: Optional[str] = None
+    target_entity_id: Optional[int] = None
+    status: str = "active"  # active, resolved
+    started_at: Optional[str] = None
+    expected_resolution_date: Optional[str] = None
+    resolved_at: Optional[str] = None
+    waiting_on_name: Optional[str] = None
+
+
+@dataclass
+class Requirement:
+    id: int
+    title: str
+    description: Optional[str] = None
+    requirement_text: Optional[str] = None
+    user_story: Optional[str] = None
+    acceptance_criteria: Optional[str] = None
+    client: Optional[str] = None
+    product: Optional[str] = None
+    ticket: Optional[str] = None
+    priority: int = 1
+    due_date: Optional[str] = None
+    owner_member_id: Optional[int] = None
+    owner_name: Optional[str] = None
+    status: str = "active"
+    workflow_template_id: Optional[int] = None
+    current_stage_id: Optional[int] = None
+    current_stage_name: Optional[str] = None
+    operational_status: OperationalStatus = OperationalStatus.ACTIVE
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+@dataclass
+class TestCondition:
+    id: int
+    requirement_id: int
+    title: str
+    description: Optional[str] = None
+    category: str = "functional"
+    risk_level: str = "medium"
+    status: str = "draft"  # draft, accepted, rejected, covered
+    notes: Optional[str] = None
+    created_at: Optional[str] = None
+
+
+@dataclass
+class TestCase:
+    id: int
+    requirement_id: Optional[int] = None
+    test_condition_id: Optional[int] = None
+    title: str = ""
+    objective: Optional[str] = None
+    preconditions: Optional[str] = None
+    steps: Optional[str] = None
+    test_data: Optional[str] = None
+    expected_result: Optional[str] = None
+    priority: int = 2
+    automation_status: str = "manual"  # manual, automated, candidate
+    latest_result: Optional[str] = "not_run"
+    created_at: Optional[str] = None
+
+
+@dataclass
+class TestExecution:
+    id: int
+    test_case_id: int
+    session_id: Optional[int] = None
+    build: Optional[str] = None
+    environment: Optional[str] = None
+    result: str = "not_run"  # passed, failed, blocked, partial, not_run
+    actual_result: Optional[str] = None
+    defect_id: Optional[int] = None
+    executed_by_member_id: Optional[int] = None
+    executed_by_name: Optional[str] = None
+    notes: Optional[str] = None
+    executed_at: Optional[str] = None
+
+
+@dataclass
+class WorkItem:
+    """
+    Unified operational Work Item DTO aggregating Tasks, Cases, Requirements, and Defects.
+    """
+    entity_type: str  # task, case, requirement, defect
+    entity_id: int
+    display_id: str   # e.g., T12, C45, R03
+    title: str
+    operational_status: OperationalStatus
+    workflow_template_id: Optional[int] = None
+    workflow_template_name: Optional[str] = None
+    current_stage_id: Optional[int] = None
+    current_stage_name: Optional[str] = None
+    priority: int = 1
+    client: Optional[str] = None
+    product: Optional[str] = None
+    ticket: Optional[str] = None
+    owner_member_id: Optional[int] = None
+    owner_name: Optional[str] = None
+    waiting_on: Optional[str] = None
+    waiting_on_role: Optional[str] = None
+    is_blocked: bool = False
+    blocker_description: Optional[str] = None
+    due_date: Optional[str] = None
+    estimated_hours: Optional[float] = None
+    actual_hours: Optional[float] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    next_action: Optional[str] = None
+    source_url: Optional[str] = None
+

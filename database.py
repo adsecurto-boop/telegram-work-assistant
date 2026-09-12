@@ -13,7 +13,7 @@ from pathlib import Path
 from models import Task, TaskStatus
 import config
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 
 _last_iso_time = 0.0
@@ -107,6 +107,8 @@ class Database:
                 self._seed_v14_defaults(cursor)
             if version < 15:
                 self._seed_v15_defaults(cursor)
+            if version < 16:
+                self._seed_v16_defaults(cursor)
             self._create_indexes(cursor)
             self._validate_schema_integrity(cursor)
             cursor.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
@@ -448,6 +450,159 @@ class Database:
                 version INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL);
+
+            -- Phase A: Work Items, Configurable Workflows, Members, Roles & Testing Workspace
+            CREATE TABLE IF NOT EXISTS workflow_templates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                description TEXT,
+                work_type TEXT NOT NULL DEFAULT 'requirement',
+                is_default INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL);
+
+            CREATE TABLE IF NOT EXISTS workflow_stages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                template_id INTEGER NOT NULL REFERENCES workflow_templates(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                stage_order INTEGER NOT NULL,
+                description TEXT,
+                expected_role TEXT,
+                expected_duration_hours REAL,
+                is_waiting INTEGER NOT NULL DEFAULT 0,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                required_artifacts_json TEXT,
+                checklist_items_json TEXT,
+                UNIQUE(template_id, name),
+                UNIQUE(template_id, stage_order));
+
+            CREATE TABLE IF NOT EXISTS members (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                email TEXT,
+                telegram_handle TEXT,
+                notes TEXT,
+                created_at TEXT NOT NULL);
+
+            CREATE TABLE IF NOT EXISTS roles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                description TEXT,
+                created_at TEXT NOT NULL);
+
+            CREATE TABLE IF NOT EXISTS member_roles (
+                member_id INTEGER NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+                role_id INTEGER NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+                PRIMARY KEY(member_id, role_id));
+
+            CREATE TABLE IF NOT EXISTS work_item_meta (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_type TEXT NOT NULL,
+                entity_id INTEGER NOT NULL,
+                workflow_template_id INTEGER REFERENCES workflow_templates(id),
+                current_stage_id INTEGER REFERENCES workflow_stages(id),
+                operational_status TEXT NOT NULL DEFAULT 'active',
+                owner_member_id INTEGER REFERENCES members(id),
+                target_role TEXT,
+                estimated_hours REAL,
+                actual_hours REAL,
+                due_date TEXT,
+                next_action TEXT,
+                completion_note TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(entity_type, entity_id));
+
+            CREATE TABLE IF NOT EXISTS stage_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_type TEXT NOT NULL,
+                entity_id INTEGER NOT NULL,
+                stage_id INTEGER NOT NULL REFERENCES workflow_stages(id),
+                entered_at TEXT NOT NULL,
+                exited_at TEXT,
+                actor_member_id INTEGER REFERENCES members(id),
+                note TEXT);
+
+            CREATE TABLE IF NOT EXISTS blockers_dependencies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_type TEXT NOT NULL,
+                entity_id INTEGER NOT NULL,
+                dependency_type TEXT NOT NULL,
+                description TEXT NOT NULL,
+                waiting_on_member_id INTEGER REFERENCES members(id),
+                waiting_on_role TEXT,
+                target_entity_type TEXT,
+                target_entity_id INTEGER,
+                status TEXT NOT NULL DEFAULT 'active',
+                started_at TEXT NOT NULL,
+                expected_resolution_date TEXT,
+                resolved_at TEXT,
+                resolution_notes TEXT);
+
+            CREATE TABLE IF NOT EXISTS requirements (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                description TEXT,
+                requirement_text TEXT,
+                user_story TEXT,
+                acceptance_criteria TEXT,
+                client TEXT,
+                product TEXT,
+                ticket TEXT,
+                priority INTEGER NOT NULL DEFAULT 1,
+                due_date TEXT,
+                owner_member_id INTEGER REFERENCES members(id),
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL);
+
+            CREATE TABLE IF NOT EXISTS test_conditions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                requirement_id INTEGER NOT NULL REFERENCES requirements(id) ON DELETE CASCADE,
+                title TEXT NOT NULL,
+                description TEXT,
+                category TEXT NOT NULL DEFAULT 'functional',
+                risk_level TEXT NOT NULL DEFAULT 'medium',
+                status TEXT NOT NULL DEFAULT 'draft',
+                notes TEXT,
+                created_at TEXT NOT NULL);
+
+            CREATE TABLE IF NOT EXISTS test_cases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                requirement_id INTEGER REFERENCES requirements(id) ON DELETE SET NULL,
+                test_condition_id INTEGER REFERENCES test_conditions(id) ON DELETE SET NULL,
+                title TEXT NOT NULL,
+                objective TEXT,
+                preconditions TEXT,
+                steps TEXT,
+                test_data TEXT,
+                expected_result TEXT,
+                priority INTEGER NOT NULL DEFAULT 2,
+                automation_status TEXT NOT NULL DEFAULT 'manual',
+                created_at TEXT NOT NULL);
+
+            CREATE TABLE IF NOT EXISTS test_executions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                test_case_id INTEGER NOT NULL REFERENCES test_cases(id) ON DELETE CASCADE,
+                session_id INTEGER REFERENCES test_sessions(id) ON DELETE SET NULL,
+                build TEXT,
+                environment TEXT,
+                result TEXT NOT NULL DEFAULT 'not_run',
+                actual_result TEXT,
+                defect_id INTEGER,
+                executed_by_member_id INTEGER REFERENCES members(id),
+                notes TEXT,
+                executed_at TEXT NOT NULL);
+
+            CREATE TABLE IF NOT EXISTS artifacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_type TEXT NOT NULL,
+                entity_id INTEGER NOT NULL,
+                artifact_type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                path TEXT,
+                url TEXT,
+                details_json TEXT,
+                created_at TEXT NOT NULL);
         ''')
 
     def _create_indexes(self, connection):
@@ -482,6 +637,20 @@ class Database:
             CREATE INDEX IF NOT EXISTS planning_active_idx ON planning_conversations(owner_id, status);
             CREATE INDEX IF NOT EXISTS conversation_turns_owner_idx ON conversation_turns(owner_id, created_at);
             CREATE INDEX IF NOT EXISTS conversation_turns_shift_idx ON conversation_turns(shift_id, created_at);
+            CREATE INDEX IF NOT EXISTS workflow_stages_template_idx ON workflow_stages(template_id, stage_order);
+            CREATE INDEX IF NOT EXISTS work_item_meta_type_idx ON work_item_meta(entity_type, entity_id);
+            CREATE INDEX IF NOT EXISTS work_item_meta_stage_idx ON work_item_meta(current_stage_id);
+            CREATE INDEX IF NOT EXISTS work_item_meta_status_idx ON work_item_meta(operational_status);
+            CREATE INDEX IF NOT EXISTS work_item_meta_owner_idx ON work_item_meta(owner_member_id);
+            CREATE INDEX IF NOT EXISTS stage_history_entity_idx ON stage_history(entity_type, entity_id);
+            CREATE INDEX IF NOT EXISTS blockers_entity_idx ON blockers_dependencies(entity_type, entity_id, status);
+            CREATE INDEX IF NOT EXISTS blockers_waiting_member_idx ON blockers_dependencies(waiting_on_member_id, status);
+            CREATE INDEX IF NOT EXISTS requirements_status_idx ON requirements(status, priority);
+            CREATE INDEX IF NOT EXISTS test_conditions_req_idx ON test_conditions(requirement_id, status);
+            CREATE INDEX IF NOT EXISTS test_cases_req_idx ON test_cases(requirement_id);
+            CREATE INDEX IF NOT EXISTS test_cases_cond_idx ON test_cases(test_condition_id);
+            CREATE INDEX IF NOT EXISTS test_executions_case_idx ON test_executions(test_case_id, result);
+            CREATE INDEX IF NOT EXISTS artifacts_entity_idx ON artifacts(entity_type, entity_id);
         ''')
 
     def _ensure_columns(self, connection):
@@ -700,6 +869,67 @@ class Database:
             for row in connection.execute(f'SELECT id FROM {table} ORDER BY id').fetchall():
                 self._index_source_in_connection(connection, source_type, row['id'])
 
+    def _seed_v16_defaults(self, connection):
+        """Schema v16: Seed default workflow templates, standard stages, and roles."""
+        now = now_iso()
+        # Ensure default roles exist
+        roles = [
+            ('Lead Tester / QA', 'Quality Assurance engineer executing test suites and exploratory sessions'),
+            ('Developer', 'Software engineer building features and resolving defects'),
+            ('Support Engineer', 'Customer support specialist handling client interactions and tickets'),
+            ('Product Owner', 'Product manager defining requirements and acceptance criteria'),
+            ('DevOps / Infrastructure', 'Platform engineer managing environments and builds')
+        ]
+        for name, desc in roles:
+            connection.execute('INSERT OR IGNORE INTO roles (name, description, created_at) VALUES (?, ?, ?)',
+                               (name, desc, now))
+
+        # Ensure default requirement workflow template exists
+        connection.execute('''INSERT OR IGNORE INTO workflow_templates
+            (name, description, work_type, is_default, created_at)
+            VALUES (?, ?, ?, 1, ?)''',
+            ('Standard Feature Delivery', 'Complete lifecycle from analysis to live deployment', 'requirement', now))
+        row = connection.execute('SELECT id FROM workflow_templates WHERE name=?',
+                                 ('Standard Feature Delivery',)).fetchone()
+        if row:
+            template_id = row['id']
+            stages = [
+                (1, 'Requirement Analysis', 'Review user story, acceptance criteria, and refine test conditions', 'Product Owner', 4.0, 0),
+                (2, 'Test Design & Preparation', 'Author test cases, prepare test data, identify risks', 'Lead Tester / QA', 6.0, 0),
+                (3, 'Waiting for Development', 'Waiting for engineering build, implementation, or API delivery', 'Developer', 16.0, 1),
+                (4, 'Test Execution', 'Execute test suite, log evidence, record test executions', 'Lead Tester / QA', 8.0, 0),
+                (5, 'Defect Investigation', 'Investigate failures, triage blockers, notify engineers', 'Lead Tester / QA', 4.0, 0),
+                (6, 'Waiting for Client / Stakeholder', 'Awaiting client sign-off, staging review, or feedback', 'Support Engineer', 24.0, 1),
+                (7, 'Ready for Release', 'All criteria met, release notes and documentation attached', 'Product Owner', 2.0, 0),
+                (8, 'Closed / Deployed', 'Feature live in production with verified telemetry', None, 0.0, 0),
+            ]
+            for order, name, desc, role, dur, waiting in stages:
+                connection.execute('''INSERT OR IGNORE INTO workflow_stages
+                    (template_id, name, stage_order, description, expected_role, expected_duration_hours, is_waiting, is_active)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 1)''',
+                    (template_id, name, order, desc, role, dur, waiting))
+
+        # Defect Workflow Template
+        connection.execute('''INSERT OR IGNORE INTO workflow_templates
+            (name, description, work_type, is_default, created_at)
+            VALUES (?, ?, ?, 0, ?)''',
+            ('Bug / Defect Triage & Verification', 'End-to-end defect tracking and retesting workflow', 'defect', now))
+        bug_row = connection.execute('SELECT id FROM workflow_templates WHERE name=?',
+                                     ('Bug / Defect Triage & Verification',)).fetchone()
+        if bug_row:
+            b_id = bug_row['id']
+            bug_stages = [
+                (1, 'Triage & Reproduction', 'Confirm bug steps, capture environment details, assess severity', 'Lead Tester / QA', 2.0, 0),
+                (2, 'Waiting for Fix', 'Awaiting developer resolution or PR merge', 'Developer', 12.0, 1),
+                (3, 'Retest Verification', 'Retest on target build, verify against original steps', 'Lead Tester / QA', 3.0, 0),
+                (4, 'Resolved & Closed', 'Verified resolved, defect closed', None, 0.0, 0),
+            ]
+            for order, name, desc, role, dur, waiting in bug_stages:
+                connection.execute('''INSERT OR IGNORE INTO workflow_stages
+                    (template_id, name, stage_order, description, expected_role, expected_duration_hours, is_waiting, is_active)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 1)''',
+                    (b_id, name, order, desc, role, dur, waiting))
+
     def rebuild_work_memory_index(self):
         with self.connect() as conn:
             self._seed_v15_defaults(conn)
@@ -717,7 +947,11 @@ class Database:
             'report_provenance', 'nl_proposals', 'report_validations',
             'nl_corrections', 'plan_snapshots', 'record_links',
             'planning_conversations', 'conversation_turns',
-            'assistant_memory_summaries', 'fts_work_memory'
+            'assistant_memory_summaries', 'fts_work_memory',
+            'workflow_templates', 'workflow_stages', 'members', 'roles',
+            'member_roles', 'work_item_meta', 'stage_history',
+            'blockers_dependencies', 'requirements', 'test_conditions',
+            'test_cases', 'test_executions', 'artifacts'
         }
         rows = cursor.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         existing = {r['name'] if isinstance(r, sqlite3.Row) else r[0] for r in rows}
@@ -4120,4 +4354,586 @@ class Database:
                 rows = connection.execute(f'''SELECT * FROM fts_work_memory WHERE {where_clause}
                     ORDER BY rowid DESC LIMIT ?''', params).fetchall()
             return [dict(row) for row in rows]
+
+    # ==========================================================================
+    # Workflows, Members, Roles & Work Item Metadata Operations (Schema v16)
+    # ==========================================================================
+
+    def get_workflow_templates(self) -> list[dict]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM workflow_templates ORDER BY is_default DESC, id ASC").fetchall()
+            templates = [dict(r) for r in rows]
+            for tmpl in templates:
+                stg_rows = conn.execute(
+                    "SELECT * FROM workflow_stages WHERE template_id=? ORDER BY stage_order ASC",
+                    (tmpl['id'],)
+                ).fetchall()
+                tmpl['stages'] = [dict(s) for s in stg_rows]
+            return templates
+
+    def get_workflow_template(self, template_id: int) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM workflow_templates WHERE id=?", (template_id,)).fetchone()
+            if not row:
+                return None
+            tmpl = dict(row)
+            stg_rows = conn.execute(
+                "SELECT * FROM workflow_stages WHERE template_id=? ORDER BY stage_order ASC",
+                (template_id,)
+            ).fetchall()
+            tmpl['stages'] = [dict(s) for s in stg_rows]
+            return tmpl
+
+    def create_workflow_template(self, name: str, description: str | None = None,
+                                 work_type: str = 'requirement', is_default: bool = False,
+                                 stages: list[dict] | None = None) -> int:
+        now = now_iso()
+        with self.connect() as conn:
+            if is_default:
+                conn.execute("UPDATE workflow_templates SET is_default=0 WHERE work_type=?", (work_type,))
+            cur = conn.execute(
+                "INSERT INTO workflow_templates (name, description, work_type, is_default, created_at) VALUES (?, ?, ?, ?, ?)",
+                (name, description, work_type, 1 if is_default else 0, now)
+            )
+            template_id = cur.lastrowid
+            if stages:
+                for idx, stage in enumerate(stages, 1):
+                    conn.execute('''INSERT INTO workflow_stages
+                        (template_id, name, stage_order, description, expected_role, expected_duration_hours, is_waiting, is_active, required_artifacts_json, checklist_items_json)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)''',
+                        (template_id, stage['name'], stage.get('stage_order', idx),
+                         stage.get('description'), stage.get('expected_role'),
+                         stage.get('expected_duration_hours'), 1 if stage.get('is_waiting') else 0,
+                         json.dumps(stage.get('required_artifacts', [])),
+                         json.dumps(stage.get('checklist_items', []))))
+            return template_id
+
+    def get_roles(self) -> list[dict]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM roles ORDER BY name ASC").fetchall()
+            return [dict(r) for r in rows]
+
+    def add_role(self, name: str, description: str | None = None) -> int:
+        with self.connect() as conn:
+            cur = conn.execute("INSERT OR IGNORE INTO roles (name, description, created_at) VALUES (?, ?, ?)",
+                               (name, description, now_iso()))
+            if cur.lastrowid:
+                return cur.lastrowid
+            existing = conn.execute("SELECT id FROM roles WHERE name=?", (name,)).fetchone()
+            return existing['id']
+
+    def get_members(self) -> list[dict]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM members ORDER BY name ASC").fetchall()
+            members = [dict(r) for r in rows]
+            for m in members:
+                r_rows = conn.execute('''SELECT r.name FROM roles r
+                    JOIN member_roles mr ON mr.role_id=r.id WHERE mr.member_id=?''', (m['id'],)).fetchall()
+                m['roles'] = [row['name'] for row in r_rows]
+            return members
+
+    def get_member(self, member_id: int) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM members WHERE id=?", (member_id,)).fetchone()
+            if not row:
+                return None
+            m = dict(row)
+            r_rows = conn.execute('''SELECT r.name FROM roles r
+                JOIN member_roles mr ON mr.role_id=r.id WHERE mr.member_id=?''', (member_id,)).fetchall()
+            m['roles'] = [row['name'] for row in r_rows]
+            return m
+
+    def add_member(self, name: str, email: str | None = None,
+                   telegram_handle: str | None = None, notes: str | None = None,
+                   roles: list[str] | None = None) -> int:
+        now = now_iso()
+        with self.connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO members (name, email, telegram_handle, notes, created_at) VALUES (?, ?, ?, ?, ?)",
+                (name, email, telegram_handle, notes, now)
+            )
+            member_id = cur.lastrowid
+            if roles:
+                for role_name in roles:
+                    r_row = conn.execute("SELECT id FROM roles WHERE name=?", (role_name,)).fetchone()
+                    if r_row:
+                        conn.execute("INSERT OR IGNORE INTO member_roles (member_id, role_id) VALUES (?, ?)",
+                                     (member_id, r_row['id']))
+            return member_id
+
+    def get_work_item_meta(self, entity_type: str, entity_id: int) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute('''SELECT m.*, t.name AS template_name, s.name AS stage_name, s.is_waiting,
+                mem.name AS owner_name
+                FROM work_item_meta m
+                LEFT JOIN workflow_templates t ON t.id=m.workflow_template_id
+                LEFT JOIN workflow_stages s ON s.id=m.current_stage_id
+                LEFT JOIN members mem ON mem.id=m.owner_member_id
+                WHERE m.entity_type=? AND m.entity_id=?''', (entity_type, entity_id)).fetchone()
+            return dict(row) if row else None
+
+    def upsert_work_item_meta(self, entity_type: str, entity_id: int, **kwargs) -> dict:
+        now = now_iso()
+        with self.connect() as conn:
+            existing = conn.execute(
+                "SELECT * FROM work_item_meta WHERE entity_type=? AND entity_id=?",
+                (entity_type, entity_id)
+            ).fetchone()
+            if existing:
+                updates = []
+                params = []
+                for k, v in kwargs.items():
+                    if k in ('workflow_template_id', 'current_stage_id', 'operational_status',
+                             'owner_member_id', 'target_role', 'estimated_hours', 'actual_hours',
+                             'due_date', 'next_action', 'completion_note'):
+                        updates.append(f"{k}=?")
+                        params.append(v)
+                updates.append("updated_at=?")
+                params.append(now)
+                params.extend([entity_type, entity_id])
+                conn.execute(f"UPDATE work_item_meta SET {', '.join(updates)} WHERE entity_type=? AND entity_id=?", params)
+            else:
+                conn.execute('''INSERT INTO work_item_meta
+                    (entity_type, entity_id, workflow_template_id, current_stage_id, operational_status,
+                     owner_member_id, target_role, estimated_hours, actual_hours, due_date, next_action,
+                     completion_note, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                    (entity_type, entity_id, kwargs.get('workflow_template_id'),
+                     kwargs.get('current_stage_id'), kwargs.get('operational_status', 'active'),
+                     kwargs.get('owner_member_id'), kwargs.get('target_role'),
+                     kwargs.get('estimated_hours'), kwargs.get('actual_hours'),
+                     kwargs.get('due_date'), kwargs.get('next_action'),
+                     kwargs.get('completion_note'), now, now))
+        return self.get_work_item_meta(entity_type, entity_id)
+
+    def transition_stage(self, entity_type: str, entity_id: int, new_stage_id: int,
+                         actor_member_id: int | None = None, note: str | None = None) -> bool:
+        now = now_iso()
+        with self.connect() as conn:
+            # Check current stage
+            meta = conn.execute(
+                "SELECT current_stage_id, workflow_template_id FROM work_item_meta WHERE entity_type=? AND entity_id=?",
+                (entity_type, entity_id)
+            ).fetchone()
+            if meta and meta['current_stage_id']:
+                conn.execute('''UPDATE stage_history SET exited_at=?
+                    WHERE entity_type=? AND entity_id=? AND stage_id=? AND exited_at IS NULL''',
+                    (now, entity_type, entity_id, meta['current_stage_id']))
+
+            # Insert new stage history
+            conn.execute('''INSERT INTO stage_history
+                (entity_type, entity_id, stage_id, entered_at, actor_member_id, note)
+                VALUES (?, ?, ?, ?, ?, ?)''',
+                (entity_type, entity_id, new_stage_id, now, actor_member_id, note))
+
+            # Fetch stage info to determine waiting
+            stg = conn.execute("SELECT is_waiting, name FROM workflow_stages WHERE id=?", (new_stage_id,)).fetchone()
+            is_waiting = bool(stg['is_waiting']) if stg else False
+
+            # Update meta
+            if meta:
+                conn.execute('''UPDATE work_item_meta SET current_stage_id=?, updated_at=?,
+                    operational_status = CASE WHEN operational_status IN ('completed', 'cancelled') THEN operational_status
+                                              WHEN ? = 1 THEN 'waiting'
+                                              ELSE 'active' END
+                    WHERE entity_type=? AND entity_id=?''',
+                    (new_stage_id, now, 1 if is_waiting else 0, entity_type, entity_id))
+            else:
+                conn.execute('''INSERT INTO work_item_meta
+                    (entity_type, entity_id, current_stage_id, operational_status, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)''',
+                    (entity_type, entity_id, new_stage_id, 'waiting' if is_waiting else 'active', now, now))
+            return True
+
+    def get_stage_history(self, entity_type: str, entity_id: int) -> list[dict]:
+        with self.connect() as conn:
+            rows = conn.execute('''SELECT h.*, s.name AS stage_name, m.name AS actor_name
+                FROM stage_history h
+                JOIN workflow_stages s ON s.id=h.stage_id
+                LEFT JOIN members m ON m.id=h.actor_member_id
+                WHERE h.entity_type=? AND h.entity_id=?
+                ORDER BY h.id ASC''', (entity_type, entity_id)).fetchall()
+            return [dict(r) for r in rows]
+
+    # Blockers and Dependencies
+    def add_blocker_dependency(self, entity_type: str, entity_id: int, dependency_type: str,
+                               description: str, waiting_on_member_id: int | None = None,
+                               waiting_on_role: str | None = None, target_entity_type: str | None = None,
+                               target_entity_id: int | None = None,
+                               expected_resolution_date: str | None = None) -> int:
+        now = now_iso()
+        with self.connect() as conn:
+            cur = conn.execute('''INSERT INTO blockers_dependencies
+                (entity_type, entity_id, dependency_type, description, waiting_on_member_id,
+                 waiting_on_role, target_entity_type, target_entity_id, status, started_at,
+                 expected_resolution_date)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)''',
+                (entity_type, entity_id, dependency_type, description, waiting_on_member_id,
+                 waiting_on_role, target_entity_type, target_entity_id, now, expected_resolution_date))
+            # Automatically update operational_status to blocked if active
+            conn.execute('''UPDATE work_item_meta SET operational_status='blocked', updated_at=?
+                WHERE entity_type=? AND entity_id=? AND operational_status NOT IN ('completed','cancelled')''',
+                (now, entity_type, entity_id))
+            return cur.lastrowid
+
+    def resolve_blocker(self, blocker_id: int, resolution_notes: str | None = None) -> bool:
+        now = now_iso()
+        with self.connect() as conn:
+            b = conn.execute("SELECT * FROM blockers_dependencies WHERE id=?", (blocker_id,)).fetchone()
+            if not b:
+                return False
+            conn.execute('''UPDATE blockers_dependencies
+                SET status='resolved', resolved_at=?, resolution_notes=? WHERE id=?''',
+                (now, resolution_notes, blocker_id))
+            # Check if any other active blockers remain for this entity
+            active = conn.execute(
+                "SELECT COUNT(*) AS c FROM blockers_dependencies WHERE entity_type=? AND entity_id=? AND status='active'",
+                (b['entity_type'], b['entity_id'])
+            ).fetchone()['c']
+            if active == 0:
+                conn.execute('''UPDATE work_item_meta SET operational_status='active', updated_at=?
+                    WHERE entity_type=? AND entity_id=? AND operational_status='blocked' ''',
+                    (now, b['entity_type'], b['entity_id']))
+            return True
+
+    def get_blockers(self, entity_type: str | None = None, entity_id: int | None = None,
+                     status: str | None = 'active') -> list[dict]:
+        with self.connect() as conn:
+            query = '''SELECT b.*, m.name AS waiting_on_name
+                FROM blockers_dependencies b
+                LEFT JOIN members m ON m.id=b.waiting_on_member_id WHERE 1=1'''
+            params = []
+            if entity_type and entity_id is not None:
+                query += " AND b.entity_type=? AND b.entity_id=?"
+                params.extend([entity_type, entity_id])
+            if status:
+                query += " AND b.status=?"
+                params.append(status)
+            query += " ORDER BY b.id DESC"
+            rows = conn.execute(query, params).fetchall()
+            return [dict(r) for r in rows]
+
+    # Requirements
+    def create_requirement(self, title: str, description: str | None = None,
+                           requirement_text: str | None = None, user_story: str | None = None,
+                           acceptance_criteria: str | None = None, client: str | None = None,
+                           product: str | None = None, ticket: str | None = None,
+                           priority: int = 1, due_date: str | None = None,
+                           owner_member_id: int | None = None, workflow_template_id: int | None = None) -> int:
+        now = now_iso()
+        with self.connect() as conn:
+            cur = conn.execute('''INSERT INTO requirements
+                (title, description, requirement_text, user_story, acceptance_criteria, client, product,
+                 ticket, priority, due_date, owner_member_id, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)''',
+                (title, description, requirement_text, user_story, acceptance_criteria, client, product,
+                 ticket, priority, due_date, owner_member_id, now, now))
+            req_id = cur.lastrowid
+
+            # Attach default or specified workflow template
+            tmpl_id = workflow_template_id
+            first_stage_id = None
+            if not tmpl_id:
+                default_tmpl = conn.execute(
+                    "SELECT id FROM workflow_templates WHERE work_type='requirement' AND is_default=1"
+                ).fetchone()
+                if default_tmpl:
+                    tmpl_id = default_tmpl['id']
+            if tmpl_id:
+                fstg = conn.execute(
+                    "SELECT id FROM workflow_stages WHERE template_id=? ORDER BY stage_order ASC LIMIT 1",
+                    (tmpl_id,)
+                ).fetchone()
+                if fstg:
+                    first_stage_id = fstg['id']
+
+            conn.execute('''INSERT INTO work_item_meta
+                (entity_type, entity_id, workflow_template_id, current_stage_id, operational_status,
+                 owner_member_id, due_date, created_at, updated_at)
+                VALUES ('requirement', ?, ?, ?, 'active', ?, ?, ?, ?)''',
+                (req_id, tmpl_id, first_stage_id, owner_member_id, due_date, now, now))
+
+            if first_stage_id:
+                conn.execute('''INSERT INTO stage_history
+                    (entity_type, entity_id, stage_id, entered_at, note)
+                    VALUES ('requirement', ?, ?, ?, 'Initial requirement creation')''',
+                    (req_id, first_stage_id, now))
+
+            self._fts_replace(conn, 'requirement', req_id, title,
+                              f"Requirement #{req_id}: {title} {description or ''} {acceptance_criteria or ''}",
+                              client=client, product=product, created_at=now)
+            return req_id
+
+    def get_requirement(self, req_id: int) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute('''SELECT r.*, m.name AS owner_name, meta.workflow_template_id,
+                meta.current_stage_id, meta.operational_status, stg.name AS current_stage_name,
+                stg.is_waiting AS current_stage_is_waiting, tmpl.name AS workflow_template_name
+                FROM requirements r
+                LEFT JOIN members m ON m.id=r.owner_member_id
+                LEFT JOIN work_item_meta meta ON meta.entity_type='requirement' AND meta.entity_id=r.id
+                LEFT JOIN workflow_stages stg ON stg.id=meta.current_stage_id
+                LEFT JOIN workflow_templates tmpl ON tmpl.id=meta.workflow_template_id
+                WHERE r.id=?''', (req_id,)).fetchone()
+            if not row:
+                return None
+            req = dict(row)
+            # Test conditions
+            tc_rows = conn.execute("SELECT * FROM test_conditions WHERE requirement_id=? ORDER BY id ASC", (req_id,)).fetchall()
+            req['test_conditions'] = [dict(tc) for tc in tc_rows]
+            # Test cases
+            tcase_rows = conn.execute("SELECT * FROM test_cases WHERE requirement_id=? ORDER BY id ASC", (req_id,)).fetchall()
+            req['test_cases'] = [dict(tc) for tc in tcase_rows]
+            # Active blockers
+            req['blockers'] = self.get_blockers('requirement', req_id, status='active')
+            return req
+
+    def list_requirements(self, status: str | None = None) -> list[dict]:
+        with self.connect() as conn:
+            query = '''SELECT r.*, m.name AS owner_name, meta.workflow_template_id,
+                meta.current_stage_id, meta.operational_status, stg.name AS current_stage_name,
+                tmpl.name AS workflow_template_name
+                FROM requirements r
+                LEFT JOIN members m ON m.id=r.owner_member_id
+                LEFT JOIN work_item_meta meta ON meta.entity_type='requirement' AND meta.entity_id=r.id
+                LEFT JOIN workflow_stages stg ON stg.id=meta.current_stage_id
+                LEFT JOIN workflow_templates tmpl ON tmpl.id=meta.workflow_template_id'''
+            params = []
+            if status:
+                query += " WHERE r.status=?"
+                params.append(status)
+            query += " ORDER BY r.priority DESC, r.id DESC"
+            rows = conn.execute(query, params).fetchall()
+            res = []
+            for r in rows:
+                item = dict(r)
+                item['conditions_count'] = conn.execute(
+                    "SELECT COUNT(*) AS c FROM test_conditions WHERE requirement_id=?", (item['id'],)
+                ).fetchone()['c']
+                item['test_cases_count'] = conn.execute(
+                    "SELECT COUNT(*) AS c FROM test_cases WHERE requirement_id=?", (item['id'],)
+                ).fetchone()['c']
+                res.append(item)
+            return res
+
+    # Test Conditions & Cases
+    def add_test_condition(self, requirement_id: int, title: str, description: str | None = None,
+                           category: str = 'functional', risk_level: str = 'medium',
+                           status: str = 'draft', notes: str | None = None) -> int:
+        now = now_iso()
+        with self.connect() as conn:
+            cur = conn.execute('''INSERT INTO test_conditions
+                (requirement_id, title, description, category, risk_level, status, notes, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                (requirement_id, title, description, category, risk_level, status, notes, now))
+            return cur.lastrowid
+
+    def update_test_condition_status(self, condition_id: int, status: str) -> bool:
+        with self.connect() as conn:
+            res = conn.execute("UPDATE test_conditions SET status=? WHERE id=?", (status, condition_id))
+            return res.rowcount > 0
+
+    def add_test_case(self, title: str, requirement_id: int | None = None,
+                      test_condition_id: int | None = None, objective: str | None = None,
+                      preconditions: str | None = None, steps: str | None = None,
+                      test_data: str | None = None, expected_result: str | None = None,
+                      priority: int = 2, automation_status: str = 'manual') -> int:
+        now = now_iso()
+        with self.connect() as conn:
+            cur = conn.execute('''INSERT INTO test_cases
+                (requirement_id, test_condition_id, title, objective, preconditions, steps,
+                 test_data, expected_result, priority, automation_status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                (requirement_id, test_condition_id, title, objective, preconditions, steps,
+                 test_data, expected_result, priority, automation_status, now))
+            return cur.lastrowid
+
+    def list_test_cases(self, requirement_id: int | None = None) -> list[dict]:
+        with self.connect() as conn:
+            query = '''SELECT tc.*, r.title AS requirement_title, cond.title AS condition_title
+                FROM test_cases tc
+                LEFT JOIN requirements r ON r.id=tc.requirement_id
+                LEFT JOIN test_conditions cond ON cond.id=tc.test_condition_id'''
+            params = []
+            if requirement_id:
+                query += " WHERE tc.requirement_id=?"
+                params.append(requirement_id)
+            query += " ORDER BY tc.id DESC"
+            rows = conn.execute(query, params).fetchall()
+            cases = []
+            for r in rows:
+                item = dict(r)
+                # Latest execution result
+                latest = conn.execute(
+                    "SELECT result, build, executed_at FROM test_executions WHERE test_case_id=? ORDER BY id DESC LIMIT 1",
+                    (item['id'],)
+                ).fetchone()
+                if latest:
+                    item['latest_result'] = latest['result']
+                    item['latest_build'] = latest['build']
+                    item['latest_executed_at'] = latest['executed_at']
+                else:
+                    item['latest_result'] = 'not_run'
+                cases.append(item)
+            return cases
+
+    def record_test_execution(self, test_case_id: int, result: str, build: str | None = None,
+                              environment: str | None = None, actual_result: str | None = None,
+                              defect_id: int | None = None, executed_by_member_id: int | None = None,
+                              notes: str | None = None, session_id: int | None = None) -> int:
+        now = now_iso()
+        with self.connect() as conn:
+            cur = conn.execute('''INSERT INTO test_executions
+                (test_case_id, session_id, build, environment, result, actual_result, defect_id,
+                 executed_by_member_id, notes, executed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                (test_case_id, session_id, build, environment, result, actual_result, defect_id,
+                 executed_by_member_id, notes, now))
+            return cur.lastrowid
+
+    # Unified Work Items Aggregator
+    def get_all_work_items(self) -> list[dict]:
+        """
+        Unified aggregator combining Tasks, Cases, and Requirements into cohesive Work Item records.
+        """
+        with self.connect() as conn:
+            items = []
+
+            # 1. Requirements
+            reqs = conn.execute('''SELECT r.id, r.title, r.client, r.product, r.ticket, r.priority,
+                r.due_date, r.created_at, r.updated_at, m.name AS owner_name, m.id AS owner_member_id,
+                meta.workflow_template_id, meta.current_stage_id, meta.operational_status,
+                meta.next_action, stg.name AS stage_name, tmpl.name AS template_name
+                FROM requirements r
+                LEFT JOIN work_item_meta meta ON meta.entity_type='requirement' AND meta.entity_id=r.id
+                LEFT JOIN workflow_stages stg ON stg.id=meta.current_stage_id
+                LEFT JOIN workflow_templates tmpl ON tmpl.id=meta.workflow_template_id
+                LEFT JOIN members m ON m.id=meta.owner_member_id
+                ORDER BY r.id DESC''').fetchall()
+            for r in reqs:
+                items.append({
+                    'entity_type': 'requirement',
+                    'entity_id': r['id'],
+                    'display_id': f"REQ-{r['id']}",
+                    'title': r['title'],
+                    'operational_status': r['operational_status'] or 'active',
+                    'workflow_template_id': r['workflow_template_id'],
+                    'workflow_template_name': r['template_name'],
+                    'current_stage_id': r['current_stage_id'],
+                    'current_stage_name': r['stage_name'],
+                    'priority': r['priority'],
+                    'client': r['client'],
+                    'product': r['product'],
+                    'ticket': r['ticket'],
+                    'owner_member_id': r['owner_member_id'],
+                    'owner_name': r['owner_name'],
+                    'due_date': r['due_date'],
+                    'next_action': r['next_action'],
+                    'created_at': r['created_at'],
+                    'updated_at': r['updated_at'],
+                })
+
+            # 2. Cases
+            cases = conn.execute('''SELECT c.id, c.title, cl.name AS client, c.product, c.platform, c.ticket,
+                c.priority, c.status, c.participation, c.next_action, c.waiting_on, c.created_at, c.updated_at,
+                meta.workflow_template_id, meta.current_stage_id, meta.operational_status,
+                stg.name AS stage_name, tmpl.name AS template_name, m.name AS owner_name, m.id AS owner_member_id
+                FROM work_cases c
+                LEFT JOIN clients cl ON cl.id=c.client_id
+                LEFT JOIN work_item_meta meta ON meta.entity_type='case' AND meta.entity_id=c.id
+                LEFT JOIN workflow_stages stg ON stg.id=meta.current_stage_id
+                LEFT JOIN workflow_templates tmpl ON tmpl.id=meta.workflow_template_id
+                LEFT JOIN members m ON m.id=meta.owner_member_id
+                WHERE c.review_state='approved'
+                ORDER BY c.id DESC''').fetchall()
+            for c in cases:
+                op_status = c['operational_status']
+                if not op_status:
+                    if c['status'] in ('resolved', 'closed'):
+                        op_status = 'completed'
+                    elif c['status'] in ('waiting_client', 'waiting_internal'):
+                        op_status = 'waiting'
+                    else:
+                        op_status = 'active'
+                items.append({
+                    'entity_type': 'case',
+                    'entity_id': c['id'],
+                    'display_id': f"CASE-{c['id']}",
+                    'title': c['title'],
+                    'operational_status': op_status,
+                    'workflow_template_id': c['workflow_template_id'],
+                    'workflow_template_name': c['template_name'],
+                    'current_stage_id': c['current_stage_id'],
+                    'current_stage_name': c['stage_name'] or c['status'],
+                    'priority': c['priority'],
+                    'client': c['client'],
+                    'product': c['product'],
+                    'ticket': c['ticket'],
+                    'owner_member_id': c['owner_member_id'],
+                    'owner_name': c['owner_name'],
+                    'waiting_on': c['waiting_on'],
+                    'due_date': None,
+                    'next_action': c['next_action'],
+                    'created_at': c['created_at'],
+                    'updated_at': c['updated_at'],
+                })
+
+            # 3. Tasks
+            tasks = conn.execute('''SELECT t.id, t.title, t.status, t.priority, t.due_date, t.project,
+                t.client, t.ticket, t.next_action, t.created_at, t.completed_at, t.blocked_reason,
+                meta.workflow_template_id, meta.current_stage_id, meta.operational_status,
+                stg.name AS stage_name, tmpl.name AS template_name, m.name AS owner_name, m.id AS owner_member_id
+                FROM tasks t
+                LEFT JOIN work_item_meta meta ON meta.entity_type='task' AND meta.entity_id=t.id
+                LEFT JOIN workflow_stages stg ON stg.id=meta.current_stage_id
+                LEFT JOIN workflow_templates tmpl ON tmpl.id=meta.workflow_template_id
+                LEFT JOIN members m ON m.id=meta.owner_member_id
+                ORDER BY t.id DESC''').fetchall()
+            for t in tasks:
+                op_status = t['operational_status']
+                if not op_status:
+                    if t['status'] == 'completed':
+                        op_status = 'completed'
+                    elif t['status'] == 'blocked':
+                        op_status = 'blocked'
+                    elif t['status'] == 'cancelled':
+                        op_status = 'cancelled'
+                    elif t['status'] == 'in_progress':
+                        op_status = 'active'
+                    else:
+                        op_status = 'pending'
+                items.append({
+                    'entity_type': 'task',
+                    'entity_id': t['id'],
+                    'display_id': f"TASK-{t['id']}",
+                    'title': t['title'],
+                    'operational_status': op_status,
+                    'workflow_template_id': t['workflow_template_id'],
+                    'workflow_template_name': t['template_name'],
+                    'current_stage_id': t['current_stage_id'],
+                    'current_stage_name': t['stage_name'] or t['status'],
+                    'priority': t['priority'],
+                    'client': t['client'],
+                    'product': t['project'],
+                    'ticket': t['ticket'],
+                    'owner_member_id': t['owner_member_id'],
+                    'owner_name': t['owner_name'],
+                    'due_date': t['due_date'],
+                    'next_action': t['next_action'],
+                    'created_at': t['created_at'],
+                    'updated_at': t['completed_at'] or t['created_at'],
+                })
+
+            # Check active blockers count for each item
+            for it in items:
+                b_count = conn.execute(
+                    "SELECT COUNT(*) AS c FROM blockers_dependencies WHERE entity_type=? AND entity_id=? AND status='active'",
+                    (it['entity_type'], it['entity_id'])
+                ).fetchone()['c']
+                it['active_blockers_count'] = b_count
+                if b_count > 0:
+                    it['is_blocked'] = True
+
+            return items
+
 

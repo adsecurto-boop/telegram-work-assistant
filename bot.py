@@ -82,6 +82,8 @@ async def startup(application):
         BotCommand('pl','Create pre-lunch report'), BotCommand('eod','Create EOD report'),
         BotCommand('summary','Preview current shift'), BotCommand('week','Weekly summary'),
         BotCommand('cases','Show active work cases'), BotCommand('inbox','Review imported work'),
+        BotCommand('workitems','Unified work items hub'), BotCommand('blockers','Show active blockers'),
+        BotCommand('testcases','Structured test suite'), BotCommand('team','Operational team directory'),
         BotCommand('followups','Show pending follow-ups'), BotCommand('dashboard','Open local dashboard'),
         BotCommand('search','Search work history'), BotCommand('health','Check bot health'),
         BotCommand('help','Show all commands')])

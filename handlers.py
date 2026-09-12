@@ -63,6 +63,14 @@ Say “delete all tasks” to delete tasks immediately with Undo.
 /shifttemplate — List shift templates
 /clusters — Historical message cluster suggestions
 /bulkhelp — Bulk inbox and clustering help
+/workitems [status] — Unified list across requirements, tasks, cases
+/blockers — View all active operational blockers
+/blockitem TYPE ID DEP_TYPE | REASON — Log a blocker against a work item
+/unblock ID [notes] — Resolve a blocker
+/requirement TITLE | CLIENT | TICKET | STORY — Create a requirement
+/testcases [REQ_ID] — List test cases
+/testrun TC_ID PASS|FAIL|BLOCKED [notes] — Record a test execution
+/team — List team personnel and roles
 
 Existing Slash Commands:
 /shift [start] [end], /schedule END [LUNCH], /status, /default START END, /preset
@@ -1722,6 +1730,138 @@ async def handle(update, context):
             await reply(update, briefing_msg)
         elif command == 'health':
             await reply(update, await health_text(context))
+
+        # --- Phase B: Tester + Support Work Operations Hub Commands ---
+        elif command == 'workitems':
+            from application.work_item_service import WorkItemService
+            wis = WorkItemService(db(context))
+            items = await asyncio.to_thread(wis.list_work_items)
+            status_arg = args[0].lower() if args else None
+            if status_arg:
+                items = [i for i in items if i.get('operational_status') == status_arg or i.get('entity_type') == status_arg]
+            if not items:
+                await reply(update, f"No work items found{' matching ' + status_arg if status_arg else ''}.")
+            else:
+                lines = [f"📋 Work Items ({len(items)}):"]
+                for it in items[:15]:
+                    disp_id = it.get('display_id') or f"{it['entity_type'].upper()}-{it['entity_id']}"
+                    op_st = it.get('operational_status') or 'active'
+                    stage = it.get('current_stage_name') or it.get('status') or '—'
+                    owner = it.get('owner_name') or 'Unassigned'
+                    lines.append(f"• {disp_id} [{it['entity_type']}] [{stage} / {op_st}]: {it['title']} (Owner: {owner})")
+                if len(items) > 15:
+                    lines.append(f"... and {len(items)-15} more in /dashboard.")
+                await reply(update, '\n'.join(lines))
+
+        elif command == 'blockers':
+            from application.work_item_service import WorkItemService
+            wis = WorkItemService(db(context))
+            blockers = await asyncio.to_thread(wis.get_blockers, status='active')
+            if not blockers:
+                await reply(update, "✅ No active blockers or dependencies recorded.")
+            else:
+                lines = [f"🚨 Active Blockers ({len(blockers)}):"]
+                for b in blockers:
+                    lines.append(f"• #{b['id']} on {b['entity_type'].upper()} #{b['entity_id']} [{b['dependency_type']}]: {b['description']}")
+                lines.append("\nResolve via /unblock ID [notes]")
+                await reply(update, '\n'.join(lines))
+
+        elif command == 'blockitem':
+            # Syntax: /blockitem <task|case|req> <ID> <dependency_type> | <description>
+            if not argument or '|' not in argument:
+                raise ValueError("Usage: /blockitem <task|case|req> <ID> <type> | <description>")
+            head_part, _, desc_part = argument.partition('|')
+            tokens = head_part.strip().split()
+            if len(tokens) < 3:
+                raise ValueError("Usage: /blockitem <task|case|req> <ID> <type> | <description>")
+            etype = tokens[0].lower()
+            if etype in ('req', 'requirement', 'requirements'):
+                etype = 'requirement'
+            elif etype in ('task', 'tasks'):
+                etype = 'task'
+            elif etype in ('case', 'cases'):
+                etype = 'case'
+            else:
+                raise ValueError("Entity type must be task, case, or requirement.")
+            eid = int(tokens[1])
+            deptype = tokens[2].lower()
+            desc = desc_part.strip()
+            if not desc:
+                raise ValueError("Blocker description is required.")
+            from application.work_item_service import WorkItemService
+            wis = WorkItemService(db(context))
+            bid = await asyncio.to_thread(wis.add_blocker, etype, eid, deptype, desc)
+            await reply(update, f"🚨 Blocker #{bid} logged against {etype.upper()} #{eid}.")
+
+        elif command == 'unblock':
+            # Syntax: /unblock <blocker_id> [resolution notes]
+            if not args or not args[0].isdigit():
+                raise ValueError("Usage: /unblock <blocker_id> [resolution notes]")
+            bid = int(args[0])
+            notes = ' '.join(args[1:]) if len(args) > 1 else None
+            from application.work_item_service import WorkItemService
+            wis = WorkItemService(db(context))
+            ok = await asyncio.to_thread(wis.resolve_blocker, bid, resolution_notes=notes)
+            if ok:
+                await reply(update, f"✅ Blocker #{bid} resolved.")
+            else:
+                await reply(update, f"Could not resolve blocker #{bid}. Check /blockers.")
+
+        elif command == 'requirement':
+            # Syntax: /requirement <title> | client | ticket | user_story
+            if not argument:
+                raise ValueError("Usage: /requirement <title> | client | ticket | user_story")
+            parts = [p.strip() for p in argument.split('|')]
+            title = parts[0]
+            client = parts[1] if len(parts) > 1 and parts[1] else None
+            ticket = parts[2] if len(parts) > 2 and parts[2] else None
+            user_story = parts[3] if len(parts) > 3 and parts[3] else None
+            from application.work_item_service import WorkItemService
+            wis = WorkItemService(db(context))
+            rid = await asyncio.to_thread(wis.create_requirement, title=title, client=client, ticket=ticket, user_story=user_story)
+            await reply(update, f"📋 Requirement REQ-{rid} created: {title}")
+
+        elif command == 'testcases':
+            req_id = int(args[0]) if args and args[0].isdigit() else None
+            from application.work_item_service import WorkItemService
+            wis = WorkItemService(db(context))
+            tcs = await asyncio.to_thread(wis.list_test_cases, requirement_id=req_id)
+            if not tcs:
+                await reply(update, f"No test cases found{' for REQ-' + str(req_id) if req_id else ''}.")
+            else:
+                lines = [f"🧪 Test Cases ({len(tcs)}):"]
+                for tc in tcs[:15]:
+                    last_res = tc.get('last_execution_result') or 'not_run'
+                    req_ref = f" [REQ-{tc['requirement_id']}]" if tc.get('requirement_id') else ""
+                    lines.append(f"• TC-{tc['id']}{req_ref} [{last_res.upper()}]: {tc['title']}")
+                await reply(update, '\n'.join(lines))
+
+        elif command == 'testrun':
+            # Syntax: /testrun <test_case_id> <pass|fail|blocked> [actual result note]
+            if len(args) < 2 or not args[0].isdigit():
+                raise ValueError("Usage: /testrun <test_case_id> <pass|fail|blocked> [actual result notes]")
+            tc_id = int(args[0])
+            result = args[1].lower()
+            if result not in ('pass', 'fail', 'blocked'):
+                raise ValueError("Result must be pass, fail, or blocked.")
+            actual = ' '.join(args[2:]) if len(args) > 2 else None
+            from application.work_item_service import WorkItemService
+            wis = WorkItemService(db(context))
+            eid = await asyncio.to_thread(wis.record_test_execution, test_case_id=tc_id, result=result, actual_result=actual)
+            await reply(update, f"🧪 Test Execution #{eid} logged: TC-{tc_id} -> {result.upper()}.")
+
+        elif command == 'team':
+            from application.member_service import MemberService
+            ms = MemberService(db(context))
+            members = await asyncio.to_thread(ms.get_members)
+            if not members:
+                await reply(update, "No team members configured. Add via /dashboard.")
+            else:
+                lines = [f"👥 Team Members ({len(members)}):"]
+                for m in members:
+                    r_str = ', '.join(m.get('roles', [])) or 'No role'
+                    lines.append(f"• {m['name']} ({r_str}) — {m.get('telegram_handle') or m.get('email') or 'No contact'}")
+                await reply(update, '\n'.join(lines))
 
         else:
             await reply(update, 'Unknown command. Use /help.')

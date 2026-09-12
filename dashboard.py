@@ -4,6 +4,7 @@ from __future__ import annotations
 import html
 import json
 import mimetypes
+import os
 import re
 import secrets
 import threading
@@ -18,6 +19,9 @@ from zoneinfo import ZoneInfo
 import config
 from domain import CASE_STATUSES
 from shifts import assign_template_range, check_missing_shift_assignments, format_shift_preview, preview_calendar_week
+from application.work_item_service import WorkItemService
+from application.workflow_service import WorkflowService
+from application.member_service import MemberService
 
 STATUSES = (
     'new', 'triaged', 'investigating', 'waiting_client', 'waiting_internal',
@@ -56,6 +60,9 @@ class DashboardService:
         self.port = int(port)
         self.token = database.get_setting('dashboard_token') or secrets.token_urlsafe(24)
         database.set_setting('dashboard_token', self.token)
+        self.work_item_service = WorkItemService(database)
+        self.workflow_service = WorkflowService(database)
+        self.member_service = MemberService(database)
         self.server = None
         self.thread = None
         self._lock = threading.RLock()
@@ -148,6 +155,11 @@ class DashboardService:
                     session = service.get_session(sid)
                     return True, sid, session['csrf_token'], False
 
+                token_hdr = self.headers.get('X-Dashboard-Token')
+                if token_hdr and secrets.compare_digest(token_hdr, service.token):
+                    new_sid, csrf = service.create_session()
+                    return True, new_sid, csrf, False
+
                 supplied_token = (params.get('token') or [''])[0]
                 if supplied_token and secrets.compare_digest(supplied_token, service.token):
                     new_sid, csrf = service.create_session()
@@ -156,12 +168,16 @@ class DashboardService:
                 return False, None, None, False
 
             def send_html(self, body: str, status=200, set_sid: str | None = None):
+                set_sid = set_sid or getattr(self, 'pending_sid', None)
                 content = body.encode('utf-8')
                 self.send_response(status)
                 self.send_header('Content-Type', 'text/html; charset=utf-8')
                 self.send_header('Content-Length', str(len(content)))
                 self.send_header('Cache-Control', 'no-store')
-                self.send_header('X-Frame-Options', 'DENY')
+                if os.getenv('ALLOW_IFRAME', 'true').lower() in ('true', '1', 'yes'):
+                    self.send_header('X-Frame-Options', 'SAMEORIGIN')
+                else:
+                    self.send_header('X-Frame-Options', 'DENY')
                 self.send_header('X-Content-Type-Options', 'nosniff')
                 self.send_header('Referrer-Policy', 'same-origin')
                 self.send_header('Content-Security-Policy', "default-src 'self' 'unsafe-inline'")
@@ -170,10 +186,14 @@ class DashboardService:
                 self.end_headers()
                 self.wfile.write(content)
 
-            def page(self, content, title='Work Assistant', csrf_token: str = ''):
+            def page(self, content, title='Work Operations Hub', csrf_token: str = ''):
                 return f'''<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{h(title)}</title><style>
+<title>{h(title)}</title>
+<meta name="description" content="Personal Work Assistant and Operations Hub with Telegram integration, tracking, and diagnostics.">
+<meta property="og:title" content="{h(title)}">
+<meta property="og:description" content="Personal Work Assistant and Operations Hub with Telegram integration, tracking, and diagnostics.">
+<style>
 body{{font:14px system-ui,-apple-system,sans-serif;margin:0;background:#f4f6f8;color:#17212b}}
 header{{background:#17212b;color:white;padding:14px 4%;box-shadow:0 2px 4px rgba(0,0,0,0.1)}}
 main{{max-width:1300px;margin:20px auto;padding:0 16px}}
@@ -203,11 +223,11 @@ th{{background:#f8f9fa;font-weight:600}}
 .kanban-col h3{{margin:0 0 10px 0;font-size:14px;color:#333;display:flex;justify-content:space-between}}
 .kanban-item{{background:white;border:1px solid #dce2e8;border-radius:6px;padding:12px;margin-bottom:10px;box-shadow:0 1px 3px rgba(0,0,0,0.05)}}
 .filter-bar{{background:white;border:1px solid #dce2e8;border-radius:8px;padding:12px;margin-bottom:16px;display:flex;gap:10px;flex-wrap:wrap;align-items:center}}
-</style></head><body><header><strong>Personal Work Assistant · Telegram Work Assistant</strong><nav>
-<a href="/">Overview</a><a href="/kanban">Kanban</a>
+</style></head><body><header><strong>Personal Work Assistant · Telegram Work Assistant · Work Operations Hub</strong><nav>
+<a href="/">Overview</a><a href="/work-items">Work Items</a><a href="/kanban">Kanban</a>
+<a href="/tests">Testing</a><a href="/workflows">Workflows</a><a href="/team">Team</a>
 <a href="/cases">Cases</a><a href="/inbox">Review Inbox</a>
-<a href="/clusters">Clusters</a><a href="/tests">Testing</a>
-<a href="/followups">Follow-ups</a><a href="/shifts">Shifts</a>
+<a href="/clusters">Clusters</a><a href="/followups">Follow-ups</a><a href="/shifts">Shifts</a>
 <a href="/reports">Reports</a><a href="/audit">Audit Log</a>
 <a href="/ai/history">AI History</a><a href="/connectors">Connectors</a>
 <a href="/settings">Settings & Diagnostics</a></nav></header><main>{content}</main></body></html>'''
@@ -259,6 +279,8 @@ th{{background:#f8f9fa;font-weight:600}}
                 if not authed:
                     self.send_html(self.page('<h2>Access denied</h2><p>Please use your authorized dashboard link with token parameter.</p>'), 403)
                     return
+
+                self.pending_sid = set_sid if not is_token_exchange else None
 
                 if is_token_exchange:
                     clean_params = {k: v for k, v in params.items() if k != 'token'}
@@ -569,10 +591,293 @@ th{{background:#f8f9fa;font-weight:600}}
 Source case <input name="source" type="number" min="1" required> into target <input name="target" type="number" min="1" required> <button>Merge</button></form></section>
 <div class="grid">{cards}</div>'''
 
-                # 8. TESTS
+                # 7B. UNIFIED WORK ITEMS VIEW
+                elif route == '/work-items':
+                    type_filter = (params.get('type') or [''])[0]
+                    status_filter = (params.get('status') or [''])[0]
+                    q_filter = (params.get('q') or [''])[0].strip().lower()
+
+                    items = service.work_item_service.list_work_items()
+                    if type_filter:
+                        items = [i for i in items if i['entity_type'] == type_filter]
+                    if status_filter:
+                        items = [i for i in items if i['operational_status'] == status_filter]
+                    if q_filter:
+                        items = [i for i in items if q_filter in i['title'].lower() or q_filter in (i.get('client') or '').lower() or q_filter in (i.get('product') or '').lower()]
+
+                    all_blockers = service.work_item_service.get_blockers(status='active')
+                    all_members = service.member_service.get_members()
+
+                    filter_bar = f'''<div class="filter-bar">
+<form method="get" action="/work-items" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;width:100%;">
+<label>Type: <select name="type">
+<option value="">All Types</option>
+<option value="requirement" {'selected' if type_filter=='requirement' else ''}>Requirements</option>
+<option value="task" {'selected' if type_filter=='task' else ''}>Tasks</option>
+<option value="case" {'selected' if type_filter=='case' else ''}>Cases</option>
+</select></label>
+<label>Status: <select name="status">
+<option value="">All Statuses</option>
+<option value="active" {'selected' if status_filter=='active' else ''}>Active</option>
+<option value="blocked" {'selected' if status_filter=='blocked' else ''}>Blocked</option>
+<option value="completed" {'selected' if status_filter=='completed' else ''}>Completed</option>
+</select></label>
+<label>Search: <input type="search" name="q" value="{h(q_filter)}" placeholder="Title, client, product..."></label>
+<button type="submit">Filter</button>
+<a href="/work-items" style="margin-left:auto;">Reset</a>
+</form>
+</div>'''
+
+                    create_req_card = f'''<section class="card" style="margin-bottom:16px;">
+<h2>Create New Requirement</h2>
+<form method="post" action="/requirements/create">
+<input type="hidden" name="csrf_token" value="{csrf_token}">
+<div style="display:grid;grid-template-columns:2fr 1fr 1fr;gap:10px;">
+<input name="title" placeholder="Requirement title *" required>
+<input name="client" placeholder="Client / Product">
+<input name="ticket" placeholder="Issue / Ticket #">
+</div>
+<div style="margin-top:8px;">
+<textarea name="user_story" rows="2" style="width:100%;box-sizing:border-box;" placeholder="User Story: As a [role], I want [capability] so that [benefit]..."></textarea>
+</div>
+<div style="margin-top:8px;">
+<textarea name="acceptance_criteria" rows="2" style="width:100%;box-sizing:border-box;" placeholder="Acceptance Criteria: Given [context], When [action], Then [outcome]..."></textarea>
+</div>
+<div style="margin-top:8px;display:flex;gap:10px;align-items:center;">
+<label>Owner: <select name="owner_member_id"><option value="">Unassigned</option>
+{''.join(f'<option value="{m["id"]}">{h(m["name"])}</option>' for m in all_members)}
+</select></label>
+<label>Priority: <select name="priority"><option value="1">P1 (Urgent)</option><option value="2" selected>P2 (Normal)</option><option value="3">P3 (Low)</option></select></label>
+<button class="primary" style="margin-left:auto;">Create Requirement</button>
+</div>
+</form>
+</section>'''
+
+                    rows_html = []
+                    for it in items:
+                        op_status = it.get('operational_status') or 'active'
+                        if op_status == 'blocked':
+                            status_badge = '<span class="tag tag-err">Blocked</span>'
+                        elif op_status in ('completed', 'closed', 'resolved'):
+                            status_badge = '<span class="tag tag-ok">Completed</span>'
+                        else:
+                            status_badge = '<span class="tag">Active</span>'
+
+                        disp_id = it.get('display_id') or f"{it['entity_type'].upper()}-{it['entity_id']}"
+                        stage_name = it.get('current_stage_name') or it.get('status') or '—'
+                        owner_name = it.get('owner_name') or 'Unassigned'
+                        title_val = it.get('title') or 'Untitled'
+
+                        actions_html = ''
+                        if it['entity_type'] == 'requirement':
+                            actions_html = f'<a href="/tests?req_id={it["entity_id"]}">Test Suite &rarr;</a>'
+                        elif it['entity_type'] == 'case':
+                            actions_html = f'<a href="/case?id={it["entity_id"]}">View Case &rarr;</a>'
+
+                        rows_html.append(f'''<tr>
+<td><strong>{h(disp_id)}</strong></td>
+<td><span class="tag">{h(it['entity_type'].upper())}</span></td>
+<td><strong>{h(title_val)}</strong><br><span class="muted">{h(it.get('client') or 'General')} {('· ' + h(it.get('product'))) if it.get('product') else ''}</span></td>
+<td><span class="tag">{h(stage_name)}</span></td>
+<td>{status_badge}</td>
+<td>{h(owner_name)}</td>
+<td>P{it.get('priority', 2)}</td>
+<td>{actions_html}</td>
+</tr>''')
+
+                    table_html = f'''<div class="card" style="overflow-x:auto;"><table>
+<tr><th>ID</th><th>Type</th><th>Title</th><th>Stage</th><th>Status</th><th>Owner</th><th>Priority</th><th>Actions</th></tr>
+{''.join(rows_html) or '<tr><td colspan="8" class="muted" style="text-align:center;padding:20px;">No work items match filter.</td></tr>'}
+</table></div>'''
+
+                    blockers_summary = ''
+                    if all_blockers:
+                        b_rows = ''.join(f"<li><strong>{h(b['entity_type'].upper())} #{b['entity_id']}</strong>: {h(b['description'])} <span class=\"muted\">({h(b['dependency_type'])})</span></li>" for b in all_blockers)
+                        blockers_summary = f'''<div class="card" style="margin-bottom:16px;background:#fff8f8;border-color:#ffd7d7;">
+<h3 style="color:#cf222e;margin-top:0;">Active Blockers & Dependencies ({len(all_blockers)})</h3>
+<ul style="margin-bottom:0;">{b_rows}</ul>
+</div>'''
+
+                    content = f'''<h1>Work Items Hub</h1>
+<p class="muted">Unified operational view across Requirements, Tasks, and Support Cases with workflow stages, blockers, and assignments.</p>
+{blockers_summary}
+{create_req_card}
+{filter_bar}
+{table_html}'''
+
+                # 7C. WORKFLOW TEMPLATES & STAGES VIEW
+                elif route == '/workflows':
+                    templates = service.workflow_service.list_templates()
+                    tmpl_cards = []
+                    for t in templates:
+                        stages_items = []
+                        for s in t.get('stages', []):
+                            desc_part = f'<p class="muted" style="margin:2px 0 0 0;">{h(s["description"])}</p>' if s.get('description') else ''
+                            cat = s.get('stage_category') or ('waiting' if s.get('is_waiting') else 'active')
+                            role_req = s.get('expected_role') or s.get('required_role_name') or 'Any'
+                            stages_items.append(
+                                f'<li style="margin-bottom:6px;"><strong>{s["stage_order"]}. {h(s["name"])}</strong> '
+                                f'<span class="tag">{h(cat)}</span> '
+                                f'<span class="muted">Role: {h(role_req)}</span>'
+                                f'{desc_part}</li>'
+                            )
+                        stages_html = ''.join(stages_items)
+                        tmpl_cards.append(f'''<section class="card">
+<h2>{h(t['name'])} {'<span class="tag tag-ok">Default</span>' if t.get('is_default') else ''}</h2>
+<p class="muted">Applies to: <strong>{h(t['work_type'].title())}</strong> · {len(t.get('stages', []))} defined stages</p>
+<p>{h(t.get('description') or 'Standard lifecycle workflow.')}</p>
+<h3>Stages Sequence</h3>
+<ol style="padding-left:20px;line-height:1.6;">{stages_html or '<li>No stages defined</li>'}</ol>
+</section>''')
+                    content = f'''<h1>Workflow Templates & Lifecycles</h1>
+<p class="muted">Standardized multi-stage pipelines ensuring rigorous separation of stages, clear handoffs, and verification gates.</p>
+<div class="grid">{''.join(tmpl_cards)}</div>'''
+
+                # 7D. TEAM & ROLE ASSIGNMENTS VIEW
+                elif route == '/team':
+                    members = service.member_service.get_members()
+                    roles = service.member_service.get_roles()
+
+                    create_member_card = f'''<section class="card" style="margin-bottom:16px;">
+<h2>Add Team Member</h2>
+<form method="post" action="/members/create">
+<input type="hidden" name="csrf_token" value="{csrf_token}">
+<div style="display:grid;grid-template-columns:2fr 2fr 1fr 1fr;gap:10px;">
+<input name="name" placeholder="Full name *" required>
+<input name="email" type="email" placeholder="Email address">
+<input name="telegram_handle" placeholder="@telegram_handle">
+<select name="role"><option value="">Assign Role</option>
+{''.join(f'<option value="{h(r["name"])}">{h(r["name"])}</option>' for r in roles)}
+</select>
+</div>
+<div style="margin-top:8px;display:flex;justify-content:flex-end;">
+<button class="primary">Add Member</button>
+</div>
+</form>
+</section>'''
+
+                    member_rows = []
+                    for m in members:
+                        m_roles = ', '.join(m.get('roles', [])) or '<span class="muted">None</span>'
+                        member_rows.append(f'''<tr>
+<td><strong>{h(m['name'])}</strong></td>
+<td>{h(m.get('email') or '—')}</td>
+<td>{h(m.get('telegram_handle') or '—')}</td>
+<td>{m_roles}</td>
+<td><span class="tag tag-ok">Active</span></td>
+</tr>''')
+
+                    team_table = f'''<div class="card"><table>
+<tr><th>Name</th><th>Email</th><th>Telegram</th><th>Roles</th><th>Status</th></tr>
+{''.join(member_rows) or '<tr><td colspan="5" class="muted" style="text-align:center;">No members recorded.</td></tr>'}
+</table></div>'''
+
+                    roles_list = ''.join(f'<div class="card"><h3>{h(r["name"])}</h3><p class="muted">{h(r.get("description") or "Standard team role.")}</p></div>' for r in roles)
+
+                    content = f'''<h1>Team & Role Directory</h1>
+<p class="muted">Operational staff profiles, functional roles, and work ownership matrix.</p>
+{create_member_card}
+<h2>Active Personnel</h2>
+{team_table}
+<h2 style="margin-top:24px;">Configured Operational Roles</h2>
+<div class="grid">{roles_list}</div>'''
+
+                # 8. TESTING WORKSPACE (Enhanced with Requirements, Conditions, Cases & Executions)
                 elif route == '/tests':
-                    cards = ''.join(self.test_card(item, csrf_token) for item in tests) or '<p>No test sessions.</p>'
-                    content = '<h1>Testing</h1><div class="grid">' + cards + '</div>'
+                    req_id_param = (params.get('req_id') or [''])[0]
+                    selected_req_id = int(req_id_param) if req_id_param.isdigit() else None
+
+                    requirements = service.work_item_service.list_requirements()
+                    test_cases = service.work_item_service.list_test_cases(requirement_id=selected_req_id)
+                    all_members = service.member_service.get_members()
+
+                    req_selector = f'''<div class="filter-bar">
+<form method="get" action="/tests" style="display:flex;gap:10px;align-items:center;">
+<label>Requirement Scope: <select name="req_id" onchange="this.form.submit()">
+<option value="">All Requirements ({len(requirements)})</option>
+{''.join(f'<option value="{r["id"]}" {"selected" if r["id"]==selected_req_id else ""}>REQ-{r["id"]}: {h(r["title"])}</option>' for r in requirements)}
+</select></label>
+<a href="/tests" style="margin-left:auto;">Clear Scope</a>
+</form>
+</div>'''
+
+                    create_tc_card = f'''<section class="card" style="margin-bottom:16px;">
+<h2>Add Test Case</h2>
+<form method="post" action="/tests/cases/create">
+<input type="hidden" name="csrf_token" value="{csrf_token}">
+<div style="display:grid;grid-template-columns:2fr 1fr 1fr;gap:10px;">
+<input name="title" placeholder="Test case title *" required>
+<select name="requirement_id">
+<option value="">Associate with Requirement</option>
+{''.join(f'<option value="{r["id"]}" {"selected" if r["id"]==selected_req_id else ""}>REQ-{r["id"]}: {h(r["title"])}</option>' for r in requirements)}
+</select>
+<select name="priority"><option value="1">P1 (Critical)</option><option value="2" selected>P2 (Normal)</option><option value="3">P3 (Minor)</option></select>
+</div>
+<div style="margin-top:8px;">
+<textarea name="objective" rows="2" style="width:100%;box-sizing:border-box;" placeholder="Test Objective / Scenario description..."></textarea>
+</div>
+<div style="margin-top:8px;display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+<textarea name="steps" rows="3" style="width:100%;box-sizing:border-box;" placeholder="Step-by-step actions: 1. ... 2. ..."></textarea>
+<textarea name="expected_result" rows="3" style="width:100%;box-sizing:border-box;" placeholder="Expected outcome / verification checkpoint..."></textarea>
+</div>
+<div style="margin-top:8px;display:flex;justify-content:flex-end;">
+<button class="primary">Create Test Case</button>
+</div>
+</form>
+</section>'''
+
+                    tc_rows = []
+                    for tc in test_cases:
+                        last_res = tc.get('last_execution_result') or 'not_run'
+                        if last_res == 'pass':
+                            badge = '<span class="tag tag-ok">PASS</span>'
+                        elif last_res == 'fail':
+                            badge = '<span class="tag tag-err">FAIL</span>'
+                        elif last_res == 'blocked':
+                            badge = '<span class="tag tag-warn">BLOCKED</span>'
+                        else:
+                            badge = '<span class="tag">NOT RUN</span>'
+
+                        exec_form = f'''<form method="post" action="/tests/executions/record" style="margin:0;display:flex;gap:4px;align-items:center;">
+<input type="hidden" name="csrf_token" value="{csrf_token}">
+<input type="hidden" name="test_case_id" value="{tc['id']}">
+<select name="result" style="padding:3px 6px;font-size:12px;">
+<option value="pass">Pass</option>
+<option value="fail">Fail</option>
+<option value="blocked">Blocked</option>
+</select>
+<input name="actual_result" placeholder="Actual result note" style="padding:3px 6px;font-size:12px;width:140px;">
+<button style="padding:3px 8px;font-size:12px;">Log</button>
+</form>'''
+
+                        req_label = f"REQ-{tc['requirement_id']}" if tc.get('requirement_id') else '—'
+                        tc_rows.append(f'''<tr>
+<td><strong>TC-{tc['id']}</strong></td>
+<td>{h(req_label)}</td>
+<td><strong>{h(tc['title'])}</strong><br><span class="muted">{h(tc.get('objective') or '')}</span></td>
+<td>P{tc.get('priority', 2)}</td>
+<td>{badge}</td>
+<td>{h(tc.get('last_execution_date') or 'Never')[:16].replace('T', ' ')}</td>
+<td>{exec_form}</td>
+</tr>''')
+
+                    tc_table = f'''<div class="card" style="overflow-x:auto;">
+<h3>Structured Test Cases & Executions</h3>
+<table>
+<tr><th>Case ID</th><th>Requirement</th><th>Title & Objective</th><th>Priority</th><th>Status</th><th>Last Run</th><th>Quick Execute</th></tr>
+{''.join(tc_rows) or '<tr><td colspan="7" class="muted" style="text-align:center;padding:20px;">No test cases defined.</td></tr>'}
+</table>
+</div>'''
+
+                    session_cards = ''.join(self.test_card(item, csrf_token) for item in tests) or '<p class="muted">No exploratory test sessions recorded.</p>'
+                    exploratory_section = f'''<h2 style="margin-top:24px;">Exploratory & Ad-hoc Test Sessions</h2><div class="grid">{session_cards}</div>'''
+
+                    content = f'''<h1>Testing Operations Workspace</h1>
+<p class="muted">End-to-end quality workspace: requirements tracing, test case definitions, test executions, and exploratory session logs.</p>
+{req_selector}
+{create_tc_card}
+{tc_table}
+{exploratory_section}'''
 
                 # 9. FOLLOW-UPS
                 elif route == '/followups':
@@ -675,11 +980,29 @@ Source case <input name="source" type="number" min="1" required> into target <in
                 # DEFAULT: TODAY OVERVIEW
                 else:
                     shift = service.database.active_shift()
-                    content = f'''<h1>Today Overview</h1><div class="grid">
+                    work_items = service.work_item_service.list_work_items()
+                    active_blockers = service.work_item_service.get_blockers(status='active')
+                    test_cases = service.work_item_service.list_test_cases()
+                    tc_passed = sum(1 for tc in test_cases if tc.get('last_execution_result') == 'pass')
+                    tc_failed = sum(1 for tc in test_cases if tc.get('last_execution_result') == 'fail')
+
+                    blocker_banner = ''
+                    if active_blockers:
+                        blocker_banner = f'''<div class="card" style="margin-bottom:16px;background:#fff8f8;border-color:#ffd7d7;">
+<h3 style="color:#cf222e;margin-top:0;">Attention: {len(active_blockers)} Active Blocker(s) Need Resolution</h3>
+<p class="muted">Items are paused waiting on internal/external dependencies. Check <a href="/work-items?status=blocked">Work Items</a> to review details.</p>
+</div>'''
+
+                    content = f'''<h1>Today Operations Overview</h1>
+<p class="muted">Live summary of shift status, work items, verification posture, and blockers.</p>
+{blocker_banner}
+<div class="grid">
 <div class="card"><h2>Active Shift</h2><p>{h(shift['start'] if shift else 'No active shift clocked')}</p><p>{h(shift['end'] if shift else '')}</p></div>
-<div class="card"><h2>Cases</h2><p>{len(cases)} approved · {sum(c['status'] not in ('closed', 'resolved') for c in cases)} active open</p></div>
-<div class="card"><h2>Review Inbox</h2><p>{len(inbox)} pending items</p></div>
-<div class="card"><h2>Follow-ups</h2><p>{len(followups)} scheduled</p></div></div>'''
+<div class="card"><h2>Work Items Hub</h2><p><strong>{len(work_items)}</strong> total items tracked</p><p class="muted"><a href="/work-items">View Work Items &rarr;</a></p></div>
+<div class="card"><h2>Testing Posture</h2><p><strong>{len(test_cases)}</strong> test cases defined</p><p><span class="tag tag-ok">{tc_passed} Pass</span> <span class="tag tag-err">{tc_failed} Fail</span></p><p class="muted"><a href="/tests">Testing Workspace &rarr;</a></p></div>
+<div class="card"><h2>Cases & Inbox</h2><p>{len(cases)} approved · {sum(c['status'] not in ('closed', 'resolved') for c in cases)} active open</p><p>{len(inbox)} inbox pending</p></div>
+<div class="card"><h2>Follow-ups</h2><p>{len(followups)} scheduled</p></div>
+</div>'''
 
                 self.send_html(self.page(content, csrf_token=csrf_token), set_sid=set_sid)
 
@@ -864,6 +1187,74 @@ Source case <input name="source" type="number" min="1" required> into target <in
                     # 12. SETTINGS
                     elif parsed.path == '/settings':
                         service.database.set_setting('mask_client_names', 'true' if 'mask_clients' in form else 'false')
+
+                    # 13. REQUIREMENTS CREATE
+                    elif parsed.path == '/requirements/create':
+                        title = form['title'][0]
+                        owner_raw = (form.get('owner_member_id') or [''])[0]
+                        owner_id = int(owner_raw) if owner_raw.isdigit() else None
+                        service.work_item_service.create_requirement(
+                            title=title,
+                            client=(form.get('client') or [''])[0] or None,
+                            ticket=(form.get('ticket') or [''])[0] or None,
+                            user_story=(form.get('user_story') or [''])[0] or None,
+                            acceptance_criteria=(form.get('acceptance_criteria') or [''])[0] or None,
+                            owner_member_id=owner_id,
+                            priority=int((form.get('priority') or ['2'])[0])
+                        )
+
+                    # 14. MEMBERS CREATE
+                    elif parsed.path == '/members/create':
+                        name = form['name'][0]
+                        email = (form.get('email') or [''])[0] or None
+                        tg = (form.get('telegram_handle') or [''])[0] or None
+                        role = (form.get('role') or [''])[0]
+                        roles = [role] if role else []
+                        service.member_service.add_member(name=name, email=email, telegram_handle=tg, roles=roles)
+
+                    # 15. TEST CASES CREATE
+                    elif parsed.path == '/tests/cases/create':
+                        title = form['title'][0]
+                        req_raw = (form.get('requirement_id') or [''])[0]
+                        req_id = int(req_raw) if req_raw.isdigit() else None
+                        service.work_item_service.add_test_case(
+                            title=title,
+                            requirement_id=req_id,
+                            objective=(form.get('objective') or [''])[0] or None,
+                            steps=(form.get('steps') or [''])[0] or None,
+                            expected_result=(form.get('expected_result') or [''])[0] or None,
+                            priority=int((form.get('priority') or ['2'])[0])
+                        )
+
+                    # 16. TEST EXECUTIONS RECORD
+                    elif parsed.path == '/tests/executions/record':
+                        tc_id = int(form['test_case_id'][0])
+                        result = form['result'][0]
+                        actual = (form.get('actual_result') or [''])[0] or None
+                        service.work_item_service.record_test_execution(
+                            test_case_id=tc_id,
+                            result=result,
+                            actual_result=actual
+                        )
+
+                    # 17. BLOCKERS CREATE
+                    elif parsed.path == '/blockers/create':
+                        ent_type = form['entity_type'][0]
+                        ent_id = int(form['entity_id'][0])
+                        dep_type = form['dependency_type'][0]
+                        desc = form['description'][0]
+                        service.work_item_service.add_blocker(
+                            entity_type=ent_type,
+                            entity_id=ent_id,
+                            dependency_type=dep_type,
+                            description=desc
+                        )
+
+                    # 18. BLOCKERS RESOLVE
+                    elif parsed.path == '/blockers/resolve':
+                        b_id = int(form['id'][0])
+                        notes = (form.get('resolution_notes') or [''])[0] or None
+                        service.work_item_service.resolve_blocker(b_id, resolution_notes=notes)
                     else:
                         raise ValueError('Unknown action.')
                 except (ValueError, KeyError) as exc:
@@ -911,3 +1302,31 @@ Source case <input name="source" type="number" min="1" required> into target <in
                 self.thread.join(timeout=5)
             self.server = None
             self.thread = None
+
+
+def main():
+    import argparse
+    import os
+    import sys
+    from database import Database
+    import config
+
+    parser = argparse.ArgumentParser(description='Work Operations Hub Dashboard')
+    parser.add_argument('--host', default=os.getenv('DASHBOARD_HOST', '127.0.0.1'))
+    parser.add_argument('--port', type=int, default=int(os.getenv('DASHBOARD_PORT', '8765')))
+    args = parser.parse_args()
+
+    db = Database(config.DB_PATH)
+    service = DashboardService(db, host=args.host, port=args.port)
+    service.start()
+    print(f"DASHBOARD_TOKEN={service.token}", flush=True)
+    print(f"Dashboard running on http://{args.host}:{args.port}/?token={service.token}", flush=True)
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        service.stop()
+
+
+if __name__ == '__main__':
+    main()

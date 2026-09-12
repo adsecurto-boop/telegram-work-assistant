@@ -1,0 +1,8 @@
+{
+  "name": "Personal Work Assistant",
+  "description": "Personal Work Assistant and Tester + Support Operations Hub for managing requirements, tasks, test suites, and workflows.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
