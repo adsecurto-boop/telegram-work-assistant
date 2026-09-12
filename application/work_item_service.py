@@ -1,11 +1,13 @@
 """Application service providing a unified Work Item layer across Tasks, Cases, and Requirements."""
 from database import Database
 from application.task_service import MutationResult
+from gemini_test_generator import GeminiTestConditionGenerator
 
 
 class WorkItemService:
     def __init__(self, db: Database):
         self.db = db
+        self.gemini_test_generator = GeminiTestConditionGenerator(db)
 
     def list_work_items(self) -> list[dict]:
         return self.db.get_all_work_items()
@@ -176,6 +178,24 @@ class WorkItemService:
                 success=False,
                 summary=f"Failed to add test condition: {e}"
             )
+
+    async def generate_draft_test_conditions(self, requirement_id: int,
+                                            focus_area: str = 'comprehensive',
+                                            model_name: str | None = None) -> dict:
+        return await self.gemini_test_generator.generate_draft_conditions(
+            requirement_id=requirement_id,
+            focus_area=focus_area,
+            model_name=model_name
+        )
+
+    def approve_draft_test_conditions(self, requirement_id: int,
+                                      approved_conditions: list[dict],
+                                      status: str = 'approved') -> dict:
+        return self.gemini_test_generator.approve_draft_conditions(
+            requirement_id=requirement_id,
+            approved_conditions=approved_conditions,
+            status=status
+        )
 
     def add_test_case(self, title: str, requirement_id: int | None = None,
                       test_condition_id: int | None = None, objective: str | None = None,

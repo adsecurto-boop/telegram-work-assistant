@@ -10,6 +10,7 @@ import secrets
 import hashlib
 import threading
 import time
+import asyncio
 from datetime import datetime, timedelta, timezone
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -31,6 +32,8 @@ from dashboard_views.testing_view import render_testing_view
 from dashboard_views.workflows_view import render_workflows_view
 from dashboard_views.team_view import render_team_view
 from dashboard_views.followups_view import render_followups_view
+from dashboard_views.chat_view import render_chat_view
+from gemini_chat_service import GeminiChatService
 
 STATUSES = (
     'new', 'triaged', 'investigating', 'waiting_client', 'waiting_internal',
@@ -111,6 +114,7 @@ class DashboardService:
         self.workflow_service = WorkflowService(database)
         self.member_service = MemberService(database)
         self.workspace_service = WorkspaceActionService(database)
+        self.chat_service = GeminiChatService(database)
         self.server = None
         self.thread = None
         self._lock = threading.RLock()
@@ -259,7 +263,8 @@ class DashboardService:
                 pillar_work = route_path in ('/work', '/work-items', '/kanban', '/inbox', '/cases', '/case')
                 pillar_testing = route_path in ('/tests', '/testing', '/evidence')
                 pillar_workspace = route_path == '/workspace'
-                pillar_ops = not (pillar_today or pillar_work or pillar_testing or pillar_workspace)
+                pillar_chat = route_path in ('/chat', '/assistant')
+                pillar_ops = not (pillar_today or pillar_work or pillar_testing or pillar_workspace or pillar_chat)
 
                 shift = service.database.active_shift()
                 if shift:
@@ -1403,6 +1408,10 @@ tr:hover td {{ background: #fafafa; }}
         <svg class="nav-icon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76"/></svg>
         Workspace Hub
       </a>
+      <a href="/chat" class="nav-segment {'active' if pillar_chat else ''}">
+        <svg class="nav-icon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+        AI Chat
+      </a>
     </nav>
 
     <!-- Operations Secondary Tools Dropdown -->
@@ -1418,6 +1427,7 @@ tr:hover td {{ background: #fafafa; }}
           <a href="/team">Team Roster</a>
           <a href="/shifts">Shift Calendar</a>
           <div class="dropdown-group-title">Intelligence & Analysis</div>
+          <a href="/chat">AI Chatbot</a>
           <a href="/followups">Follow-ups</a>
           <a href="/clusters">Clusters</a>
           <a href="/reports">Reports</a>
@@ -1449,6 +1459,10 @@ tr:hover td {{ background: #fafafa; }}
   <a href="/tests" class="mobile-nav-item {'active' if pillar_testing else ''}">
     <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/></svg>
     <span>Testing</span>
+  </a>
+  <a href="/chat" class="mobile-nav-item {'active' if pillar_chat else ''}">
+    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+    <span>AI Chat</span>
   </a>
   <a href="/workspace" class="mobile-nav-item {'active' if pillar_workspace else ''}">
     <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76"/></svg>
@@ -1684,6 +1698,22 @@ document.addEventListener('click', function(e) {{
                 elif route == '/workspace':
                     content = render_workspace_view(service, csrf_token)
 
+                # 15. GEMINI AI CHATBOT
+                elif route in ('/chat', '/assistant'):
+                    owner_id = config.OWNER_ID or 1
+                    turns = service.chat_service.get_conversation_history(owner_id=owner_id, limit=50)
+                    content = render_chat_view(
+                        conversation_turns=turns,
+                        current_role=(params.get('role') or ['general_assistant'])[0],
+                        current_mode=(params.get('mode') or ['auto'])[0]
+                    )
+
+                elif route == '/api/chat/history':
+                    owner_id = config.OWNER_ID or 1
+                    turns = service.chat_service.get_conversation_history(owner_id=owner_id, limit=50)
+                    self.send_json({'success': True, 'turns': turns})
+                    return
+
                 # DEFAULT: TODAY COCKPIT (Primary Operational Hub)
                 else:
                     content = render_today_view(service, csrf_token, params)
@@ -1725,8 +1755,38 @@ document.addEventListener('click', function(e) {{
                     return
 
                 try:
+                    # 00. GEMINI MULTI-TURN CHAT INTERFACE
+                    if parsed.path == '/api/chat':
+                        msg = json_body.get('message') or (form.get('message') or [''])[0]
+                        role_key = json_body.get('role_key') or (form.get('role_key') or ['general_assistant'])[0]
+                        task_mode = json_body.get('task_mode') or (form.get('task_mode') or ['auto'])[0]
+                        custom_prompt = json_body.get('custom_system_instruction') or (form.get('custom_system_instruction') or [''])[0]
+                        owner_id = config.OWNER_ID or 1
+
+                        new_loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(new_loop)
+                        try:
+                            result = new_loop.run_until_complete(service.chat_service.send_message(
+                                message=msg,
+                                role_key=role_key,
+                                task_mode=task_mode,
+                                custom_system_instruction=custom_prompt,
+                                owner_id=owner_id
+                            ))
+                        finally:
+                            new_loop.close()
+
+                        self.send_json(result)
+                        return
+
+                    elif parsed.path == '/api/chat/clear':
+                        owner_id = config.OWNER_ID or 1
+                        ok = service.chat_service.clear_conversation_history(owner_id=owner_id)
+                        self.send_json({'success': ok})
+                        return
+
                     # 0A. WORKSPACE SERVER-SIDE MUTATIONS (PROPOSE & EXECUTE)
-                    if parsed.path == '/workspace/action/propose':
+                    elif parsed.path == '/workspace/action/propose':
                         act = json_body.get('action') or (form.get('action') or [''])[0]
                         args_data = json_body.get('args')
                         if args_data is None:

@@ -5,6 +5,7 @@ from dashboard_views.components import (
     render_priority_tag,
     format_iso_time
 )
+from dashboard_views.ai_condition_modal import render_ai_condition_modal
 
 
 def render_testing_view(service, csrf_token: str, params: dict, test_sub: str = 'cases') -> str:
