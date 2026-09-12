@@ -1,6 +1,30 @@
 import http from 'node:http';
+import fs from 'node:fs';
 import { spawn, execSync, type ChildProcess } from 'node:child_process';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+const WORKSPACE_SCOPES = [
+  'https://www.googleapis.com/auth/drive',
+  'https://www.googleapis.com/auth/drive.file',
+  'https://www.googleapis.com/auth/drive.readonly',
+  'https://www.googleapis.com/auth/spreadsheets',
+  'https://www.googleapis.com/auth/spreadsheets.readonly',
+  'https://www.googleapis.com/auth/tasks',
+  'https://www.googleapis.com/auth/tasks.readonly',
+  'https://www.googleapis.com/auth/documents',
+  'https://www.googleapis.com/auth/documents.readonly'
+];
+
+const WORKSPACE_API_ENDPOINTS = {
+  drive: 'https://www.googleapis.com/drive/v3',
+  sheets: 'https://sheets.googleapis.com/v4',
+  tasks: 'https://tasks.googleapis.com/tasks/v1',
+  docs: 'https://docs.googleapis.com/v1',
+  keepNotice: 'Google Keep API requires Google Workspace enterprise domain authorization.'
+};
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const PORT = 3000;
 const PYTHON_PORT = 8765;
@@ -113,6 +137,32 @@ setInterval(async () => {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost:3000'}`);
 
+  if (url.pathname === '/firebase-applet-config.json') {
+    try {
+      const configPath = path.join(__dirname, 'firebase-applet-config.json');
+      if (fs.existsSync(configPath)) {
+        const configData = fs.readFileSync(configPath, 'utf-8');
+        res.writeHead(200, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Cache-Control': 'no-store'
+        });
+        res.end(configData);
+        return;
+      }
+    } catch (err: any) {
+      console.error('[server] Error serving firebase config:', err.message);
+    }
+  }
+
+  if (url.pathname === '/api/workspace-scopes') {
+    res.writeHead(200, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'no-store'
+    });
+    res.end(JSON.stringify({ scopes: WORKSPACE_SCOPES, endpoints: WORKSPACE_API_ENDPOINTS }));
+    return;
+  }
+
   if (!dashboardToken) {
     dashboardToken = getDbToken();
   }
@@ -156,8 +206,7 @@ const server = http.createServer(async (req, res) => {
   proxyHeaders.host = `${PYTHON_HOST}:${PYTHON_PORT}`;
 
   const cookies = req.headers.cookie || '';
-  const hasSession = cookies.includes('dashboard_session=');
-  if (!hasSession && dashboardToken) {
+  if (dashboardToken) {
     proxyHeaders['x-dashboard-token'] = dashboardToken;
   }
 

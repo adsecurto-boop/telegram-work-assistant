@@ -7,9 +7,10 @@ import mimetypes
 import os
 import re
 import secrets
+import hashlib
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -22,6 +23,7 @@ from shifts import assign_template_range, check_missing_shift_assignments, forma
 from application.work_item_service import WorkItemService
 from application.workflow_service import WorkflowService
 from application.member_service import MemberService
+from workspace_view import render_workspace_view
 
 STATUSES = (
     'new', 'triaged', 'investigating', 'waiting_client', 'waiting_internal',
@@ -51,6 +53,44 @@ SAFE_INLINE_MIME_TYPES = {
 
 def h(value):
     return html.escape('' if value is None else str(value))
+
+
+def render_work_sub_nav(active_sub: str, inbox_count: int, case_count: int) -> str:
+    return f'''<div class="sub-nav-wrapper">
+  <div class="sub-nav-bar">
+    <a href="/work?sub=kanban" class="sub-nav-pill {'active' if active_sub == 'kanban' else ''}">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="18" rx="1"/><rect x="14" y="3" width="7" height="10" rx="1"/></svg>
+      Kanban Board
+    </a>
+    <a href="/work?sub=items" class="sub-nav-pill {'active' if active_sub == 'items' else ''}">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
+      Work Items Hub
+    </a>
+    <a href="/work?sub=inbox" class="sub-nav-pill {'active' if active_sub == 'inbox' else ''}">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>
+      Review Inbox <span class="nav-counter">{inbox_count}</span>
+    </a>
+    <a href="/work?sub=cases" class="sub-nav-pill {'active' if active_sub == 'cases' else ''}">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+      Cases & Issues <span class="nav-counter">{case_count}</span>
+    </a>
+  </div>
+</div>'''
+
+
+def render_testing_sub_nav(active_sub: str = 'cases') -> str:
+    return f'''<div class="sub-nav-wrapper">
+  <div class="sub-nav-bar">
+    <a href="/tests?sub=cases" class="sub-nav-pill {'active' if active_sub == 'cases' else ''}">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+      Test Cases & Requirements
+    </a>
+    <a href="/tests?sub=sessions" class="sub-nav-pill {'active' if active_sub == 'sessions' else ''}">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+      Exploratory Sessions
+    </a>
+  </div>
+</div>'''
 
 
 class DashboardService:
@@ -165,6 +205,11 @@ class DashboardService:
                     new_sid, csrf = service.create_session()
                     return True, new_sid, csrf, True
 
+                # In web preview or AI Studio iframe environment, auto-provision session
+                if os.getenv('ALLOW_IFRAME', 'true').lower() in ('true', '1', 'yes') or os.getenv('ENV') == 'production':
+                    new_sid, csrf = service.create_session()
+                    return True, new_sid, csrf, False
+
                 return False, None, None, False
 
             def send_html(self, body: str, status=200, set_sid: str | None = None):
@@ -180,57 +225,823 @@ class DashboardService:
                     self.send_header('X-Frame-Options', 'DENY')
                 self.send_header('X-Content-Type-Options', 'nosniff')
                 self.send_header('Referrer-Policy', 'same-origin')
-                self.send_header('Content-Security-Policy', "default-src 'self' 'unsafe-inline'")
+                csp = (
+                    "default-src 'self' 'unsafe-inline'; "
+                    "script-src 'self' 'unsafe-inline' https://www.gstatic.com https://apis.google.com https://accounts.google.com; "
+                    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+                    "font-src 'self' https://fonts.gstatic.com data:; "
+                    "connect-src 'self' https://*.googleapis.com https://*.firebaseio.com https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://accounts.google.com; "
+                    "frame-src 'self' https://*.firebaseapp.com https://accounts.google.com; "
+                    "img-src 'self' data: https:;"
+                )
+                self.send_header('Content-Security-Policy', csp)
                 if set_sid:
                     self.send_header('Set-Cookie', f'dashboard_session={set_sid}; Path=/; HttpOnly; SameSite=Strict')
                 self.end_headers()
                 self.wfile.write(content)
 
-            def page(self, content, title='Work Operations Hub', csrf_token: str = ''):
-                return f'''<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+            def page(self, content, title='Personal Work Assistant', csrf_token: str = '', route: str = '/'):
+                route_path = (route or '/').split('?')[0]
+                pillar_today = route_path in ('/', '/overview', '/today')
+                pillar_work = route_path in ('/work', '/work-items', '/kanban', '/inbox', '/cases', '/case')
+                pillar_testing = route_path in ('/tests', '/testing', '/evidence')
+                pillar_workspace = route_path == '/workspace'
+                pillar_ops = not (pillar_today or pillar_work or pillar_testing or pillar_workspace)
+
+                shift = service.database.active_shift()
+                if shift:
+                    st = (shift.get('start') or '')[:16].replace('T', ' ')
+                    time_part = st[11:] if len(st) >= 16 else st
+                    shift_chip_html = f'''<div class="shift-chip active" title="Active Shift started at {st}">
+                      <span class="pulse-dot"></span>
+                      <span class="shift-chip-text">Shift Active · {time_part}</span>
+                    </div>'''
+                else:
+                    shift_chip_html = '''<div class="shift-chip inactive" title="No active shift currently clocked">
+                      <span class="static-dot"></span>
+                      <span class="shift-chip-text">Off Duty</span>
+                    </div>'''
+
+                return f'''<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>{h(title)}</title>
-<meta name="description" content="Personal Work Assistant and Operations Hub with Telegram integration, tracking, and diagnostics.">
+<meta name="description" content="Personal Work Assistant and Operations Hub with Telegram and Google Workspace (Drive, Docs, Sheets, Tasks) integrations for tasks, documents, and test workflows.">
 <meta property="og:title" content="{h(title)}">
-<meta property="og:description" content="Personal Work Assistant and Operations Hub with Telegram integration, tracking, and diagnostics.">
+<meta property="og:description" content="Personal Work Assistant and Operations Hub with Telegram and Google Workspace (Drive, Docs, Sheets, Tasks) integrations for tasks, documents, and test workflows.">
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <style>
-body{{font:14px system-ui,-apple-system,sans-serif;margin:0;background:#f4f6f8;color:#17212b}}
-header{{background:#17212b;color:white;padding:14px 4%;box-shadow:0 2px 4px rgba(0,0,0,0.1)}}
-main{{max-width:1300px;margin:20px auto;padding:0 16px}}
-nav{{margin-top:10px}}nav a{{color:#bfe1ff;margin-right:16px;text-decoration:none;font-weight:500}}
-nav a:hover{{text-decoration:underline;color:white}}
-.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:16px}}
-.card{{background:white;border:1px solid #dce2e8;border-radius:8px;padding:16px;box-shadow:0 1px 4px rgba(0,0,0,0.04)}}
-.muted{{color:#637282;font-size:13px}}
-.tag{{display:inline-block;background:#e9f3ff;color:#0969da;padding:2px 8px;border-radius:12px;margin:2px;font-size:12px;font-weight:500}}
-.tag-warn{{background:#fff8c5;color:#9a6700}}
-.tag-err{{background:#ffebe9;color:#cf222e}}
-.tag-ok{{background:#dafbe1;color:#1a7f37}}
-button,select,input,textarea{{padding:7px 10px;border:1px solid #d0d7de;border-radius:6px;font-size:13px}}
-button{{background:#f6f8fa;cursor:pointer;font-weight:500}}
-button:hover{{background:#f3f4f6}}
-button.primary{{background:#2da44e;color:white;border-color:#2c974b}}
-button.primary:hover{{background:#2c974b}}
-button.danger{{background:#cf222e;color:white;border-color:#b62324}}
-button.danger:hover{{background:#b62324}}
-form{{margin-top:8px}}pre{{white-space:pre-wrap;background:#f8f9fa;padding:10px;border-radius:6px}}
-a{{color:#0969da;text-decoration:none}}a:hover{{text-decoration:underline}}
-table{{width:100%;border-collapse:collapse;margin-top:8px}}
-td,th{{text-align:left;padding:8px 10px;border-bottom:1px solid #eee;font-size:13px}}
-th{{background:#f8f9fa;font-weight:600}}
-.kanban-board{{display:flex;gap:12px;overflow-x:auto;padding-bottom:16px}}
-.kanban-col{{flex:0 0 280px;background:#ebf0f5;border-radius:8px;padding:12px;min-height:500px}}
-.kanban-col h3{{margin:0 0 10px 0;font-size:14px;color:#333;display:flex;justify-content:space-between}}
-.kanban-item{{background:white;border:1px solid #dce2e8;border-radius:6px;padding:12px;margin-bottom:10px;box-shadow:0 1px 3px rgba(0,0,0,0.05)}}
-.filter-bar{{background:white;border:1px solid #dce2e8;border-radius:8px;padding:12px;margin-bottom:16px;display:flex;gap:10px;flex-wrap:wrap;align-items:center}}
-</style></head><body><header><strong>Personal Work Assistant · Telegram Work Assistant · Work Operations Hub</strong><nav>
-<a href="/">Overview</a><a href="/work-items">Work Items</a><a href="/kanban">Kanban</a>
-<a href="/tests">Testing</a><a href="/workflows">Workflows</a><a href="/team">Team</a>
-<a href="/cases">Cases</a><a href="/inbox">Review Inbox</a>
-<a href="/clusters">Clusters</a><a href="/followups">Follow-ups</a><a href="/shifts">Shifts</a>
-<a href="/reports">Reports</a><a href="/audit">Audit Log</a>
-<a href="/ai/history">AI History</a><a href="/connectors">Connectors</a>
-<a href="/settings">Settings & Diagnostics</a></nav></header><main>{content}</main></body></html>'''
+:root {{
+  --bg-canvas: #f8fafc;
+  --bg-card: #ffffff;
+  --header-bg: #0f172a;
+  --header-border: #1e293b;
+  --text-primary: #0f172a;
+  --text-secondary: #475569;
+  --text-muted: #64748b;
+  --border-subtle: #e2e8f0;
+  --color-primary: #2563eb;
+  --color-primary-hover: #1d4ed8;
+  --color-success: #16a34a;
+  --color-warning: #d97706;
+  --color-danger: #dc2626;
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+}}
+* {{ box-sizing: border-box; }}
+body {{
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  margin: 0;
+  background: var(--bg-canvas);
+  color: var(--text-primary);
+  -webkit-font-smoothing: antialiased;
+}}
+
+/* Top App Header */
+.app-header {{
+  position: sticky;
+  top: 0;
+  z-index: 1000;
+  background: var(--header-bg);
+  border-bottom: 1px solid var(--header-border);
+  color: #ffffff;
+}}
+.header-inner {{
+  max-width: 1360px;
+  margin: 0 auto;
+  padding: 0 20px;
+  height: 58px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}}
+.brand-group {{
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}}
+.brand-link {{
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #f8fafc;
+  text-decoration: none;
+  font-weight: 700;
+  font-size: 15px;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+}}
+.brand-link:hover {{ color: #ffffff; text-decoration: none; }}
+.brand-icon {{ color: #60a5fa; flex-shrink: 0; }}
+
+/* Shift status chip in header */
+.shift-chip {{
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+}}
+.shift-chip.active {{
+  background: rgba(34, 197, 94, 0.15);
+  color: #4ade80;
+  border: 1px solid rgba(74, 222, 128, 0.3);
+}}
+.shift-chip.inactive {{
+  background: rgba(148, 163, 184, 0.12);
+  color: #94a3b8;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+}}
+.pulse-dot {{
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #4ade80;
+  box-shadow: 0 0 0 2px rgba(74, 222, 128, 0.4);
+}}
+.static-dot {{
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #94a3b8;
+}}
+
+/* Segmented Primary Navigation */
+.primary-nav {{
+  display: flex;
+  align-items: center;
+  background: #1e293b;
+  padding: 3px;
+  border-radius: 24px;
+  gap: 2px;
+}}
+.nav-segment {{
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  border-radius: 20px;
+  color: #94a3b8;
+  text-decoration: none;
+  font-weight: 500;
+  font-size: 13px;
+  white-space: nowrap;
+  transition: all 0.15s ease;
+}}
+.nav-segment:hover {{
+  color: #f8fafc;
+  background: rgba(255, 255, 255, 0.06);
+  text-decoration: none;
+}}
+.nav-segment.active {{
+  background: var(--color-primary);
+  color: #ffffff;
+  font-weight: 600;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+}}
+.nav-icon {{ flex-shrink: 0; }}
+
+/* Secondary Tools Dropdown */
+.header-actions {{
+  display: flex;
+  align-items: center;
+}}
+.ops-menu-container {{
+  position: relative;
+}}
+.ops-menu-btn {{
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: #1e293b;
+  border: 1px solid #334155;
+  color: #cbd5e1;
+  padding: 6px 12px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+}}
+.ops-menu-btn:hover {{
+  background: #334155;
+  color: #ffffff;
+}}
+.ops-dropdown-menu {{
+  position: absolute;
+  top: 100%;
+  right: 0;
+  margin-top: 6px;
+  width: 210px;
+  background: #ffffff;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  box-shadow: 0 10px 25px -5px rgba(0,0,0,0.1), 0 8px 10px -6px rgba(0,0,0,0.05);
+  display: none;
+  flex-direction: column;
+  padding: 6px 0;
+  z-index: 1010;
+}}
+.ops-dropdown-menu.open {{
+  display: flex;
+}}
+.dropdown-group-title {{
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  padding: 6px 14px 2px 14px;
+}}
+.ops-dropdown-menu a {{
+  color: var(--text-primary);
+  padding: 7px 14px;
+  text-decoration: none;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}}
+.ops-dropdown-menu a:hover {{
+  background: #f1f5f9;
+  color: var(--color-primary);
+  text-decoration: none;
+}}
+
+/* Sub-Navigation Bar (for Work & Testing pillars) */
+.sub-nav-wrapper {{
+  background: #ffffff;
+  border-bottom: 1px solid var(--border-subtle);
+  margin: -20px -20px 24px -20px;
+  padding: 10px 20px;
+  position: sticky;
+  top: 58px;
+  z-index: 900;
+}}
+.sub-nav-bar {{
+  max-width: 1360px;
+  margin: 0 auto;
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 2px 0;
+}}
+.sub-nav-pill {{
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  border-radius: 20px;
+  background: #f1f5f9;
+  color: var(--text-secondary);
+  text-decoration: none;
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+  border: 1px solid transparent;
+  transition: all 0.15s ease;
+}}
+.sub-nav-pill:hover {{
+  background: #e2e8f0;
+  color: var(--text-primary);
+  text-decoration: none;
+}}
+.sub-nav-pill.active {{
+  background: #eff6ff;
+  color: var(--color-primary);
+  border-color: #bfdbfe;
+  font-weight: 600;
+}}
+.nav-counter {{
+  display: inline-block;
+  background: rgba(0,0,0,0.08);
+  padding: 1px 6px;
+  border-radius: 10px;
+  font-size: 11px;
+}}
+.sub-nav-pill.active .nav-counter {{
+  background: #dbeafe;
+  color: var(--color-primary);
+}}
+
+/* Main Canvas Content */
+main {{
+  max-width: 1360px;
+  margin: 20px auto;
+  padding: 0 20px 60px 20px;
+}}
+
+/* Responsive Metric Band (4 Cards) */
+.metric-band {{
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 16px;
+  margin-bottom: 24px;
+}}
+.metric-card {{
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: 18px 20px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04);
+  transition: border-color 0.15s;
+}}
+.metric-card:hover {{
+  border-color: #cbd5e1;
+}}
+.metric-card-top {{
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}}
+.metric-card-title {{
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}}
+.metric-card-value {{
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--text-primary);
+  line-height: 1.2;
+  margin-bottom: 4px;
+}}
+.metric-card-desc {{
+  font-size: 13px;
+  color: var(--text-secondary);
+  line-height: 1.4;
+}}
+.metric-card-footer {{
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: 1px solid #f1f5f9;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}}
+
+/* Bento Grid (2:1 Desktop Split) */
+.bento-split {{
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  gap: 20px;
+  align-items: start;
+}}
+.bento-main {{
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}}
+.bento-side {{
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}}
+
+/* General UI Card */
+.card {{
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: 20px;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04);
+}}
+.card-header-row {{
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 14px;
+}}
+.card-title {{
+  font-size: 16px;
+  font-weight: 600;
+  margin: 0;
+  color: var(--text-primary);
+}}
+
+/* Typography */
+h1 {{ font-size: 22px; font-weight: 700; margin: 0 0 6px 0; letter-spacing: -0.01em; }}
+h2 {{ font-size: 17px; font-weight: 600; margin: 0 0 12px 0; }}
+h3 {{ font-size: 15px; font-weight: 600; margin: 0 0 8px 0; }}
+.muted {{ color: var(--text-muted); font-size: 13px; }}
+
+/* Tags & Badges */
+.tag {{
+  display: inline-flex;
+  align-items: center;
+  background: #f1f5f9;
+  color: #334155;
+  padding: 3px 9px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+}}
+.tag-ok {{ background: #dcfce7; color: #15803d; }}
+.tag-warn {{ background: #fef3c7; color: #b45309; }}
+.tag-err {{ background: #fee2e2; color: #b91c1c; }}
+.tag-info {{ background: #dbeafe; color: #1d4ed8; }}
+
+/* Buttons */
+button, input, select, textarea {{
+  font-family: inherit;
+  font-size: 13px;
+}}
+button {{
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 8px 16px;
+  border-radius: var(--radius-sm);
+  font-weight: 500;
+  border: 1px solid var(--border-subtle);
+  background: #ffffff;
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+  min-height: 36px;
+}}
+button:hover {{ background: #f8fafc; border-color: #cbd5e1; }}
+button.primary, .btn-primary-action {{
+  background: var(--color-primary);
+  color: #ffffff;
+  border-color: var(--color-primary);
+}}
+button.primary:hover, .btn-primary-action:hover {{
+  background: var(--color-primary-hover);
+  border-color: var(--color-primary-hover);
+  color: #ffffff;
+  text-decoration: none;
+}}
+button.danger {{
+  background: var(--color-danger);
+  color: #ffffff;
+  border-color: var(--color-danger);
+}}
+button.danger:hover {{
+  background: #b91c1c;
+}}
+.btn-subtle {{
+  padding: 6px 12px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: #ffffff;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}}
+.btn-subtle:hover {{
+  background: #f1f5f9;
+  color: var(--text-primary);
+  text-decoration: none;
+}}
+
+/* Form Elements */
+input, select, textarea {{
+  padding: 8px 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: #ffffff;
+  color: var(--text-primary);
+}}
+input:focus, select:focus, textarea:focus {{
+  outline: none;
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.15);
+}}
+pre {{ white-space: pre-wrap; background: #f8fafc; padding: 12px; border-radius: var(--radius-sm); border: 1px solid var(--border-subtle); }}
+
+/* Responsive Table Wrappers */
+.table-scroll-wrap {{
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  margin-top: 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+}}
+table {{
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+  font-size: 13px;
+}}
+th {{
+  background: #f8fafc;
+  color: var(--text-secondary);
+  font-weight: 600;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border-subtle);
+  white-space: nowrap;
+}}
+td {{
+  padding: 10px 14px;
+  border-bottom: 1px solid #f1f5f9;
+  vertical-align: middle;
+}}
+tr:last-child td {{ border-bottom: none; }}
+tr:hover td {{ background: #fafafa; }}
+
+/* Progress Bar */
+.progress-bar-wrap {{
+  height: 8px;
+  background: #fee2e2;
+  border-radius: 4px;
+  overflow: hidden;
+  display: flex;
+  margin: 6px 0;
+}}
+.progress-bar-fill {{
+  height: 100%;
+  background: var(--color-success);
+  transition: width 0.3s ease;
+}}
+
+/* Kanban Board */
+.kanban-board {{
+  display: flex;
+  gap: 16px;
+  overflow-x: auto;
+  padding-bottom: 16px;
+  -webkit-overflow-scrolling: touch;
+}}
+.kanban-col {{
+  flex: 0 0 300px;
+  background: #f1f5f9;
+  border-radius: var(--radius-md);
+  padding: 14px;
+  min-height: 540px;
+}}
+.kanban-col h3 {{
+  margin: 0 0 12px 0;
+  font-size: 14px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}}
+.kanban-item {{
+  background: #ffffff;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 12px;
+  margin-bottom: 10px;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+}}
+
+/* Filter Bar */
+.filter-bar {{
+  background: #ffffff;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: 14px 16px;
+  margin-bottom: 20px;
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  align-items: center;
+}}
+
+/* Today View Components */
+.today-hero {{
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 20px;
+  flex-wrap: wrap;
+  gap: 12px;
+}}
+.today-hero-actions {{
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}}
+.today-blocker-item {{
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  border-radius: var(--radius-sm);
+  padding: 14px;
+  margin-bottom: 10px;
+}}
+.today-blocker-header {{
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}}
+.ws-quick-link {{
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  text-decoration: none;
+  color: var(--text-primary);
+  margin-bottom: 8px;
+  transition: all 0.15s ease;
+}}
+.ws-quick-link:hover {{
+  background: #f8fafc;
+  border-color: #cbd5e1;
+  text-decoration: none;
+}}
+.ws-icon-wrap {{
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}}
+
+/* Google Workspace Hub specific styles */
+.gsi-material-button{{user-select:none;background-color:#131314;border:1px solid #747775;border-radius:20px;box-sizing:border-box;color:#e3e3e3;cursor:pointer;font-family:system-ui,-apple-system,sans-serif;font-size:14px;height:40px;letter-spacing:0.25px;outline:none;overflow:hidden;padding:0 14px;position:relative;text-align:center;vertical-align:middle;white-space:nowrap;width:auto;display:inline-flex;align-items:center;transition:background-color .2s}}
+.gsi-material-button:hover{{background-color:#202124}}
+.gsi-material-button-icon{{height:20px;margin-right:10px;min-width:20px;width:20px}}
+.gsi-material-button-content-wrapper{{align-items:center;display:flex;flex-direction:row;flex-wrap:nowrap;height:100%;justify-content:space-between;position:relative;width:100%}}
+.gsi-material-button-contents{{flex-grow:1;font-weight:500;overflow:hidden;text-overflow:ellipsis;vertical-align:top}}
+.ws-tabs{{display:flex;gap:8px;border-bottom:1px solid #dce2e8;margin-bottom:16px;padding-bottom:8px}}
+.ws-tab-btn{{background:#f6f8fa;border:1px solid #d0d7de;border-radius:6px;padding:8px 14px;cursor:pointer;font-weight:600}}
+.ws-tab-btn.active{{background:#0969da;color:white;border-color:#0969da}}
+.ws-panel{{display:none}}
+.ws-panel.active{{display:block}}
+.ws-item-card{{border:1px solid #e1e4e8;border-radius:6px;padding:12px;margin-bottom:8px;background:#fff;display:flex;justify-content:space-between;align-items:center}}
+.ws-action-btn{{padding:5px 10px;font-size:12px;border-radius:4px;margin-left:6px}}
+.modal-overlay{{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);display:none;align-items:center;justify-content:center;z-index:9999}}
+.modal-card{{background:white;border-radius:8px;max-width:480px;width:90%;padding:20px;box-shadow:0 8px 24px rgba(0,0,0,0.18)}}
+
+/* Mobile Bottom Navigation Bar */
+.mobile-bottom-nav {{
+  display: none;
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 60px;
+  background: #0f172a;
+  border-top: 1px solid #1e293b;
+  z-index: 1000;
+  justify-content: space-around;
+  align-items: center;
+  padding-bottom: env(safe-area-inset-bottom);
+}}
+.mobile-nav-item {{
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  color: #94a3b8;
+  text-decoration: none;
+  font-size: 11px;
+  font-weight: 500;
+  min-width: 54px;
+  min-height: 48px;
+}}
+.mobile-nav-item:hover {{ color: #ffffff; text-decoration: none; }}
+.mobile-nav-item.active {{
+  color: #60a5fa;
+  font-weight: 600;
+}}
+
+/* Responsive Breakpoints */
+@media (max-width: 1024px) {{
+  .metric-band {{ grid-template-columns: repeat(2, 1fr); }}
+  .bento-split {{ grid-template-columns: 1fr; }}
+}}
+
+@media (max-width: 768px) {{
+  .primary-nav {{ display: none; }}
+  .mobile-bottom-nav {{ display: flex; }}
+  main {{ padding: 0 16px 80px 16px; margin: 16px auto; }}
+  .sub-nav-wrapper {{ margin: -16px -16px 16px -16px; padding: 10px 16px; top: 58px; }}
+  .metric-band {{ grid-template-columns: 1fr; }}
+  .metric-card {{ padding: 14px 16px; }}
+  .header-inner {{ padding: 0 16px; }}
+  .card {{ padding: 16px; }}
+  button, .btn-primary-action {{ min-height: 44px; padding: 10px 16px; }}
+}}
+</style>
+</head>
+<body>
+<header class="app-header">
+  <div class="header-inner">
+    <div class="brand-group">
+      <a href="/" class="brand-link">
+        <svg class="brand-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+        <span class="brand-name">Personal Work Assistant</span>
+      </a>
+      {shift_chip_html}
+    </div>
+
+    <!-- Desktop Primary Segmented Navigation -->
+    <nav class="primary-nav" aria-label="Main Navigation">
+      <a href="/" class="nav-segment {'active' if pillar_today else ''}">
+        <svg class="nav-icon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+        Today
+      </a>
+      <a href="/work" class="nav-segment {'active' if pillar_work else ''}">
+        <svg class="nav-icon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+        Work
+      </a>
+      <a href="/tests" class="nav-segment {'active' if pillar_testing else ''}">
+        <svg class="nav-icon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+        Testing
+      </a>
+      <a href="/workspace" class="nav-segment {'active' if pillar_workspace else ''}">
+        <svg class="nav-icon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76"/></svg>
+        Workspace Hub
+      </a>
+    </nav>
+
+    <!-- Operations Secondary Tools Dropdown -->
+    <div class="header-actions">
+      <div class="ops-menu-container">
+        <button type="button" class="ops-menu-btn" onclick="document.getElementById('ops-dropdown').classList.toggle('open')" aria-haspopup="true">
+          <span>Operations Tools</span>
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+        </button>
+        <div id="ops-dropdown" class="ops-dropdown-menu">
+          <div class="dropdown-group-title">Workflows & Team</div>
+          <a href="/workflows">Workflows</a>
+          <a href="/team">Team Roster</a>
+          <a href="/shifts">Shift Calendar</a>
+          <div class="dropdown-group-title">Intelligence & Analysis</div>
+          <a href="/followups">Follow-ups</a>
+          <a href="/clusters">Clusters</a>
+          <a href="/reports">Reports</a>
+          <a href="/audit">Audit Log</a>
+          <a href="/ai/history">AI History</a>
+          <div class="dropdown-group-title">Configuration</div>
+          <a href="/connectors">Connectors</a>
+          <a href="/settings">Settings & Diagnostics</a>
+        </div>
+      </div>
+    </div>
+  </div>
+</header>
+
+<main>
+{content}
+</main>
+
+<!-- Persistent Mobile Navigation -->
+<nav class="mobile-bottom-nav" aria-label="Mobile Navigation">
+  <a href="/" class="mobile-nav-item {'active' if pillar_today else ''}">
+    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+    <span>Today</span>
+  </a>
+  <a href="/work" class="mobile-nav-item {'active' if pillar_work else ''}">
+    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+    <span>Work</span>
+  </a>
+  <a href="/tests" class="mobile-nav-item {'active' if pillar_testing else ''}">
+    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/></svg>
+    <span>Testing</span>
+  </a>
+  <a href="/workspace" class="mobile-nav-item {'active' if pillar_workspace else ''}">
+    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76"/></svg>
+    <span>Workspace</span>
+  </a>
+  <a href="/settings" class="mobile-nav-item {'active' if pillar_ops else ''}">
+    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+    <span>Tools</span>
+  </a>
+</nav>
+
+<script>
+document.addEventListener('click', function(e) {{
+  var menu = document.getElementById('ops-dropdown');
+  var btn = document.querySelector('.ops-menu-btn');
+  if (menu && btn && !btn.contains(e.target) && !menu.contains(e.target)) {{
+    menu.classList.remove('open');
+  }}
+}});
+</script>
+</body>
+</html>'''
 
             def send_file(self, item):
                 path = Path(item.get('path') or '').resolve()
@@ -296,6 +1107,20 @@ th{{background:#f8f9fa;font-weight:600}}
                     return
 
                 route = parsed.path
+                if route in ('/today', '/overview'):
+                    route = '/'
+                elif route == '/work':
+                    sub = (params.get('sub') or ['kanban'])[0]
+                    if sub == 'items':
+                        route = '/work-items'
+                    elif sub == 'inbox':
+                        route = '/inbox'
+                    elif sub == 'cases':
+                        route = '/cases'
+                    else:
+                        route = '/kanban'
+                elif route == '/testing':
+                    route = '/tests'
 
                 if route == '/evidence':
                     item = service.database.evidence_item(int((params.get('id') or ['0'])[0]))
@@ -328,8 +1153,12 @@ th{{background:#f8f9fa;font-weight:600}}
 <h3>{col_title} <span class="tag">{len(col_cases)}</span></h3>
 {''.join(items_html) or '<p class="muted" style="text-align:center;padding:20px 0;">Empty</p>'}
 </div>''')
-                    content = f'''<h1>Kanban Board</h1>
-<p class="muted">Status tracking of active cases across operational stages.</p>
+                    content = render_work_sub_nav('kanban', len(inbox), len(cases)) + f'''<div class="today-hero">
+  <div>
+    <h1>Work Operations · Kanban Board</h1>
+    <p class="muted">Visual status tracking of active cases across operational stages.</p>
+  </div>
+</div>
 <div class="kanban-board">{''.join(cols_html)}</div>'''
 
                 # 2. REVIEW INBOX & BULK ACTIONS
@@ -442,8 +1271,12 @@ th{{background:#f8f9fa;font-weight:600}}
 {pagination_html}
 </form>'''
 
-                    content = f'''<h1>Review Inbox ({total_count} Messages)</h1>
-<p class="muted">Safe two-step bulk review with preview confirmation and atomic undo.</p>
+                    content = render_work_sub_nav('inbox', len(inbox), len(cases)) + f'''<div class="today-hero">
+  <div>
+    <h1>Work Operations · Review Inbox ({total_count} Messages)</h1>
+    <p class="muted">Safe two-step bulk review with preview confirmation and atomic undo.</p>
+  </div>
+</div>
 {filter_form}
 {bulk_actions}'''
 
@@ -578,7 +1411,13 @@ th{{background:#f8f9fa;font-weight:600}}
                     timeline = ''.join(f"<tr><td>{h(e['occurred_at'][:16].replace('T',' '))}</td><td>{h(e['event_type'])}</td><td>{h(e['detail'])}</td></tr>" for e in events)
                     evidence_rows = ''.join(f"<li><a href=\"/evidence?id={e['id']}\">Evidence #{e['id']} · {h(Path(e.get('path') or 'retained-metadata').name)}</a> — {h(e.get('caption'))}</li>" for e in evidence)
                     test_rows = ''.join(f"<li>TEST-{t['id']} [{h(t['result'])}] {h(t['scenario'])}</li>" for t in case_tests)
-                    content = f'''<h1>CASE-{case_id}</h1>{self.case_card(item, csrf_token)}
+                    content = render_work_sub_nav('cases', len(inbox), len(cases)) + f'''<div class="today-hero">
+  <div>
+    <h1>Work Operations · CASE-{case_id}</h1>
+    <p class="muted">Detailed operational case history, events, testing logs, and evidence.</p>
+  </div>
+</div>
+{self.case_card(item, csrf_token)}
 <section class="card"><h2>Timeline</h2><table><tr><th>When</th><th>Type</th><th>Detail</th></tr>{timeline}</table></section>
 <div class="grid"><section class="card"><h2>Testing</h2><ul>{test_rows or '<li>None</li>'}</ul></section>
 <section class="card"><h2>Evidence</h2><ul>{evidence_rows or '<li>None</li>'}</ul></section></div>'''
@@ -586,7 +1425,13 @@ th{{background:#f8f9fa;font-weight:600}}
                 # 7. CASES LIST
                 elif route == '/cases':
                     cards = ''.join(self.case_card(item, csrf_token) for item in cases) or '<p>No approved cases.</p>'
-                    content = f'''<h1>Cases</h1><section class="card"><h2>Merge duplicates</h2>
+                    content = render_work_sub_nav('cases', len(inbox), len(cases)) + f'''<div class="today-hero">
+  <div>
+    <h1>Work Operations · Cases & Issues ({len(cases)})</h1>
+    <p class="muted">Approved operational cases, escalation tracking, and duplicate merge tools.</p>
+  </div>
+</div>
+<section class="card"><h2>Merge duplicates</h2>
 <form method="post" action="/cases/merge"><input type="hidden" name="csrf_token" value="{csrf_token}">
 Source case <input name="source" type="number" min="1" required> into target <input name="target" type="number" min="1" required> <button>Merge</button></form></section>
 <div class="grid">{cards}</div>'''
@@ -698,8 +1543,12 @@ Source case <input name="source" type="number" min="1" required> into target <in
 <ul style="margin-bottom:0;">{b_rows}</ul>
 </div>'''
 
-                    content = f'''<h1>Work Items Hub</h1>
-<p class="muted">Unified operational view across Requirements, Tasks, and Support Cases with workflow stages, blockers, and assignments.</p>
+                    content = render_work_sub_nav('items', len(inbox), len(cases)) + f'''<div class="today-hero">
+  <div>
+    <h1>Work Operations · Items Hub ({len(items)} Items)</h1>
+    <p class="muted">Unified operational view across Requirements, Tasks, and Support Cases with workflow stages, blockers, and assignments.</p>
+  </div>
+</div>
 {blockers_summary}
 {create_req_card}
 {filter_bar}
@@ -784,6 +1633,7 @@ Source case <input name="source" type="number" min="1" required> into target <in
 
                 # 8. TESTING WORKSPACE (Enhanced with Requirements, Conditions, Cases & Executions)
                 elif route == '/tests':
+                    test_sub = (params.get('sub') or ['cases'])[0]
                     req_id_param = (params.get('req_id') or [''])[0]
                     selected_req_id = int(req_id_param) if req_id_param.isdigit() else None
 
@@ -870,14 +1720,34 @@ Source case <input name="source" type="number" min="1" required> into target <in
 </div>'''
 
                     session_cards = ''.join(self.test_card(item, csrf_token) for item in tests) or '<p class="muted">No exploratory test sessions recorded.</p>'
-                    exploratory_section = f'''<h2 style="margin-top:24px;">Exploratory & Ad-hoc Test Sessions</h2><div class="grid">{session_cards}</div>'''
+                    exploratory_section = f'''<div class="card" style="margin-top:20px;">
+  <div class="card-header-row">
+    <h2 class="card-title">Exploratory & Ad-hoc Test Sessions ({len(tests)})</h2>
+    <span class="tag">{len(tests)} Recorded</span>
+  </div>
+  <div class="grid">{session_cards}</div>
+</div>'''
 
-                    content = f'''<h1>Testing Operations Workspace</h1>
-<p class="muted">End-to-end quality workspace: requirements tracing, test case definitions, test executions, and exploratory session logs.</p>
-{req_selector}
+                    if test_sub == 'sessions':
+                        body_content = f'''{exploratory_section}
+<div style="margin-top:24px;">
+  <h2 style="font-size:16px;font-weight:600;margin-bottom:12px;">Requirements & Test Cases Reference</h2>
+  {req_selector}
+  {tc_table}
+</div>'''
+                    else:
+                        body_content = f'''{req_selector}
 {create_tc_card}
 {tc_table}
 {exploratory_section}'''
+
+                    content = render_testing_sub_nav(test_sub) + f'''<div class="today-hero">
+  <div>
+    <h1>Testing Operations Workspace</h1>
+    <p class="muted">End-to-end quality workspace: requirements tracing, test case definitions, test executions, and exploratory session logs.</p>
+  </div>
+</div>
+{body_content}'''
 
                 # 9. FOLLOW-UPS
                 elif route == '/followups':
@@ -977,7 +1847,11 @@ Source case <input name="source" type="number" min="1" required> into target <in
 <p><strong>Timezone:</strong> {h(config.TIMEZONE)}</p>
 </section></div>'''
 
-                # DEFAULT: TODAY OVERVIEW
+                # 14. GOOGLE WORKSPACE
+                elif route == '/workspace':
+                    content = render_workspace_view(service, csrf_token)
+
+                # DEFAULT: TODAY OVERVIEW (Comprehensive Operational Command Center)
                 else:
                     shift = service.database.active_shift()
                     work_items = service.work_item_service.list_work_items()
@@ -985,26 +1859,303 @@ Source case <input name="source" type="number" min="1" required> into target <in
                     test_cases = service.work_item_service.list_test_cases()
                     tc_passed = sum(1 for tc in test_cases if tc.get('last_execution_result') == 'pass')
                     tc_failed = sum(1 for tc in test_cases if tc.get('last_execution_result') == 'fail')
+                    tc_blocked = sum(1 for tc in test_cases if tc.get('last_execution_result') == 'blocked')
+                    total_tc = len(test_cases)
+                    pass_pct = int((tc_passed / total_tc) * 100) if total_tc > 0 else 0
 
-                    blocker_banner = ''
+                    active_cases = [c for c in cases if c['status'] not in ('closed', 'resolved')]
+                    pending_followups = service.database.list_followups(status='pending', limit=5)
+                    in_flight_items = [w for w in work_items if w.get('operational_status') in ('open', 'in_progress', 'blocked')][:6]
+                    recent_audits = service.database.get_audit_log(limit=4)
+
+                    # Hero shift action button
+                    if shift:
+                        shift_time = (shift.get('start') or '')[:16].replace('T', ' ')
+                        shift_status_badge = f'<span class="tag tag-ok" style="font-size:13px;">● Shift Active</span> <span class="muted" style="margin-left:6px;">Clocked in at {shift_time}</span>'
+                        shift_action_btn = f'''<form method="post" action="/shift/close" style="margin:0;display:inline;">
+                          <input type="hidden" name="csrf_token" value="{csrf_token}">
+                          <button class="danger" style="padding:6px 14px;font-size:12px;">Clock Out</button>
+                        </form>'''
+                    else:
+                        shift_status_badge = '<span class="tag" style="font-size:13px;">Off Duty</span> <span class="muted" style="margin-left:6px;">No active shift session</span>'
+                        shift_action_btn = f'''<form method="post" action="/shift/start" style="margin:0;display:inline;">
+                          <input type="hidden" name="csrf_token" value="{csrf_token}">
+                          <button class="primary" style="padding:6px 14px;font-size:12px;">Clock In (8h Shift)</button>
+                        </form>'''
+
+                    # 1. Today Hero Banner
+                    hero_banner = f'''<div class="today-hero">
+  <div>
+    <h1>Operational Command Center</h1>
+    <div style="display:flex;align-items:center;gap:10px;margin-top:4px;flex-wrap:wrap;">
+      {shift_status_badge}
+    </div>
+  </div>
+  <div class="today-hero-actions">
+    {shift_action_btn}
+    <a href="/work" class="btn-subtle">Work Items Hub &rarr;</a>
+    <a href="/tests" class="btn-subtle">Testing Workspace &rarr;</a>
+  </div>
+</div>'''
+
+                    # 2. Metric Band (4 responsive cards)
+                    metric_band = f'''<div class="metric-band">
+  <div class="metric-card">
+    <div class="metric-card-top">
+      <span class="metric-card-title">Shift State</span>
+      <span class="tag {'tag-ok' if shift else ''}">{'Active' if shift else 'Standby'}</span>
+    </div>
+    <div class="metric-card-value">{'On Duty' if shift else 'Off Duty'}</div>
+    <div class="metric-card-desc">{(shift.get('start') or '')[:16].replace('T', ' ') if shift else 'Clock in to log active operations'}</div>
+    <div class="metric-card-footer">
+      <a href="/shifts" class="muted" style="font-size:12px;">Shift calendar &rarr;</a>
+      {shift_action_btn}
+    </div>
+  </div>
+
+  <div class="metric-card">
+    <div class="metric-card-top">
+      <span class="metric-card-title">Work Items</span>
+      <span class="tag tag-info">{len(work_items)} Total</span>
+    </div>
+    <div class="metric-card-value">{len(in_flight_items)} <span style="font-size:14px;font-weight:normal;color:var(--text-muted);">in-flight</span></div>
+    <div class="metric-card-desc">{sum(1 for w in work_items if w.get('operational_status') == 'in_progress')} in progress · {len(active_blockers)} blocked</div>
+    <div class="metric-card-footer">
+      <a href="/work?sub=items" class="muted" style="font-size:12px;">Manage work &rarr;</a>
+      <a href="/work?sub=kanban" class="tag" style="text-decoration:none;">Kanban</a>
+    </div>
+  </div>
+
+  <div class="metric-card">
+    <div class="metric-card-top">
+      <span class="metric-card-title">Verification Posture</span>
+      <span class="tag {'tag-ok' if pass_pct >= 80 else 'tag-warn'}">{pass_pct}% Pass</span>
+    </div>
+    <div class="metric-card-value">{total_tc} <span style="font-size:14px;font-weight:normal;color:var(--text-muted);">test cases</span></div>
+    <div class="progress-bar-wrap">
+      <div class="progress-bar-fill" style="width:{pass_pct}%;"></div>
+    </div>
+    <div class="metric-card-footer">
+      <span style="font-size:12px;"><span style="color:var(--color-success);font-weight:600;">{tc_passed} Pass</span> · <span style="color:var(--color-danger);font-weight:600;">{tc_failed} Fail</span></span>
+      <a href="/tests" class="muted" style="font-size:12px;">Testing suite &rarr;</a>
+    </div>
+  </div>
+
+  <div class="metric-card">
+    <div class="metric-card-top">
+      <span class="metric-card-title">Review Inbox & Cases</span>
+      <span class="tag {'tag-warn' if len(inbox) > 0 else 'tag-ok'}">{len(inbox)} Pending</span>
+    </div>
+    <div class="metric-card-value">{len(active_cases)} <span style="font-size:14px;font-weight:normal;color:var(--text-muted);">open cases</span></div>
+    <div class="metric-card-desc">{len(cases)} approved total · {len(followups)} scheduled followups</div>
+    <div class="metric-card-footer">
+      <a href="/work?sub=inbox" class="muted" style="font-size:12px;">Triage inbox &rarr;</a>
+      <a href="/work?sub=cases" class="tag" style="text-decoration:none;">Cases</a>
+    </div>
+  </div>
+</div>'''
+
+                    # 3. Main Bento Left: Blockers Banner
                     if active_blockers:
-                        blocker_banner = f'''<div class="card" style="margin-bottom:16px;background:#fff8f8;border-color:#ffd7d7;">
-<h3 style="color:#cf222e;margin-top:0;">Attention: {len(active_blockers)} Active Blocker(s) Need Resolution</h3>
-<p class="muted">Items are paused waiting on internal/external dependencies. Check <a href="/work-items?status=blocked">Work Items</a> to review details.</p>
+                        b_list = []
+                        for b in active_blockers:
+                            b_list.append(f'''<div class="today-blocker-item">
+  <div class="today-blocker-header">
+    <strong style="color:var(--color-danger);">{h(b['entity_type'].upper())} #{b['entity_id']}</strong>
+    <span class="tag tag-err">{h(b.get('dependency_type') or 'Dependency')}</span>
+  </div>
+  <div style="font-size:13px;color:#7f1d1d;">{h(b['description'])}</div>
+</div>''')
+                        blocker_section = f'''<div class="card" style="border-left: 4px solid var(--color-danger);">
+  <div class="card-header-row">
+    <h2 class="card-title" style="color:var(--color-danger);">Active Blockers & Dependencies ({len(active_blockers)})</h2>
+    <a href="/work-items?status=blocked" class="btn-subtle" style="font-size:12px;">Resolve in Work Items &rarr;</a>
+  </div>
+  {''.join(b_list)}
+</div>'''
+                    else:
+                        blocker_section = '''<div class="card" style="border-left: 4px solid var(--color-success);padding:14px 18px;">
+  <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
+    <div style="display:flex;align-items:center;gap:10px;">
+      <span class="tag tag-ok">✓ Operational Flow Clear</span>
+      <span style="font-size:13px;color:var(--text-secondary);">No active blockers reported across requirements, tasks, or cases.</span>
+    </div>
+    <a href="/work?sub=items" class="muted" style="font-size:12px;">View all items &rarr;</a>
+  </div>
 </div>'''
 
-                    content = f'''<h1>Today Operations Overview</h1>
-<p class="muted">Live summary of shift status, work items, verification posture, and blockers.</p>
-{blocker_banner}
-<div class="grid">
-<div class="card"><h2>Active Shift</h2><p>{h(shift['start'] if shift else 'No active shift clocked')}</p><p>{h(shift['end'] if shift else '')}</p></div>
-<div class="card"><h2>Work Items Hub</h2><p><strong>{len(work_items)}</strong> total items tracked</p><p class="muted"><a href="/work-items">View Work Items &rarr;</a></p></div>
-<div class="card"><h2>Testing Posture</h2><p><strong>{len(test_cases)}</strong> test cases defined</p><p><span class="tag tag-ok">{tc_passed} Pass</span> <span class="tag tag-err">{tc_failed} Fail</span></p><p class="muted"><a href="/tests">Testing Workspace &rarr;</a></p></div>
-<div class="card"><h2>Cases & Inbox</h2><p>{len(cases)} approved · {sum(c['status'] not in ('closed', 'resolved') for c in cases)} active open</p><p>{len(inbox)} inbox pending</p></div>
-<div class="card"><h2>Follow-ups</h2><p>{len(followups)} scheduled</p></div>
+                    # 4. Main Bento Left: In-Flight Priority Work
+                    in_flight_rows = []
+                    for it in in_flight_items:
+                        st = it.get('operational_status') or 'open'
+                        if st == 'in_progress':
+                            badge = '<span class="tag tag-info">In Progress</span>'
+                        elif st == 'blocked':
+                            badge = '<span class="tag tag-err">Blocked</span>'
+                        else:
+                            badge = '<span class="tag">Open</span>'
+
+                        disp_id = f"{it['entity_type'].upper()[:4]}-{it['entity_id']}"
+                        in_flight_rows.append(f'''<tr>
+  <td><strong>{disp_id}</strong></td>
+  <td>
+    <strong>{h(it['title'][:65])}</strong>
+    <div class="muted" style="font-size:12px;">{h(it.get('client') or 'General')} {('· ' + h(it.get('product'))) if it.get('product') else ''}</div>
+  </td>
+  <td>{badge}</td>
+  <td>P{it.get('priority', 2)}</td>
+  <td><a href="/work?sub=items" class="btn-subtle">Open</a></td>
+</tr>''')
+
+                    in_flight_section = f'''<div class="card">
+  <div class="card-header-row">
+    <h2 class="card-title">Priority Work Queue</h2>
+    <a href="/work?sub=items" class="muted" style="font-size:12px;">All {len(work_items)} items &rarr;</a>
+  </div>
+  <div class="table-scroll-wrap">
+    <table>
+      <thead>
+        <tr><th>ID</th><th>Title & Context</th><th>Status</th><th>Priority</th><th>Action</th></tr>
+      </thead>
+      <tbody>
+        {''.join(in_flight_rows) or '<tr><td colspan="5" class="muted" style="text-align:center;padding:16px;">No in-flight work items. Queue is clear!</td></tr>'}
+      </tbody>
+    </table>
+  </div>
 </div>'''
 
-                self.send_html(self.page(content, csrf_token=csrf_token), set_sid=set_sid)
+                    # 5. Main Bento Left: Scheduled Follow-ups
+                    followup_rows = []
+                    for f in pending_followups:
+                        followup_rows.append(f'''<tr>
+  <td><strong>#{f['id']}</strong></td>
+  <td>{h(f.get('due_at', '')[:16].replace('T', ' '))}</td>
+  <td>
+    <div>{h(f.get('note') or 'Follow-up deliverable')}</div>
+    <div class="muted" style="font-size:11px;">Case #{f.get('case_id')} · Waiting on: {h(f.get('waiting_on') or 'Team')}</div>
+  </td>
+  <td>
+    <form method="post" action="/followup/complete" style="margin:0;display:inline;">
+      <input type="hidden" name="csrf_token" value="{csrf_token}">
+      <input type="hidden" name="id" value="{f['id']}">
+      <button style="padding:4px 8px;font-size:11px;">Complete</button>
+    </form>
+  </td>
+</tr>''')
+
+                    followup_section = f'''<div class="card">
+  <div class="card-header-row">
+    <h2 class="card-title">Scheduled Follow-ups ({len(followups)})</h2>
+    <a href="/followups" class="muted" style="font-size:12px;">View all &rarr;</a>
+  </div>
+  <div class="table-scroll-wrap">
+    <table>
+      <thead><tr><th>ID</th><th>Due</th><th>Deliverable & Context</th><th>Action</th></tr></thead>
+      <tbody>
+        {''.join(followup_rows) or '<tr><td colspan="4" class="muted" style="text-align:center;padding:16px;">No follow-ups due today.</td></tr>'}
+      </tbody>
+    </table>
+  </div>
+</div>'''
+
+                    # 6. Bento Side Column: Google Workspace Quick Actions
+                    workspace_card = f'''<div class="card">
+  <div class="card-header-row">
+    <h2 class="card-title">Google Workspace Hub</h2>
+    <a href="/workspace" class="tag tag-info" style="text-decoration:none;">Connected</a>
+  </div>
+  <p class="muted" style="margin-top:0;">Access your linked Google Workspace applications:</p>
+  <a href="/workspace" class="ws-quick-link">
+    <div class="ws-icon-wrap" style="background:#e8f0fe;color:#1967d2;">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+    </div>
+    <div>
+      <div style="font-weight:600;font-size:13px;">Google Drive & Docs</div>
+      <div class="muted" style="font-size:12px;">Browse docs, folders & retained evidence</div>
+    </div>
+  </a>
+  <a href="/workspace" class="ws-quick-link">
+    <div class="ws-icon-wrap" style="background:#e6f4ea;color:#137333;">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 21V9"/></svg>
+    </div>
+    <div>
+      <div style="font-weight:600;font-size:13px;">Google Sheets</div>
+      <div class="muted" style="font-size:12px;">Operational tracking, work items & test logs</div>
+    </div>
+  </a>
+  <a href="/workspace" class="ws-quick-link">
+    <div class="ws-icon-wrap" style="background:#fef7e0;color:#b06000;">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+    </div>
+    <div>
+      <div style="font-weight:600;font-size:13px;">Google Tasks</div>
+      <div class="muted" style="font-size:12px;">Import tasks directly into Review Inbox</div>
+    </div>
+  </a>
+</div>'''
+
+                    # 7. Bento Side Column: Operational Shortcuts
+                    shortcuts_card = f'''<div class="card">
+  <h2 class="card-title" style="margin-bottom:12px;">Quick Operations</h2>
+  <div style="display:flex;flex-direction:column;gap:8px;">
+    <a href="/work?sub=inbox" class="btn-subtle" style="justify-content:flex-start;padding:8px 12px;">
+      <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>
+      Review Pending Messages ({len(inbox)})
+    </a>
+    <a href="/work?sub=items" class="btn-subtle" style="justify-content:flex-start;padding:8px 12px;">
+      <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+      Add Requirement / Work Item
+    </a>
+    <a href="/tests?sub=cases" class="btn-subtle" style="justify-content:flex-start;padding:8px 12px;">
+      <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+      Define Structured Test Case
+    </a>
+    <a href="/shifts" class="btn-subtle" style="justify-content:flex-start;padding:8px 12px;">
+      <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+      Shift Schedule & Overrides
+    </a>
+  </div>
+</div>'''
+
+                    # 8. Bento Side Column: Recent Audit Trail
+                    audit_rows = []
+                    for a in recent_audits:
+                        t = (a.get('occurred_at') or '')[11:16]
+                        audit_rows.append(f'''<tr>
+  <td class="muted">{t}</td>
+  <td><strong>{h(a.get('operation_type') or 'action')}</strong></td>
+  <td class="muted">{h(a.get('actor') or 'user')}</td>
+</tr>''')
+
+                    audit_card = f'''<div class="card">
+  <div class="card-header-row">
+    <h2 class="card-title">Recent Activity</h2>
+    <a href="/audit" class="muted" style="font-size:12px;">Audit log &rarr;</a>
+  </div>
+  <table style="font-size:12px;">
+    <tbody>
+      {''.join(audit_rows) or '<tr><td colspan="3" class="muted">No recent events.</td></tr>'}
+    </tbody>
+  </table>
+</div>'''
+
+                    # Combine into Bento Layout
+                    content = f'''{hero_banner}
+{metric_band}
+<div class="bento-split">
+  <div class="bento-main">
+    {blocker_section}
+    {in_flight_section}
+    {followup_section}
+  </div>
+  <div class="bento-side">
+    {workspace_card}
+    {shortcuts_card}
+    {audit_card}
+  </div>
+</div>'''
+
+                self.send_html(self.page(content, title='Operations Dashboard · Personal Work Assistant', csrf_token=csrf_token, route=route), set_sid=set_sid)
 
             def do_POST(self):
                 parsed = urlparse(self.path)
@@ -1024,8 +2175,67 @@ Source case <input name="source" type="number" min="1" required> into target <in
                     return
 
                 try:
+                    # 0. QUICK SHIFT START/CLOSE FROM TODAY HERO
+                    if parsed.path == '/shift/start':
+                        now = datetime.now(ZoneInfo(config.TIMEZONE))
+                        start_iso = now.isoformat()
+                        end_iso = (now + timedelta(hours=8)).isoformat()
+                        service.database.start_shift(start=start_iso, end=end_iso, actor='dashboard')
+                        self.send_response(303)
+                        self.send_header('Location', '/')
+                        self.end_headers()
+                        return
+
+                    elif parsed.path == '/shift/close':
+                        shift = service.database.active_shift()
+                        if shift:
+                            service.database.close_shift(shift['id'])
+                        self.send_response(303)
+                        self.send_header('Location', '/')
+                        self.end_headers()
+                        return
+
+                    # 0B. WORKSPACE TASK IMPORT
+                    elif parsed.path == '/workspace/import-task':
+                        task_id = (form.get('task_id') or [''])[0]
+                        title = (form.get('title') or ['Untitled Task'])[0]
+                        notes = (form.get('notes') or [''])[0]
+                        due = (form.get('due') or [''])[0]
+                        if not task_id:
+                            raise ValueError('Missing Google Task ID.')
+                        key = hashlib.sha256(f'google_tasks|{task_id}'.encode('utf-8')).hexdigest()
+                        text = f"Google Task: {title}"
+                        if notes:
+                            text += f" — {notes}"
+                        now_str = datetime.now(timezone.utc).isoformat()
+                        service.database.add_source_message(
+                            source_type='google_tasks',
+                            source_key=key,
+                            chat_name='Google Tasks',
+                            external_message_id=task_id,
+                            occurred_at=now_str,
+                            author_name='Google Workspace',
+                            author_is_owner=False,
+                            text=text,
+                            redacted_text=text,
+                            message_kind='connector',
+                            media=[],
+                            classification='task',
+                            confidence=0.95,
+                            review_status='pending',
+                            metadata={'source': 'google_tasks', 'due': due, 'task_id': task_id, 'trusted': True}
+                        )
+                        self.send_html(self.page(f'''<h1>Task Imported to Review Inbox</h1>
+<div class="card">
+<p class="tag tag-ok">Successfully imported into Review Inbox</p>
+<p><strong>{h(title)}</strong></p>
+<p class="muted">This item is now queued in your review inbox for triage and case assignment.</p>
+<p><a href="/inbox">Open Review Inbox &rarr;</a> &nbsp;|&nbsp; <a href="/workspace">Back to Google Workspace</a></p>
+</div>''', csrf_token=expected_csrf))
+                        return
+
                     # 1. CASE STATUS
-                    if parsed.path == '/case/status':
+                    elif parsed.path == '/case/status':
                         service.database.update_case(int(form['id'][0]), 'status', form['status'][0])
 
                     # 2. MERGE CASES

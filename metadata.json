@@ -1,6 +1,6 @@
 {
   "name": "Personal Work Assistant",
-  "description": "Personal Work Assistant and Tester + Support Operations Hub for managing requirements, tasks, test suites, and workflows.",
+  "description": "Personal Work Assistant and Operations Hub with Telegram and Google Workspace (Drive, Docs, Sheets, Tasks) integrations for tasks, documents, and test workflows.",
   "requestFramePermissions": [],
   "majorCapabilities": [
     "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
