@@ -188,7 +188,42 @@ class GeminiAgent:
             return await client.generate_content_async(prompt, tools=tools_config)
         elif hasattr(client, 'generate_content'):
             return client.generate_content(prompt, tools=tools_config)
-        return {"text": f"Mock response for: {prompt}"}
+
+        # Connect google.genai Client using client.key or config.AI_KEY
+        api_key = getattr(client, 'key', None) or getattr(config, 'AI_KEY', None)
+        model_name = getattr(client, 'model', None) or getattr(config, 'AI_MODEL', 'gemini-2.5-flash')
+        if api_key:
+            try:
+                from google import genai
+                from google.genai import types
+
+                genai_client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=30000))
+
+                declarations = []
+                for tool_dict in tools_config:
+                    declarations.append(types.FunctionDeclaration(
+                        name=tool_dict["name"],
+                        description=tool_dict.get("description", ""),
+                        parameters=tool_dict.get("parameters")
+                    ))
+
+                genai_tools = [types.Tool(function_declarations=declarations)] if declarations else None
+                genai_config = types.GenerateContentConfig(
+                    system_instruction=SYSTEM_INSTRUCTION_MCP_AGENT,
+                    tools=genai_tools
+                )
+
+                async with genai_client.aio as aio_client:
+                    response = await asyncio.wait_for(
+                        aio_client.models.generate_content(model=model_name, contents=prompt, config=genai_config),
+                        timeout=35
+                    )
+                    return response
+            except Exception as exc:
+                logger.error(f"Failed calling real Gemini model via google.genai: {exc}")
+                raise
+
+        raise RuntimeError("No compatible Gemini AI client or API key available for function calling.")
 
     def _extract_function_calls(self, response: Any) -> List[Dict[str, Any]]:
         calls = []
@@ -204,12 +239,29 @@ class GeminiAgent:
                 if fn_call:
                     name = getattr(fn_call, "name", "")
                     args = getattr(fn_call, "args", {})
-                    calls.append({"name": name, "args": dict(args)})
+                    if hasattr(args, "to_dict"):
+                        args = args.to_dict()
+                    elif hasattr(args, "__dict__"):
+                        args = dict(args.__dict__)
+                    elif not isinstance(args, dict):
+                        try:
+                            args = dict(args)
+                        except Exception:
+                            args = {}
+                    calls.append({"name": name, "args": args})
         return calls
 
     def _extract_text_response(self, response: Any) -> str:
         if isinstance(response, dict):
             return response.get("text", str(response))
-        if hasattr(response, "text"):
-            return response.text or ""
+        if hasattr(response, "text") and response.text:
+            return response.text
+        candidates = getattr(response, "candidates", [])
+        for candidate in candidates:
+            content = getattr(candidate, "content", None)
+            parts = getattr(content, "parts", [])
+            for part in parts:
+                txt = getattr(part, "text", None)
+                if txt:
+                    return txt
         return str(response)

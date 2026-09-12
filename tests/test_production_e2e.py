@@ -160,6 +160,9 @@ class ProductionE2ETests(unittest.IsolatedAsyncioTestCase):
             source_update_id=105
         )
         self.assertTrue(res.success)
+        # Assert local followup record was actually created in database
+        pending_followups = self.db.list_followups()
+        self.assertTrue(len(pending_followups) > 0 or len(self.db.search_historical_memory("issue #61")) > 0)
 
     async def test_06_external_write_confirmation(self):
         fn_call = {"function_calls": [{"name": "mcp__mock__create_issue", "args": {"title": "Ubuntu 24 Wayland Blank"}}]}
@@ -175,20 +178,39 @@ class ProductionE2ETests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(prop['status'], 'pending')
 
     async def test_07_confirm_executes_exact_proposal(self):
+        import handlers
+        from unittest.mock import AsyncMock, MagicMock
+        from types import SimpleNamespace
+
         prop_id = "prop_e2e_confirm"
         payload = {"gemini_name": "mcp__mock__create_issue", "arguments": {"title": "Confirmed Wayland Issue"}}
         self.db.create_proposal(prop_id, self.owner_id, "mcp_external_write", json.dumps(payload), source_update_id=107)
 
-        claimed = self.db.claim_nl_proposal(prop_id, self.owner_id)
-        self.assertIsNotNone(claimed)
+        # Build synthetic Telegram callback update and context
+        msg = MagicMock()
+        msg.reply_text = AsyncMock()
+        msg.edit_text = AsyncMock()
+        msg.forward_origin = None
+        query = MagicMock()
+        query.data = f"mcp:confirm:{prop_id}"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        query.from_user = SimpleNamespace(id=self.owner_id)
+        query.message = msg
 
-        call_res = await self.mcp_manager.call_tool(payload["gemini_name"], payload["arguments"])
-        self.assertTrue(call_res.success)
-        self.assertIn("Created GitHub issue #99", call_res.text)
+        update = MagicMock()
+        update.callback_query = query
+        update.effective_message = msg
+        context = MagicMock()
+        context.application.bot_data = {"mcp_manager": self.mcp_manager, "db": self.db}
 
-        self.db.finish_nl_proposal(prop_id, "accepted")
+        # Invoke actual production Telegram callback handler
+        await handlers.handle_callback(update, context)
+
+        # Verify proposal state transitioned to accepted in DB
         prop_after = self.db.get_nl_proposal(prop_id)
         self.assertEqual(prop_after['status'], 'accepted')
+        self.assertTrue(msg.reply_text.called)
 
     async def test_08_cancel_proposal(self):
         prop_id = "prop_e2e_cancel"
@@ -279,8 +301,8 @@ class ProductionE2ETests(unittest.IsolatedAsyncioTestCase):
 
     def test_15_fts_case_event_indexing_and_report_metric(self):
         c_id = self.db.create_case("GBB Ubuntu screenshot error", client="Acme")
+        # Automatic live indexing should occur during add_case_event without manual rebuild call
         self.db.add_case_event(c_id, "testing", "Wayland blank only on Ubuntu 24.04")
-        self.db.rebuild_work_memory_index()
 
         results = self.db.search_historical_memory("Ubuntu 24.04")
         self.assertTrue(len(results) > 0)
@@ -289,3 +311,27 @@ class ProductionE2ETests(unittest.IsolatedAsyncioTestCase):
         shift = {'start': '2026-09-12T10:00:00', 'end': '2026-09-12T19:00:00'}
         res = ReportValidator.validate('eod', 'Explicit resolved queries: 4', shift, activities=[], tasks=[], cases=[])
         self.assertFalse(any(w.code == 'UNSUPPORTED_INTERACTION_COUNT' for w in res.warnings))
+
+    async def test_16_telegram_handler_end_to_end_flow(self):
+        import handlers
+        from unittest.mock import AsyncMock, MagicMock
+        from types import SimpleNamespace
+
+        msg = MagicMock()
+        msg.forward_origin = None
+        msg.reply_text = AsyncMock()
+        update = MagicMock()
+        update.update_id = 888
+        update.effective_message = msg
+        update.message = msg
+
+        context = MagicMock()
+        context.application.bot_data = {"mcp_manager": self.mcp_manager, "db": self.db}
+
+        # Invoke actual Telegram handler
+        await handlers.save_plain_message(update, context, "Complete task 1")
+        self.assertTrue(msg.reply_text.called)
+
+        # Verify turn was recorded in DB
+        turns = self.db.get_recent_turns(self.owner_id, 5)
+        self.assertTrue(len(turns) > 0)

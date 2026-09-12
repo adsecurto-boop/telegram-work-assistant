@@ -763,7 +763,7 @@ async def handle_callback(update, context):
             await reply(update, f'Could not accept proposal: {exc}')
             return
 
-        action_type = accepted.get('action_type')
+        action_type = accepted.get('action_type') or accepted.get('intent')
         raw_payload = accepted.get('proposal')
         payload = {}
         if isinstance(raw_payload, dict):
@@ -797,7 +797,7 @@ async def handle_callback(update, context):
             plan = ConversationPlan.model_validate(payload)
             res = await nlp.execute_plan(plan, shift)
             await asyncio.to_thread(db(context).finish_nl_proposal, prop_id, 'accepted')
-            await reply(update, res.summary_reply)
+            await reply(update, res.reply)
             return
 
         from nlp import NLInterpretation, NLActionExecutor, NLIntent, ReasonCode
@@ -943,9 +943,11 @@ async def handle(update, context):
             await reply(update, text, MENU)
         elif command in ('integrations', 'tools'):
             from mcp_manager import MCPManager
-            mgr = MCPManager()
-            mgr.load_config()
-            health = mgr.get_health_status()
+            mcp_mgr = context.application.bot_data.get('mcp_manager') if context and hasattr(context, 'application') and hasattr(context.application, 'bot_data') else None
+            if not mcp_mgr:
+                mcp_mgr = MCPManager()
+                mcp_mgr.load_config()
+            health = mcp_mgr.get_health_status()
             lines = ['🔌 **Personal Work Assistant — MCP Integrations**\n']
             if not health:
                 lines.append('No external MCP integrations configured in `mcp_config.json`.')

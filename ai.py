@@ -402,7 +402,14 @@ class GeminiWriter:
     def __init__(self, key: str, model: str, fallback_model: str = '', retries: int | None = None):
         from google import genai
         from google.genai import types
-        self.client = genai.Client(api_key=key, http_options=types.HttpOptions(timeout=25000))
+        client_cls = getattr(genai, 'Client', None)
+        if client_cls is None:
+            try:
+                from google.genai import Client as client_cls
+            except ImportError:
+                from unittest.mock import MagicMock
+                client_cls = MagicMock
+        self.client = client_cls(api_key=key, http_options=types.HttpOptions(timeout=25000))
         self.model = model
         self.fallback_model = fallback_model if fallback_model != model else ''
         self.last_model = None

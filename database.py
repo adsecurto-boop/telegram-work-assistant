@@ -666,15 +666,15 @@ class Database:
             conn.execute("DELETE FROM fts_work_memory")
             self._seed_v14_defaults(conn)
 
-        # Backfill conversation summaries
-        try:
-            cursor = connection.execute("SELECT id, summary_text, created_at FROM assistant_memory_summaries")
-            for row in cursor.fetchall():
-                connection.execute('''INSERT OR IGNORE INTO fts_work_memory (source_type, source_id, title, content, client, product, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                    ('conversation_summary', str(row['id']), 'Conversation Summary', row['summary_text'] or '', '', '', row['created_at'] or now_iso()))
-        except Exception:
-            pass
+            # Backfill conversation summaries inside the active connection context
+            try:
+                cursor = conn.execute("SELECT id, summary_text, created_at FROM assistant_memory_summaries")
+                for row in cursor.fetchall():
+                    conn.execute('''INSERT OR IGNORE INTO fts_work_memory (source_type, source_id, title, content, client, product, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                        ('conversation_summary', str(row['id']), 'Conversation Summary', row['summary_text'] or '', '', '', row['created_at'] or now_iso()))
+            except Exception as e:
+                logger.error(f"Error indexing assistant memory summaries in rebuild_work_memory_index: {e}")
 
     def _validate_schema_integrity(self, cursor):
         required_tables = {
@@ -2196,7 +2196,7 @@ class Database:
                        outcome=None, occurred_at=None, source_message_id=None,
                        correlation_id=None, audit_actor='system'):
         with self.connect() as connection:
-            case = connection.execute('SELECT * FROM work_cases WHERE id=?', (case_id,)).fetchone()
+            case = connection.execute('SELECT c.name as client_name, w.* FROM work_cases w LEFT JOIN clients c ON w.client_id = c.id WHERE w.id=?', (case_id,)).fetchone()
             if not case:
                 raise ValueError('Case not found.')
             stamp = now_iso()
@@ -2206,6 +2206,12 @@ class Database:
                 (case_id, shift_id, event_type, detail, actor_role, outcome,
                  source_message_id, occurred_at or stamp, stamp)).lastrowid
             connection.execute('UPDATE work_cases SET updated_at=? WHERE id=?', (stamp, case_id))
+            try:
+                connection.execute('''INSERT INTO fts_work_memory (source_type, source_id, title, content, client, product, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                    ('case_event', str(event_id), f"CaseEvent #{event_id}", f"Case #{case_id} [{event_type}]: {detail or ''}", case['client_name'] or '', case['product'] or '', occurred_at or stamp))
+            except Exception:
+                pass
             if correlation_id:
                 event = connection.execute('SELECT * FROM case_events WHERE id=?', (event_id,)).fetchone()
                 self._record_audit_in_connection(
@@ -3570,6 +3576,7 @@ class Database:
                 return None
             d = dict(row)
             d['proposal'] = json.loads(d['proposal_json'])
+            d['action_type'] = d.get('intent')
             return d
 
     def accept_nl_proposal(self, proposal_id: str, owner_id=None) -> dict:
@@ -3592,6 +3599,7 @@ class Database:
             d = dict(row)
             d['status'] = 'accepted'
             d['proposal'] = json.loads(d['proposal_json'])
+            d['action_type'] = d.get('intent')
             return d
 
     def claim_nl_proposal(self, proposal_id: str, owner_id=None) -> dict:
@@ -3613,6 +3621,7 @@ class Database:
             result = dict(row)
             result['status'] = 'executing'
             result['proposal'] = json.loads(result['proposal_json'])
+            result['action_type'] = result.get('intent')
             return result
 
     def finish_nl_proposal(self, proposal_id: str, status: str):

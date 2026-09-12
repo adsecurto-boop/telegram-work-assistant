@@ -169,6 +169,14 @@ class AssistantOrchestrator:
         if match_issue:
             new_refs['github_issue'] = {"number": int(match_issue.group(1))}
 
+        # Execute local action continuation if requested in user text alongside MCP read
+        low_text = text.lower()
+        if any(kw in low_text for kw in ["remind me", "follow up", "create task", "add event"]):
+            shift = await asyncio.to_thread(self.db.active_shift)
+            local_interp = await self.nlp.interpret_message(text, shift=shift)
+            if local_interp and local_interp.intent not in (NLIntent.UNKNOWN,):
+                await self.nlp.executor.execute(local_interp, shift)
+
         return OrchestrationResult(
             reply_text=res.final_text,
             actions_executed=res.tool_calls_executed,
@@ -204,7 +212,7 @@ class AssistantOrchestrator:
         # Policy check every planned action for high-risk write confirmation
         high_risk_actions = []
         for action in plan.actions:
-            decision, would_mutate, reason = evaluate_action_policy(action, shift)
+            decision, would_mutate, reason = evaluate_action_policy(action, has_active_shift=bool(shift))
             if decision in (ActionDecision.PROPOSE_CONFIRMATION, ActionDecision.REQUIRE_CLARIFICATION):
                 high_risk_actions.append(action)
 
@@ -222,7 +230,7 @@ class AssistantOrchestrator:
                 prop_id=prop_id,
                 owner_id=owner_id,
                 action_type="compound_plan",
-                payload_json=json.dumps({"plan_actions": [a.dict() for a in plan.actions]}),
+                payload_json=json.dumps(plan.model_dump()),
                 source_update_id=source_update_id
             )
             return OrchestrationResult(
