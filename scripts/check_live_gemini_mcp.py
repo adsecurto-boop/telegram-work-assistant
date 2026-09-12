@@ -20,7 +20,8 @@ async def main() -> int:
     manager = MCPManager()
     manager.load_config({"mcpServers": {"mock": {
         "enabled": True, "transport": "stdio", "command": sys.executable,
-        "args": ["-m", "tests.mock_mcp_server"], "env": {},
+        "args": ["-m", "tests.mock_mcp_server"],
+        "read_only_tools": ["search_issues", "get_issue"], "env": {},
     }}})
     model = GeminiToolModel(config.AI_KEY, config.AI_MODEL)
     try:
@@ -32,6 +33,7 @@ async def main() -> int:
         print(f"model={config.AI_MODEL}")
         print(f"mcp_protocol={manager.get_health_status()['mock']['protocol_version']}")
         print(f"tool_calls={len(result.tool_calls_executed)}")
+        print(f"function_response_role={model.last_function_response_role}")
         print(f"final_used_tool_result={bool('61' in result.final_text)}")
         return 0 if round_trip else 1
     finally:

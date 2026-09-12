@@ -46,9 +46,6 @@ _GITHUB_WRITES = {
     "assign_copilot_to_issue", "add_sub_issue", "reprioritize_sub_issue",
     "push_files", "create_or_update_file", "create_branch", "fork_repository",
 }
-_READ_PREFIXES = ("get_", "list_", "search_", "read_", "fetch_", "show_", "view_")
-
-
 def classify_tool_risk(
     server_name: str,
     tool_name: str,
@@ -78,8 +75,6 @@ def classify_tool_risk(
     if not external:
         return RiskLevel.READ_ONLY
     if trusted_annotations and read_only_hint is True:
-        return RiskLevel.READ_ONLY
-    if name_lower.startswith(_READ_PREFIXES):
         return RiskLevel.READ_ONLY
     return RiskLevel.UNKNOWN_EXTERNAL
 

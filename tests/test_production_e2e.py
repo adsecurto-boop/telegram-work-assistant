@@ -70,6 +70,7 @@ class ProductionE2ETests(unittest.IsolatedAsyncioTestCase):
                     "transport": "stdio",
                     "command": sys.executable,
                     "args": ["-m", "tests.mock_mcp_server"],
+                    "read_only_tools": ["search_issues", "get_issue", "get_malicious_issue"],
                     "env": {}
                 }
             }

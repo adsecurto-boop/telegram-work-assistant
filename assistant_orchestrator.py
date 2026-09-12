@@ -13,7 +13,7 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from database import Database
@@ -26,6 +26,7 @@ from mcp_registry import ToolRegistry, RiskLevel
 from mcp_policy import ToolPolicy, PolicyDecision
 from agent_orchestrator import GeminiAgent, AgentRunResult, SYSTEM_INSTRUCTION_MCP_AGENT
 from gemini_tool_model import ToolCallingModel
+from domain import parse_due
 import config
 
 logger = logging.getLogger("assistant_orchestrator")
@@ -52,6 +53,74 @@ class AgentContinuationResult:
     local_action_executed: Optional[Dict[str, Any]] = None
 
 
+class ExternalFactContinuationPlanner:
+    """Turns verified external facts into a strictly allowlisted local plan."""
+    ALLOWED_INTENTS = {
+        NLIntent.ADD_CASE_EVENT, NLIntent.CREATE_TASK, NLIntent.CREATE_FOLLOWUP,
+        NLIntent.UPDATE_CASE,
+    }
+
+    def __init__(self, semantic_planner: Any = None):
+        self.semantic_planner = semantic_planner
+
+    async def plan(self, user_message: str, facts: List[Dict[str, Any]],
+                   context: Dict[str, Any], case_id: Optional[int]) -> Optional[ConversationPlan]:
+        if self.semantic_planner and hasattr(self.semantic_planner, "interpret_external_continuation"):
+            candidate = self.semantic_planner.interpret_external_continuation(
+                user_message, facts, context, sorted(i.value for i in self.ALLOWED_INTENTS))
+            if hasattr(candidate, "__await__"):
+                candidate = await candidate
+            if candidate:
+                plan = candidate if isinstance(candidate, ConversationPlan) else ConversationPlan.model_validate(candidate)
+                if any(action.intent not in self.ALLOWED_INTENTS for action in plan.actions):
+                    raise ValueError("External continuation proposed a non-local or unsupported action")
+                return plan
+
+        # Credential-free safety fallback for the small deterministic local action grammar.
+        state = self._state(facts)
+        low = user_message.casefold()
+        actions: List[PlannedAction] = []
+        if any(phrase in low for phrase in ("add its current state", "add its current status", "save the issue number")):
+            if not case_id:
+                return ConversationPlan(
+                    clarification_question=("I found the external issue, but I don't know which local case "
+                                            "you want me to attach this to."))
+            actions.append(PlannedAction(
+                intent=NLIntent.ADD_CASE_EVENT,
+                entities=NLEntities(case_id=case_id, event_type="external_status",
+                                    event_detail=f"External issue current state: {state or 'unknown'}")))
+        condition_requested = any(p in low for p in ("if it is", "if it's", "if still", "if the issue"))
+        if condition_requested and state != "open":
+            return ConversationPlan(reply="The condition was not met, so I did not create a reminder.")
+        if "retest task" in low:
+            actions.append(PlannedAction(
+                intent=NLIntent.CREATE_TASK,
+                entities=NLEntities(task_title="Retest external issue", date=parse_due("tomorrow"))))
+        elif "remind me" in low or "follow up" in low:
+            if not case_id:
+                return ConversationPlan(
+                    clarification_question=("I found the external issue, but I don't know which local case "
+                                            "you want me to attach this to."))
+            actions.append(PlannedAction(
+                intent=NLIntent.CREATE_FOLLOWUP,
+                entities=NLEntities(case_id=case_id, followup_due=parse_due("tomorrow"),
+                                    notes="Re-check external issue state and follow up with development",
+                                    waiting_on="development")))
+        return ConversationPlan(actions=actions) if actions else None
+
+    @staticmethod
+    def _state(facts: List[Dict[str, Any]]) -> Optional[str]:
+        serialized = json.dumps(facts, ensure_ascii=False)
+        for fact in facts:
+            data = fact.get("data")
+            if isinstance(data, dict):
+                value = data.get("state") or data.get("status")
+                if isinstance(value, str):
+                    return value.casefold()
+        match = re.search(r'\b(open|closed)\b', serialized, re.IGNORECASE)
+        return match.group(1).casefold() if match else None
+
+
 class AssistantOrchestrator:
 
     def __init__(self, db: Database, mcp_manager: Optional[MCPManager] = None,
@@ -61,6 +130,7 @@ class AssistantOrchestrator:
         self.ai_client = ai_client
         self.tool_model = tool_model
         self.nlp = NaturalLanguagePipeline(db, ai_client=ai_client)
+        self.external_continuation_planner = ExternalFactContinuationPlanner(ai_client)
 
     async def route_and_process(
         self,
@@ -76,14 +146,14 @@ class AssistantOrchestrator:
 
         # 2. Check if external integration tool call is needed
         needs_mcp = self._detect_external_tool_need(text, active_refs)
-        if needs_mcp and self.mcp_manager:
-            active_tools = self.mcp_manager.registry.list_tools()
-            if active_tools:
+        if needs_mcp:
+            active_tools = self.mcp_manager.registry.list_tools() if self.mcp_manager else []
+            if active_tools and self._registry_supports_request(text, active_refs):
                 return await self._process_mcp_agent_path(text, owner_id, active_refs, source_update_id)
-            integration = "GitHub" if any(word in text.casefold() for word in ("github", "issue", "pull request", "repo")) else "the external integration"
+            integration = self._requested_integration(text) or "external"
             return OrchestrationResult(
-                reply_text=(f"I couldn't check {integration} right now. Your local work data "
-                            f"and commands are still available. Reference: ERR-{uuid.uuid4().hex[:6].upper()}"),
+                reply_text=(f"The {integration} integration is not configured or currently available. "
+                            "Your local work data and commands are still available."),
                 active_external_refs=active_refs, success=False, error="integration_unavailable",
             )
 
@@ -109,19 +179,51 @@ class AssistantOrchestrator:
 
     def _detect_external_tool_need(self, text: str, active_refs: Optional[Dict[str, Any]] = None) -> bool:
         low = text.lower()
-        tool_keywords = [
-            "github", "issue", "pull request", "pr", "repo", "repository",
-            "gmail", "email", "mail", "inbox",
-            "calendar", "meeting", "event",
-            "drive", "google document", "google doc"
-        ]
-        if any(k in low for k in tool_keywords):
+        if re.search(r'\b(?:github|repo|repository|gmail|email|mail|inbox|calendar|meeting|drive)\b', low) \
+                or any(phrase in low for phrase in ("pull request", "google document", "google doc")):
+            return True
+        if re.search(r'\bissue\s*#?\d+\b', low) and any(
+                phrase in low for phrase in ("check", "still open", "closed now", "current state", "current status")):
             return True
         if active_refs and any(w in low for w in [
             "who created", "who opened", "what labels", "assignee", "comment",
             "is it", "does it", "still open", "closed now", "its state", "its status",
         ]):
             return True
+        return False
+
+    @staticmethod
+    def _requested_integration(text: str) -> Optional[str]:
+        low = text.casefold()
+        for name, keywords in {
+            "GitHub": ("github", "pull request", "repository", "repo"),
+            "Gmail": ("gmail", "email", "mail", "inbox"),
+            "Google Calendar": ("calendar", "meeting"),
+            "Google Drive": ("drive", "google document", "google doc"),
+        }.items():
+            if any((keyword in low if ' ' in keyword else
+                    re.search(rf'\b{re.escape(keyword)}\b', low)) for keyword in keywords):
+                return name
+        return None
+
+    def _registry_supports_request(self, text: str, active_refs: Dict[str, Any]) -> bool:
+        requested = self._requested_integration(text)
+        if not requested and active_refs:
+            requested = "GitHub" if "github_issue" in active_refs else None
+        if not requested and re.search(r'\bissue\s*#?\d+\b', text.casefold()):
+            requested = "GitHub"
+        if not requested:
+            return False
+        needles = {
+            "GitHub": ("github", "issue", "pull", "repository", "repo"),
+            "Gmail": ("gmail", "email", "mail", "inbox"),
+            "Google Calendar": ("calendar", "meeting", "event"),
+            "Google Drive": ("drive", "document", "file"),
+        }[requested]
+        for tool in self.mcp_manager.registry.list_tools():
+            haystack = f"{tool.server_name} {tool.original_name} {tool.description}".casefold()
+            if any(needle in haystack for needle in needles):
+                return True
         return False
 
     def _detect_plan_need(self, text: str) -> bool:
@@ -224,6 +326,7 @@ class AssistantOrchestrator:
                         "provider": "github", "repository": repository,
                         "number": int(number), "url": url,
                         "title": item.get("title"),
+                        "state": item.get("state") or item.get("status"),
                         "fetched_at": datetime.now(timezone.utc).isoformat(),
                         "source_tool": result.tool_id,
                     }
@@ -240,50 +343,38 @@ class AssistantOrchestrator:
                                             result: AgentRunResult,
                                             context_data: Dict[str, Any]) -> AgentContinuationResult:
         facts = [r.model_payload() for r in result.tool_results if r.success]
-        low = text.casefold()
-        conditional_reminder = ("remind me" in low or "follow up" in low) and any(
-            phrase in low for phrase in ("if it is", "if it's", "if still", "if the issue")
-        )
-        continuation = AgentContinuationResult(result.final_text, facts, conditional_reminder)
-        if not conditional_reminder:
-            return continuation
-
-        state: Optional[str] = None
-        for tool_result in result.tool_results:
-            if not tool_result.success:
-                continue
-            if isinstance(tool_result.data, dict):
-                value = tool_result.data.get("state") or tool_result.data.get("status")
-                if isinstance(value, str):
-                    state = value.casefold()
-            if not state:
-                match = re.search(r"\b(open|closed)\b", tool_result.text, re.IGNORECASE)
-                state = match.group(1).casefold() if match else None
-        if state != "open":
-            if state:
-                continuation.final_answer += "\n\nThe condition was not met, so I did not create a reminder."
-            return continuation
-
+        continuation = AgentContinuationResult(result.final_text, facts)
         active_case = context_data.get("active_case") or {}
         case_id = active_case.get("id") if isinstance(active_case, dict) else None
         if not case_id:
-            cases = await asyncio.to_thread(self.db.list_cases, None, 1)
-            case_id = cases[0]["id"] if cases else None
-        if not case_id:
-            continuation.final_answer += "\n\nThe issue is open, but no active case exists to attach a reminder to."
+            cases = await asyncio.to_thread(self.db.list_cases, None, 2)
+            case_id = cases[0]["id"] if len(cases) == 1 else None
+        plan = await self.external_continuation_planner.plan(text, facts, context_data, case_id)
+        if not plan:
             return continuation
-        due_at = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
-        correlation_id = f"external_cont_{uuid.uuid4().hex[:10]}"
-        followup_id = await asyncio.to_thread(
-            self.db.add_followup, case_id, due_at,
-            "Re-check external issue state and follow up with development",
-            "development", None, "case", correlation_id, "assistant_orchestrator",
-        )
-        continuation.local_action_executed = {
-            "intent": "create_followup", "followup_id": followup_id,
-            "case_id": case_id, "condition": "external issue state == open",
-        }
-        continuation.final_answer += f"\n\nThe issue is open, so I created follow-up #{followup_id} for tomorrow."
+        if plan.clarification_question:
+            continuation.final_answer += "\n\n" + plan.clarification_question
+            return continuation
+        if not plan.actions:
+            if plan.reply:
+                continuation.final_answer += "\n\n" + plan.reply
+            return continuation
+        shift = await asyncio.to_thread(self.db.active_shift)
+        for action in plan.actions:
+            decision, _mutates, _reason = evaluate_action_policy(action, has_active_shift=bool(shift))
+            if decision not in (ActionDecision.EXECUTE_IMMEDIATELY, ActionDecision.READ_ONLY):
+                continuation.final_answer += "\n\nThe local continuation requires clarification or confirmation."
+                return continuation
+        executed = await self.nlp.execute_plan(plan, shift)
+        if executed.success:
+            continuation.local_action_executed = {
+                "intent": "external_fact_continuation",
+                "actions": executed.executed_actions,
+                "correlation_id": executed.correlation_id,
+            }
+            continuation.final_answer += "\n\n" + executed.reply
+        else:
+            continuation.final_answer += "\n\n" + executed.reply
         return continuation
 
     async def _process_conversation_plan_path(

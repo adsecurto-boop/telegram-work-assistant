@@ -41,7 +41,7 @@ class TestMCPRegistryAndAdapter(unittest.TestCase):
         self.assertEqual(name, "mcp__github_api__search_issues")
 
     def test_risk_level_classification(self):
-        self.assertEqual(classify_tool_risk("github", "search_issues"), RiskLevel.READ_ONLY)
+        self.assertEqual(classify_tool_risk("github", "search_issues"), RiskLevel.UNKNOWN_EXTERNAL)
         self.assertEqual(classify_tool_risk("github", "create_issue"), RiskLevel.EXTERNAL_WRITE)
         self.assertEqual(classify_tool_risk("filesystem", "delete_file"), RiskLevel.DESTRUCTIVE)
         self.assertEqual(classify_tool_risk("local", "create_task"), RiskLevel.LOCAL_WRITE)
@@ -140,6 +140,17 @@ class TestMCPPolicyAndSecurity(unittest.TestCase):
         self.assertNotIn("verysecretvalue", payload)
         self.assertNotIn("access_token", payload)
 
+    def test_nested_model_payload_redacts_common_secret_forms(self):
+        tr = ToolResult("vendor.read", "mcp__vendor__read", True, data={
+            "metadata": [{"api_key": "plainApiSecret123", "nested": {
+                "password": "plainPassword123", "note": "github_pat_ABCDEF1234567890"}}],
+            "authorization": "Bearer abcdefghijklmnop",
+        })
+        payload = json.dumps(tr.model_payload())
+        for secret in ("plainApiSecret123", "plainPassword123", "github_pat_ABCDEF1234567890",
+                       "abcdefghijklmnop"):
+            self.assertNotIn(secret, payload)
+
 
 class TestMCPManagerAndAgentIntegration(unittest.IsolatedAsyncioTestCase):
 
@@ -152,6 +163,7 @@ class TestMCPManagerAndAgentIntegration(unittest.IsolatedAsyncioTestCase):
                     "transport": "stdio",
                     "command": sys.executable,
                     "args": ["-m", "tests.mock_mcp_server"],
+                    "read_only_tools": ["search_issues", "get_issue", "get_malicious_issue"],
                     "env": {}
                 }
             }
@@ -231,7 +243,8 @@ class TestMCPManagerAndAgentIntegration(unittest.IsolatedAsyncioTestCase):
         ])
         agent = GeminiAgent(self.manager, ai_client=client)
         result = await agent.run("Read the issue only")
-        self.assertIsNotNone(result.pending_confirmation)
+        self.assertIsNone(result.pending_confirmation)
+        self.assertIn("outside the user's authorization scope", json.dumps(client.requests[-1]))
         self.assertEqual([call["tool_id"] for call in result.tool_calls_executed],
                          ["mock.search_issues"])
 

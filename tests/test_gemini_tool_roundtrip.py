@@ -54,6 +54,22 @@ class GeminiNativeRoundTripTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.id, "call-61")
         self.assertTrue(response.response["success"])
         self.assertEqual(response.response["data"]["state"], "open")
+        self.assertEqual(sent[0].role, "user")
+        self.assertEqual(sent[1].role, "model")
+        self.assertEqual(sent[2].role, "tool")
+
+    def test_parallel_function_responses_keep_ids_names_and_order(self):
+        adapter = GeminiToolModel.__new__(GeminiToolModel)
+        adapter._types = types
+        from gemini_tool_model import ModelFunctionCall
+        calls = [
+            ModelFunctionCall("search_issues", {"q": "Wayland"}, "call-1"),
+            ModelFunctionCall("get_issue", {"number": 61}, "call-2"),
+        ]
+        content = adapter.function_response_content(calls, [{"result": "a"}, {"result": "b"}])
+        self.assertEqual(content.role, "tool")
+        self.assertEqual([(p.function_response.name, p.function_response.id) for p in content.parts],
+                         [("search_issues", "call-1"), ("get_issue", "call-2")])
 
 
 if __name__ == "__main__":

@@ -37,6 +37,7 @@ class GeminiToolModel:
         from google import genai
         from google.genai import types
         self.model = model
+        self.last_function_response_role = "tool"
         self._types = types
         self._client = genai.Client(
             api_key=api_key,
@@ -51,7 +52,7 @@ class GeminiToolModel:
         parts = [self._types.Part(function_response=self._types.FunctionResponse(
             name=call.name, response=payload, id=call.call_id))
             for call, payload in zip(calls, payloads)]
-        return self._types.Content(role="user", parts=parts)
+        return self._types.Content(role="tool", parts=parts)
 
     async def generate(self, messages: List[Any], tools: List[Dict[str, Any]],
                        system_instruction: Optional[str] = None) -> ModelTurn:
@@ -64,17 +65,44 @@ class GeminiToolModel:
             system_instruction=system_instruction,
             tools=[self._types.Tool(function_declarations=declarations)] if declarations else None,
         )
-        response = await self._client.aio.models.generate_content(
-            model=self.model, contents=messages, config=config,
-        )
-        content = response.candidates[0].content if response.candidates else None
+        try:
+            response = await self._client.aio.models.generate_content(
+                model=self.model, contents=messages, config=config,
+            )
+        except Exception as exc:
+            # Gemini 3.6's GenerateContent endpoint currently documents/accepts function
+            # responses as user content even though the generic SDK manual example uses tool.
+            # Retry only this explicit provider compatibility error; all others propagate.
+            if "Role 'tool' is not supported" not in str(exc):
+                raise
+            compatible_messages = [
+                item.model_copy(update={"role": "user"})
+                if getattr(item, "role", None) == "tool" and hasattr(item, "model_copy") else item
+                for item in messages
+            ]
+            self.last_function_response_role = "user(provider-compat)"
+            response = await self._client.aio.models.generate_content(
+                model=self.model, contents=compatible_messages, config=config,
+            )
+        candidates = getattr(response, "candidates", None) or []
+        content = getattr(candidates[0], "content", None) if candidates else None
         calls: List[ModelFunctionCall] = []
         texts: List[str] = []
         for part in getattr(content, "parts", []) or []:
             fn = getattr(part, "function_call", None)
             if fn:
+                raw_args = getattr(fn, "args", None)
+                if raw_args is None:
+                    arguments = {}
+                elif isinstance(raw_args, dict):
+                    arguments = dict(raw_args)
+                else:
+                    try:
+                        arguments = dict(raw_args)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError("Gemini returned malformed function arguments") from exc
                 calls.append(ModelFunctionCall(
-                    name=fn.name or "", arguments=dict(fn.args or {}),
+                    name=fn.name or "", arguments=arguments,
                     call_id=getattr(fn, "id", None),
                 ))
             if getattr(part, "text", None):
@@ -97,8 +125,8 @@ class CompatibleToolModel:
 
     def function_response_content(self, calls: List[ModelFunctionCall],
                                   payloads: List[Dict[str, Any]]) -> Dict[str, Any]:
-        return {"role": "user", "parts": [
-            {"function_response": {"name": call.name, "response": payload}}
+        return {"role": "tool", "parts": [
+            {"function_response": {"name": call.name, "response": payload, "id": call.call_id}}
             for call, payload in zip(calls, payloads)
         ]}
 
@@ -121,11 +149,17 @@ class CompatibleToolModel:
         if isinstance(response, ModelTurn):
             return response
         if isinstance(response, dict):
-            calls = [ModelFunctionCall(
-                name=call.get("name", ""),
-                arguments=dict(call.get("args", call.get("arguments", {})) or {}),
-                call_id=call.get("id"),
-            ) for call in response.get("function_calls", [])]
+            calls = []
+            for call in response.get("function_calls", []) or []:
+                if not isinstance(call, dict):
+                    raise ValueError("Tool model returned a malformed function call")
+                raw_args = call.get("args", call.get("arguments", {}))
+                if not isinstance(raw_args, dict):
+                    raise ValueError("Tool model returned malformed function arguments")
+                calls.append(ModelFunctionCall(
+                    name=str(call.get("name", "")), arguments=dict(raw_args),
+                    call_id=call.get("id"),
+                ))
             return ModelTurn(response.get("text"), calls, response)
         candidates = getattr(response, "candidates", []) or []
         content = getattr(candidates[0], "content", None) if candidates else None
@@ -133,7 +167,13 @@ class CompatibleToolModel:
         for part in getattr(content, "parts", []) or []:
             fn = getattr(part, "function_call", None)
             if fn:
-                calls.append(ModelFunctionCall(fn.name or "", dict(fn.args or {}), getattr(fn, "id", None)))
+                raw_args = getattr(fn, "args", None) or {}
+                if not isinstance(raw_args, dict):
+                    try:
+                        raw_args = dict(raw_args)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError("Tool model returned malformed function arguments") from exc
+                calls.append(ModelFunctionCall(fn.name or "", dict(raw_args), getattr(fn, "id", None)))
             if getattr(part, "text", None):
                 texts.append(part.text)
         text = "\n".join(texts) or getattr(response, "text", None)

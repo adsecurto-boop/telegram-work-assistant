@@ -14,11 +14,11 @@ from typing import Any, Dict, List, Optional
 from mcp import Client, StdioServerParameters
 from mcp.client.streamable_http import streamable_http_client
 
-from mcp_registry import ToolRegistry
+from mcp_registry import RiskLevel, ToolRegistry, classify_tool_risk
 
 logger = logging.getLogger("mcp_manager")
 SUPPORTED_TRANSPORTS = {"stdio", "streamable_http"}
-TRUSTED_ANNOTATION_SERVERS = {"github"}
+MAX_TOOL_DISCOVERY_PAGES = 100
 
 
 def _utc_now() -> str:
@@ -46,8 +46,10 @@ def _redact_model_value(value: Any) -> Any:
     if isinstance(value, str):
         return AIPayloadBuilder.redact_text(value)
     if isinstance(value, dict):
+        sensitive_keys = {"authorization", "access_token", "refresh_token", "api_key",
+                          "apikey", "password", "secret", "token", "credential"}
         return {str(key): _redact_model_value(item) for key, item in value.items()
-                if str(key).casefold() not in {"authorization", "access_token", "refresh_token"}}
+                if str(key).casefold().replace("-", "_") not in sensitive_keys}
     if isinstance(value, list):
         return [_redact_model_value(item) for item in value]
     return value
@@ -148,8 +150,21 @@ class MCPServerConnection:
     async def list_tools(self, timeout: float = 10.0) -> List[Any]:
         if not self.client:
             return []
-        result = await asyncio.wait_for(self.client.list_tools(), timeout=timeout)
-        return list(result.tools)
+        tools: List[Any] = []
+        cursor: Optional[str] = None
+        seen_cursors: set[str] = set()
+        for _page_number in range(MAX_TOOL_DISCOVERY_PAGES):
+            result = await asyncio.wait_for(
+                self.client.list_tools(cursor=cursor), timeout=timeout)
+            tools.extend(list(result.tools))
+            next_cursor = getattr(result, "next_cursor", None)
+            if next_cursor is None:
+                return tools
+            if next_cursor in seen_cursors:
+                raise RuntimeError("MCP tool pagination cursor cycle detected")
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        raise RuntimeError(f"MCP tool discovery exceeded {MAX_TOOL_DISCOVERY_PAGES} pages")
 
     async def call_tool(self, tool_name: str, arguments: Dict[str, Any], timeout: float = 30.0) -> Any:
         if not self.client:
@@ -213,9 +228,24 @@ class MCPManager:
             return
         try:
             raw_tools = await server.list_tools(timeout=timeout)
-            self.registry.clear_server_tools(server_name)
+            discovered = []
             for tool in raw_tools:
                 annotations = _as_dict(getattr(tool, "annotations", None))
+                discovered.append((tool, annotations))
+            self.registry.clear_server_tools(server_name)
+            for tool, annotations in discovered:
+                trusted_annotations = self._annotations_are_trusted(server)
+                explicit_read_allowlist = set(server.config.get("read_only_tools", []))
+                read_only_hint = annotations.get("readOnlyHint", annotations.get("read_only_hint"))
+                destructive_hint = annotations.get("destructiveHint", annotations.get("destructive_hint"))
+                risk = classify_tool_risk(
+                    server_name, tool.name, external=True,
+                    read_only_hint=read_only_hint,
+                    destructive_hint=destructive_hint,
+                    trusted_annotations=trusted_annotations,
+                )
+                if risk == RiskLevel.UNKNOWN_EXTERNAL and tool.name in explicit_read_allowlist:
+                    risk = RiskLevel.READ_ONLY
                 self.registry.register_tool(
                     server_name=server_name,
                     original_name=tool.name,
@@ -223,12 +253,25 @@ class MCPManager:
                     input_schema=getattr(tool, "input_schema", None) or {},
                     external=True,
                     annotations=annotations,
-                    trusted_annotations=server_name.casefold() in TRUSTED_ANNOTATION_SERVERS,
+                    trusted_annotations=trusted_annotations,
+                    risk_level=risk,
                 )
         except Exception as exc:
             server.status = "degraded"
             server.last_error = f"Tool discovery failed: {type(exc).__name__}: {exc}"
             logger.warning("Error discovering tools for %s: %s", server_name, exc)
+
+    @staticmethod
+    def _annotations_are_trusted(server: MCPServerConnection) -> bool:
+        """Trust hints only with explicit operator intent and pinned endpoint identity."""
+        if server.config.get("trust_tool_annotations") is not True:
+            return False
+        expected = server.config.get("trusted_endpoint")
+        if not expected:
+            return False
+        if server.transport == "streamable_http":
+            return server.config.get("url") == expected
+        return server.config.get("command") == expected
 
     async def call_tool(self, name: str, arguments: Dict[str, Any], timeout: float = 30.0) -> ToolResult:
         desc = self.registry.get_by_gemini_name(name) or self.registry.get_by_canonical_id(name)

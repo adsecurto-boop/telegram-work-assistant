@@ -13,7 +13,7 @@ from pathlib import Path
 from models import Task, TaskStatus
 import config
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 
 _last_iso_time = 0.0
@@ -105,6 +105,8 @@ class Database:
                 self._seed_v13_defaults(cursor)
             if version < 14:
                 self._seed_v14_defaults(cursor)
+            if version < 15:
+                self._seed_v15_defaults(cursor)
             self._create_indexes(cursor)
             self._validate_schema_integrity(cursor)
             cursor.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
@@ -488,7 +490,8 @@ class Database:
             'tasks': {
                 'planned_shift_id': 'INTEGER', 'due_date': 'TEXT', 'project': 'TEXT',
                 'client': 'TEXT', 'ticket': 'TEXT', 'next_action': 'TEXT',
-                'tags': 'TEXT', 'completion_note': 'TEXT'},
+                'tags': 'TEXT', 'completion_note': 'TEXT', 'blocked_reason': 'TEXT',
+                'completed_at': 'TEXT'},
             'activities': {
                 'unplanned': 'INTEGER NOT NULL DEFAULT 0',
                 'source_message_id': 'INTEGER REFERENCES source_messages(id)',
@@ -631,50 +634,75 @@ class Database:
         except Exception:
             pass
 
-        # Backfill cases
-        try:
-            cursor = connection.execute("SELECT id, title, client, product, detail, created_at FROM work_cases")
-            for row in cursor.fetchall():
-                connection.execute('''INSERT OR IGNORE INTO fts_work_memory (source_type, source_id, title, content, client, product, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                    ('case', str(row['id']), row['title'] or '', f"Case #{row['id']}: {row['title'] or ''} {row['detail'] or ''}", row['client'] or '', row['product'] or '', row['created_at'] or now_iso()))
-        except Exception:
-            pass
+    def _fts_replace(self, connection, source_type, source_id, title, content,
+                     client='', product='', created_at=None):
+        """Replace one logical search document inside the caller's transaction."""
+        key = str(source_id)
+        connection.execute(
+            'DELETE FROM fts_work_memory WHERE source_type=? AND source_id=?',
+            (source_type, key))
+        connection.execute('''INSERT INTO fts_work_memory
+            (source_type, source_id, title, content, client, product, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)''',
+            (source_type, key, title or '', content or '', client or '', product or '',
+             created_at or now_iso()))
 
-        # Backfill test sessions
-        try:
-            cursor = connection.execute("SELECT id, scenario, environment, result, defects, created_at FROM test_sessions")
-            for row in cursor.fetchall():
-                connection.execute('''INSERT OR IGNORE INTO fts_work_memory (source_type, source_id, title, content, client, product, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                    ('test_session', str(row['id']), row['scenario'] or '', f"Test Session #{row['id']} [{row['result']}]: {row['scenario']} {row['environment']} {row['defects'] or ''}", '', '', row['created_at'] or now_iso()))
-        except Exception:
-            pass
+    def _index_source_in_connection(self, connection, source_type, source_id):
+        if source_type == 'task':
+            row = connection.execute('SELECT * FROM tasks WHERE id=?', (source_id,)).fetchone()
+            if row:
+                content = ' '.join(str(row[k] or '') for k in (
+                    'title', 'status', 'due_date', 'project', 'client', 'ticket',
+                    'next_action', 'tags', 'blocked_reason', 'completion_note'))
+                self._fts_replace(connection, 'task', row['id'], row['title'], content,
+                                  row['client'], row['project'], row['created_at'])
+        elif source_type == 'case':
+            row = connection.execute('''SELECT w.*, c.name AS client FROM work_cases w
+                LEFT JOIN clients c ON c.id=w.client_id WHERE w.id=?''', (source_id,)).fetchone()
+            if row:
+                content = ' '.join(str(row[k] or '') for k in (
+                    'title', 'product', 'platform', 'ticket', 'priority', 'status',
+                    'participation', 'next_action', 'waiting_on', 'resolution'))
+                self._fts_replace(connection, 'case', row['id'], f"Case #{row['id']}: {row['title']}",
+                                  content, row['client'], row['product'], row['created_at'])
+        elif source_type == 'case_event':
+            row = connection.execute('''SELECT e.*, w.product, c.name AS client
+                FROM case_events e JOIN work_cases w ON w.id=e.case_id
+                LEFT JOIN clients c ON c.id=w.client_id WHERE e.id=?''', (source_id,)).fetchone()
+            if row:
+                content = f"Case #{row['case_id']} [{row['event_type']}]: {row['detail'] or ''} {row['outcome'] or ''}"
+                self._fts_replace(connection, 'case_event', row['id'], f"CaseEvent #{row['id']}",
+                                  content, row['client'], row['product'], row['occurred_at'])
+        elif source_type == 'test_session':
+            row = connection.execute('SELECT * FROM test_sessions WHERE id=?', (source_id,)).fetchone()
+            if row:
+                content = ' '.join(str(row[k] or '') for k in (
+                    'scenario', 'environment', 'build', 'preconditions', 'steps', 'expected',
+                    'actual', 'result', 'defects', 'retest_result'))
+                self._fts_replace(connection, 'test_session', row['id'],
+                                  f"Test Session #{row['id']}: {row['scenario']}", content,
+                                  created_at=row['created_at'])
+        elif source_type == 'conversation_summary':
+            row = connection.execute('SELECT * FROM assistant_memory_summaries WHERE id=?',
+                                     (source_id,)).fetchone()
+            if row:
+                self._fts_replace(connection, 'conversation_summary', row['id'],
+                                  'Conversation Summary', row['summary_text'],
+                                  created_at=row['created_at'])
 
-        # Backfill case_events
-        try:
-            cursor = connection.execute("SELECT id, case_id, event_type, detail, occurred_at FROM case_events")
-            for row in cursor.fetchall():
-                connection.execute('''INSERT INTO fts_work_memory (source_type, source_id, title, content, client, product, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                    ('case_event', str(row['id']), f"CaseEvent #{row['id']}", f"Case #{row['case_id']} [{row['event_type']}]: {row['detail'] or ''}", '', '', row['occurred_at'] or now_iso()))
-        except Exception:
-            pass
+    def _seed_v15_defaults(self, connection):
+        """Repair v14's incomplete FTS backfill from the real relational schema."""
+        connection.execute('DELETE FROM fts_work_memory')
+        for source_type, table in (
+            ('task', 'tasks'), ('case', 'work_cases'), ('case_event', 'case_events'),
+            ('test_session', 'test_sessions'),
+            ('conversation_summary', 'assistant_memory_summaries')):
+            for row in connection.execute(f'SELECT id FROM {table} ORDER BY id').fetchall():
+                self._index_source_in_connection(connection, source_type, row['id'])
 
     def rebuild_work_memory_index(self):
         with self.connect() as conn:
-            conn.execute("DELETE FROM fts_work_memory")
-            self._seed_v14_defaults(conn)
-
-            # Backfill conversation summaries inside the active connection context
-            try:
-                cursor = conn.execute("SELECT id, summary_text, created_at FROM assistant_memory_summaries")
-                for row in cursor.fetchall():
-                    conn.execute('''INSERT OR IGNORE INTO fts_work_memory (source_type, source_id, title, content, client, product, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                        ('conversation_summary', str(row['id']), 'Conversation Summary', row['summary_text'] or '', '', '', row['created_at'] or now_iso()))
-            except Exception as e:
-                logger.error(f"Error indexing assistant memory summaries in rebuild_work_memory_index: {e}")
+            self._seed_v15_defaults(conn)
 
     def _validate_schema_integrity(self, cursor):
         required_tables = {
@@ -862,6 +890,7 @@ class Database:
                  client, ticket, next_action, tags)).lastrowid
             if shift_id:
                 self._activity(connection, shift_id, 'plan', title, client=client, task_id=task_id)
+            self._index_source_in_connection(connection, 'task', task_id)
             return Task.from_row(connection.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone())
 
     def update_task(self, task_id, field, value, shift_id=None):
@@ -880,6 +909,7 @@ class Database:
             if shift_id:
                 self._activity(connection, shift_id, 'task_edit',
                                f"{row['title']}: {field} updated", task_id=task_id)
+            self._index_source_in_connection(connection, 'task', task_id)
             return Task.from_row(connection.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone())
 
     def get_task(self, task_id):
@@ -1094,6 +1124,7 @@ class Database:
                                              outcome=status.value, task_id=task_id,
                                              unplanned=1 if row['planned_shift_id'] != shift_id else 0)
             updated_row = connection.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
+            self._index_source_in_connection(connection, 'task', task_id)
             if correlation_id:
                 fields = ('status', 'blocked_reason', 'completed_at', 'completion_note')
                 self._record_audit_in_connection(
@@ -2165,11 +2196,15 @@ class Database:
                  status, participation, next_action, waiting_on, follow_up_at, resolution,
                  int(bool(client_updated)), review_state, source, stamp, stamp,
                  stamp if status == 'closed' else None)).lastrowid
+            event_id = None
             if shift_id or detail:
-                connection.execute('''INSERT INTO case_events
+                event_id = connection.execute('''INSERT INTO case_events
                     (case_id,shift_id,event_type,detail,actor_role,outcome,occurred_at,created_at)
                     VALUES (?,?,?,?,?,?,?,?)''',
-                    (case_id, shift_id, event_type, detail or title, 'owner', status, stamp, stamp))
+                    (case_id, shift_id, event_type, detail or title, 'owner', status, stamp, stamp)).lastrowid
+            self._index_source_in_connection(connection, 'case', case_id)
+            if event_id:
+                self._index_source_in_connection(connection, 'case_event', event_id)
             return case_id
 
     def case(self, case_id):
@@ -2206,12 +2241,8 @@ class Database:
                 (case_id, shift_id, event_type, detail, actor_role, outcome,
                  source_message_id, occurred_at or stamp, stamp)).lastrowid
             connection.execute('UPDATE work_cases SET updated_at=? WHERE id=?', (stamp, case_id))
-            try:
-                connection.execute('''INSERT INTO fts_work_memory (source_type, source_id, title, content, client, product, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                    ('case_event', str(event_id), f"CaseEvent #{event_id}", f"Case #{case_id} [{event_type}]: {detail or ''}", case['client_name'] or '', case['product'] or '', occurred_at or stamp))
-            except Exception:
-                pass
+            self._index_source_in_connection(connection, 'case', case_id)
+            self._index_source_in_connection(connection, 'case_event', event_id)
             if correlation_id:
                 event = connection.execute('SELECT * FROM case_events WHERE id=?', (event_id,)).fetchone()
                 self._record_audit_in_connection(
@@ -2252,6 +2283,8 @@ class Database:
             updated = connection.execute('''SELECT work_case.*,client.name AS client
                 FROM work_cases work_case LEFT JOIN clients client ON client.id=work_case.client_id
                 WHERE work_case.id=?''', (case_id,)).fetchone()
+            self._index_source_in_connection(connection, 'case', case_id)
+            self._index_source_in_connection(connection, 'case_event', event_id)
             if correlation_id:
                 before_state = {field: row[field], 'closed_at': row['closed_at']}
                 after_state = {field: updated[field], 'closed_at': updated['closed_at']}
@@ -2375,6 +2408,11 @@ class Database:
                         self._record_audit_in_connection(
                             connection, correlation_id, 'update_case_for_test', actor,
                             'work_cases', case_id, dict(before_case), dict(after_case))
+            self._index_source_in_connection(connection, 'test_session', session_id)
+            if event_id:
+                self._index_source_in_connection(connection, 'case_event', event_id)
+            if case_id:
+                self._index_source_in_connection(connection, 'case', case_id)
             return session_id
 
     def test_sessions(self, shift_id=None, case_id=None, limit=50):
@@ -2426,6 +2464,9 @@ class Database:
                     self._record_audit_in_connection(
                         connection, correlation_id, 'create_test_update_event', actor,
                         'case_events', event_id, None, dict(event))
+            self._index_source_in_connection(connection, 'test_session', session_id)
+            if event_id:
+                self._index_source_in_connection(connection, 'case_event', event_id)
 
     def evidence_item(self, evidence_id):
         with self.connect() as connection:
@@ -4002,12 +4043,7 @@ class Database:
                 (owner_id, shift_id, memory_type, summary_text, source_turn_start_id, source_turn_end_id, version, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)''',
                 (owner_id, shift_id, memory_type, summary_text, source_turn_start_id, source_turn_end_id, stamp, stamp)).lastrowid
-            connection.execute('''DELETE FROM fts_work_memory
-                WHERE source_type='conversation_summary' AND source_id=?''', (str(summary_id),))
-            connection.execute('''INSERT INTO fts_work_memory
-                (source_type, source_id, title, content, client, product, created_at)
-                VALUES ('conversation_summary', ?, 'Conversation Summary', ?, '', '', ?)''',
-                (str(summary_id), summary_text or '', stamp))
+            self._index_source_in_connection(connection, 'conversation_summary', summary_id)
             return summary_id
 
     def get_latest_memory_summary(self, owner_id: int, shift_id: int | None = None) -> dict | None:

@@ -12,6 +12,7 @@ from ai import AIPayloadBuilder
 from mcp_adapter import convert_tools_for_gemini_config
 from mcp_manager import MCPManager, ToolResult
 from mcp_policy import PolicyDecision, ToolPolicy, ToolPolicyResult
+from mcp_registry import RiskLevel
 
 logger = logging.getLogger("agent_orchestrator")
 
@@ -39,6 +40,23 @@ class AgentRunResult:
     iterations: int = 0
     success: bool = True
     error: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class AgentAuthorization:
+    """Authority derived only from the user's request, never from tool output."""
+    external_read_allowed: bool = True
+    external_write_requested: bool = False
+    destructive_requested: bool = False
+
+    @classmethod
+    def from_user_message(cls, text: str) -> "AgentAuthorization":
+        low = text.casefold()
+        read_only = any(phrase in low for phrase in ("read only", "only read", "don't change", "do not change"))
+        write_words = ("create", "update", "edit", "post", "send", "merge", "close", "reopen",
+                       "comment", "assign", "label", "publish", "deploy", "delete", "remove")
+        destructive = any(word in low for word in ("delete", "remove", "destroy", "purge"))
+        return cls(True, (not read_only and any(word in low for word in write_words)), destructive)
 
 
 class GeminiAgent:
@@ -75,6 +93,7 @@ class GeminiAgent:
         executed: List[Dict[str, Any]] = []
         results: List[ToolResult] = []
         seen: set[str] = set()
+        authorization = AgentAuthorization.from_user_message(user_message)
         for iteration in range(1, self.max_iterations + 1):
             try:
                 turn = await model.generate(messages, tool_config, SYSTEM_INSTRUCTION_MCP_AGENT)
@@ -90,7 +109,8 @@ class GeminiAgent:
                 response_calls: List[ModelFunctionCall] = []
                 response_payloads: List[Dict[str, Any]] = []
                 for call in turn.function_calls:
-                    signature = json.dumps([call.name, call.arguments], sort_keys=True, default=str)
+                    signature = json.dumps([call.name, call.arguments], sort_keys=True,
+                                           separators=(",", ":"), default=str)
                     if signature in seen:
                         duplicate = ToolResult(call.name, call.name, False,
                                                error="Duplicate call prevented in this run")
@@ -116,6 +136,20 @@ class GeminiAgent:
                         continue
                     policy = ToolPolicy.evaluate(desc, call.arguments)
                     if policy.decision == PolicyDecision.CONFIRMATION_REQUIRED:
+                        if (desc.risk_level in (RiskLevel.EXTERNAL_WRITE, RiskLevel.UNKNOWN_EXTERNAL)
+                                and not authorization.external_write_requested):
+                            denied = ToolResult(call.name, call.name, False,
+                                                error="Action was outside the user's authorization scope")
+                            response_calls.append(call)
+                            response_payloads.append(denied.model_payload())
+                            continue
+                        if (desc.risk_level in (RiskLevel.DESTRUCTIVE, RiskLevel.PRIVILEGED)
+                                and not authorization.destructive_requested):
+                            denied = ToolResult(call.name, call.name, False,
+                                                error="Destructive action was not requested by the user")
+                            response_calls.append(call)
+                            response_payloads.append(denied.model_payload())
+                            continue
                         return AgentRunResult(run_id, policy.confirmation_preview or "",
                                               executed, results, policy, iteration)
                     result = await self.mcp_manager.call_tool(call.name, call.arguments)

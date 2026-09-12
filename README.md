@@ -66,7 +66,7 @@ Telegram is one interface to the assistant. The localhost dashboard is another. 
 | **Gemini Copilot Tools** | **Requires Credentials** | Optional `/casesummary`, `/nextaction`, `/draftclient`, `/draftescalation`, `/analyzetest`, and report polishing. Works with fallback deterministic text when offline. Bounded, field-allowlisted context payloads. |
 | **Voice Transcription & Single-Logging** | **Requires Credentials** | Voice messages transcribed via Gemini and routed cleanly to semantic NLP execution without phantom duplicate notes. Captured locally when offline. |
 | **Read-Only Connectors** | **Requires Credentials** | Freshdesk and Freshchat pollers with HTTPS enforcement, pagination, and untrusted payload tagging (`author_is_owner=False`, `trusted=False`). CSV sync via CLI. |
-| **MCP External Tools** | **Optional** | Official MCP Python SDK v2 client, long-lived stdio and Streamable HTTP sessions, live health, conservative policy classification, and exact persisted-call confirmation. GitHub is disabled by default. |
+| **MCP External Tools** | **Optional / Credential Dependent** | Official MCP Python SDK v2 client, paginated discovery, long-lived stdio and Streamable HTTP sessions, live health, conservative policy classification, and exact persisted-call confirmation. GitHub is runtime-wired but disabled by default. |
 | **Multi-User / Public Cloud** | **Planned or Unavailable** | Designed exclusively as a private, single-owner assistant on a local Windows PC. Access is restricted to `OWNER_ID` in private chats. |
 
 ---
@@ -111,10 +111,25 @@ For a local installation, use GitHub's official `ghcr.io/github/github-mcp-serve
 Docker image or official binary with `transport: "stdio"`; do not use the repository
 name as an npm package. Keep `GITHUB_READ_ONLY=1` and limit toolsets for read-first use.
 
-Tool annotations are recorded as hints. Explicit policy and known GitHub mutation
-semantics take priority, and any unknown external operation requires Telegram
+Tool annotations are recorded as hints and are trusted only when the operator opts in
+and the configured endpoint exactly matches a pinned identity. Destructive and known
+write semantics always take priority. Unknown external operations require Telegram
 confirmation. Confirming atomically claims the persisted proposal, revalidates the
 tool/schema/server/risk, and executes those exact stored arguments once.
+
+Verification is deliberately separated: `scripts/check_live_gemini_mcp.py` performs
+an opt-in live Gemini round trip against a local safe MCP server, while
+`scripts/check_live_github_mcp.py` performs one harmless `get_me` read against the
+official GitHub endpoint. Both skip with exit code 2 when their credential is absent.
+The automated suite proves local mock MCP compatibility; it does not claim live GitHub
+verification. Gmail, Google Calendar, and Google Drive MCP integrations are **not
+implemented / future integrations** unless the operator adds and validates servers.
+
+The adapter constructs the generic SDK function-result turn with `role="tool"` and
+preserves every call ID. The Gemini 3.6 GenerateContent endpoint currently rejects
+that generic role and requires the documented legacy-compatible `role="user"`; the
+adapter retries only that explicit 400 compatibility response and reports the role
+used in the live smoke diagnostics.
 
 Run the interactive setup wizard:
 ```powershell
@@ -379,7 +394,7 @@ The complete test suite runs against temporary databases using mocked Telegram a
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-The suite includes 289 unit and integration tests covering:
+The suite includes more than 353 unit and integration tests covering:
 - **Durable Dialogue Memory & Pronoun Resolution**: `conversation_turns` persistence across restarts, context building, rolling summaries, and unambiguous pronoun resolution (`tests/test_assistant_correctness.py`).
 - **Multi-Action Planning**: `ConversationPlan` with atomic transactions, dependency propagation, confirmation requirements for high-risk actions, and full rollback on partial failure (`tests/test_mission_hardening.py`).
 - **Stale Report Finalization Guard**: Live facts hash recomputation at finalization time, rejection of stale reports, and shift close validation (`tests/test_assistant_correctness.py`).
