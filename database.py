@@ -3625,7 +3625,7 @@ class Database:
             return result
 
     def finish_nl_proposal(self, proposal_id: str, status: str):
-        if status not in {'accepted', 'failed', 'cancelled'}:
+        if status not in {'accepted', 'executed', 'failed', 'cancelled'}:
             raise ValueError('Invalid proposal completion status.')
         with self.connect() as connection:
             if connection.execute(
@@ -3998,10 +3998,17 @@ class Database:
                             source_turn_end_id: int | None = None) -> int:
         stamp = now_iso()
         with self.connect() as connection:
-            return connection.execute('''INSERT INTO assistant_memory_summaries
+            summary_id = connection.execute('''INSERT INTO assistant_memory_summaries
                 (owner_id, shift_id, memory_type, summary_text, source_turn_start_id, source_turn_end_id, version, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)''',
                 (owner_id, shift_id, memory_type, summary_text, source_turn_start_id, source_turn_end_id, stamp, stamp)).lastrowid
+            connection.execute('''DELETE FROM fts_work_memory
+                WHERE source_type='conversation_summary' AND source_id=?''', (str(summary_id),))
+            connection.execute('''INSERT INTO fts_work_memory
+                (source_type, source_id, title, content, client, product, created_at)
+                VALUES ('conversation_summary', ?, 'Conversation Summary', ?, '', '', ?)''',
+                (str(summary_id), summary_text or '', stamp))
+            return summary_id
 
     def get_latest_memory_summary(self, owner_id: int, shift_id: int | None = None) -> dict | None:
         with self.connect() as connection:
@@ -4018,6 +4025,9 @@ class Database:
         stamp = created_at or now_iso()
         with self.connect() as connection:
             try:
+                connection.execute('''DELETE FROM fts_work_memory
+                    WHERE source_type=? AND source_id=?''',
+                    (str(source_type), str(source_id)))
                 connection.execute('''INSERT INTO fts_work_memory (source_type, source_id, title, content, client, product, created_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?)''',
                     (str(source_type), str(source_id), title or '', content or '', client or '', product or '', stamp))

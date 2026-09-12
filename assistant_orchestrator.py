@@ -13,6 +13,7 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from database import Database
@@ -24,6 +25,7 @@ from mcp_manager import MCPManager, ToolResult
 from mcp_registry import ToolRegistry, RiskLevel
 from mcp_policy import ToolPolicy, PolicyDecision
 from agent_orchestrator import GeminiAgent, AgentRunResult, SYSTEM_INSTRUCTION_MCP_AGENT
+from gemini_tool_model import ToolCallingModel
 import config
 
 logger = logging.getLogger("assistant_orchestrator")
@@ -42,12 +44,22 @@ class OrchestrationResult:
     error: Optional[str] = None
 
 
+@dataclass
+class AgentContinuationResult:
+    final_answer: str
+    external_facts: List[Dict[str, Any]] = field(default_factory=list)
+    local_plan_required: bool = False
+    local_action_executed: Optional[Dict[str, Any]] = None
+
+
 class AssistantOrchestrator:
 
-    def __init__(self, db: Database, mcp_manager: Optional[MCPManager] = None, ai_client: Any = None):
+    def __init__(self, db: Database, mcp_manager: Optional[MCPManager] = None,
+                 ai_client: Any = None, tool_model: Optional[ToolCallingModel] = None):
         self.db = db
         self.mcp_manager = mcp_manager
         self.ai_client = ai_client
+        self.tool_model = tool_model
         self.nlp = NaturalLanguagePipeline(db, ai_client=ai_client)
 
     async def route_and_process(
@@ -63,11 +75,17 @@ class AssistantOrchestrator:
         active_refs = self._extract_active_external_refs(turns)
 
         # 2. Check if external integration tool call is needed
-        needs_mcp = self._detect_external_tool_need(text)
+        needs_mcp = self._detect_external_tool_need(text, active_refs)
         if needs_mcp and self.mcp_manager:
             active_tools = self.mcp_manager.registry.list_tools()
             if active_tools:
                 return await self._process_mcp_agent_path(text, owner_id, active_refs, source_update_id)
+            integration = "GitHub" if any(word in text.casefold() for word in ("github", "issue", "pull request", "repo")) else "the external integration"
+            return OrchestrationResult(
+                reply_text=(f"I couldn't check {integration} right now. Your local work data "
+                            f"and commands are still available. Reference: ERR-{uuid.uuid4().hex[:6].upper()}"),
+                active_external_refs=active_refs, success=False, error="integration_unavailable",
+            )
 
         # 3. Check if compound multi-action or contextual plan is needed
         needs_plan = self._detect_plan_need(text)
@@ -89,17 +107,20 @@ class AssistantOrchestrator:
             success=True
         )
 
-    def _detect_external_tool_need(self, text: str) -> bool:
+    def _detect_external_tool_need(self, text: str, active_refs: Optional[Dict[str, Any]] = None) -> bool:
         low = text.lower()
         tool_keywords = [
             "github", "issue", "pull request", "pr", "repo", "repository",
             "gmail", "email", "mail", "inbox",
             "calendar", "meeting", "event",
-            "drive", "document", "doc", "file"
+            "drive", "google document", "google doc"
         ]
         if any(k in low for k in tool_keywords):
             return True
-        if any(w in low for w in ["check whether", "who created", "is it fixed", "is it closed", "check my"]):
+        if active_refs and any(w in low for w in [
+            "who created", "who opened", "what labels", "assignee", "comment",
+            "is it", "does it", "still open", "closed now", "its state", "its status",
+        ]):
             return True
         return False
 
@@ -132,7 +153,7 @@ class AssistantOrchestrator:
         active_refs: Dict[str, Any],
         source_update_id: Optional[int]
     ) -> OrchestrationResult:
-        agent = GeminiAgent(self.mcp_manager, ai_client=self.ai_client)
+        agent = GeminiAgent(self.mcp_manager, ai_client=self.ai_client, tool_model=self.tool_model)
 
         context_data = build_assistant_context(self.db, owner_id=owner_id)
         context_prompt = (
@@ -163,28 +184,107 @@ class AssistantOrchestrator:
                 success=True
             )
 
-        # Detect new active external reference (e.g. GitHub issue number)
-        new_refs = dict(active_refs)
-        match_issue = re.search(r'issue\s+#?(\d+)', res.final_text, re.IGNORECASE)
-        if match_issue:
-            new_refs['github_issue'] = {"number": int(match_issue.group(1))}
-
-        # Execute local action continuation if requested in user text alongside MCP read
-        low_text = text.lower()
-        if any(kw in low_text for kw in ["remind me", "follow up", "create task", "add event"]):
-            shift = await asyncio.to_thread(self.db.active_shift)
-            local_interp = await self.nlp.interpret_message(text, shift=shift)
-            if local_interp and local_interp.intent not in (NLIntent.UNKNOWN,):
-                await self.nlp.executor.execute(local_interp, shift)
+        new_refs = self._external_refs_from_results(active_refs, res.tool_results, res.final_text)
+        continuation = await self._continue_from_external_facts(text, owner_id, res, context_data)
+        if continuation.local_action_executed:
+            res.tool_calls_executed.append(continuation.local_action_executed)
 
         return OrchestrationResult(
-            reply_text=res.final_text,
+            reply_text=continuation.final_answer,
             actions_executed=res.tool_calls_executed,
             agent_run_id=res.run_id,
             active_external_refs=new_refs,
             success=res.success,
             error=res.error
         )
+
+    def _external_refs_from_results(self, existing: Dict[str, Any], results: List[ToolResult],
+                                    final_text: str) -> Dict[str, Any]:
+        refs = dict(existing)
+        for result in results:
+            candidates: List[Dict[str, Any]] = []
+            data = result.data
+            if isinstance(data, dict):
+                candidates.append(data)
+                for key in ("items", "issues", "data", "result"):
+                    value = data.get(key)
+                    if isinstance(value, list):
+                        candidates.extend(item for item in value if isinstance(item, dict))
+                    elif isinstance(value, dict):
+                        candidates.append(value)
+            for item in candidates:
+                number = item.get("number") or item.get("issue_number")
+                repository = item.get("repository") or item.get("repo")
+                url = item.get("html_url") or item.get("url")
+                if not repository and isinstance(url, str):
+                    match = re.search(r"github\.com/([^/]+/[^/]+)/(?:issues|pull)/\d+", url)
+                    repository = match.group(1) if match else None
+                if number and repository:
+                    refs["github_issue"] = {
+                        "provider": "github", "repository": repository,
+                        "number": int(number), "url": url,
+                        "title": item.get("title"),
+                        "fetched_at": datetime.now(timezone.utc).isoformat(),
+                        "source_tool": result.tool_id,
+                    }
+                    return refs
+        match = re.search(r'issue\s+#?(\d+)', final_text, re.IGNORECASE)
+        old_repo = (existing.get("github_issue") or {}).get("repository")
+        if match and old_repo:
+            refs["github_issue"] = {**existing.get("github_issue", {}),
+                                    "number": int(match.group(1)),
+                                    "fetched_at": datetime.now(timezone.utc).isoformat()}
+        return refs
+
+    async def _continue_from_external_facts(self, text: str, owner_id: int,
+                                            result: AgentRunResult,
+                                            context_data: Dict[str, Any]) -> AgentContinuationResult:
+        facts = [r.model_payload() for r in result.tool_results if r.success]
+        low = text.casefold()
+        conditional_reminder = ("remind me" in low or "follow up" in low) and any(
+            phrase in low for phrase in ("if it is", "if it's", "if still", "if the issue")
+        )
+        continuation = AgentContinuationResult(result.final_text, facts, conditional_reminder)
+        if not conditional_reminder:
+            return continuation
+
+        state: Optional[str] = None
+        for tool_result in result.tool_results:
+            if not tool_result.success:
+                continue
+            if isinstance(tool_result.data, dict):
+                value = tool_result.data.get("state") or tool_result.data.get("status")
+                if isinstance(value, str):
+                    state = value.casefold()
+            if not state:
+                match = re.search(r"\b(open|closed)\b", tool_result.text, re.IGNORECASE)
+                state = match.group(1).casefold() if match else None
+        if state != "open":
+            if state:
+                continuation.final_answer += "\n\nThe condition was not met, so I did not create a reminder."
+            return continuation
+
+        active_case = context_data.get("active_case") or {}
+        case_id = active_case.get("id") if isinstance(active_case, dict) else None
+        if not case_id:
+            cases = await asyncio.to_thread(self.db.list_cases, None, 1)
+            case_id = cases[0]["id"] if cases else None
+        if not case_id:
+            continuation.final_answer += "\n\nThe issue is open, but no active case exists to attach a reminder to."
+            return continuation
+        due_at = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+        correlation_id = f"external_cont_{uuid.uuid4().hex[:10]}"
+        followup_id = await asyncio.to_thread(
+            self.db.add_followup, case_id, due_at,
+            "Re-check external issue state and follow up with development",
+            "development", None, "case", correlation_id, "assistant_orchestrator",
+        )
+        continuation.local_action_executed = {
+            "intent": "create_followup", "followup_id": followup_id,
+            "case_id": case_id, "condition": "external issue state == open",
+        }
+        continuation.final_answer += f"\n\nThe issue is open, so I created follow-up #{followup_id} for tomorrow."
+        return continuation
 
     async def _process_conversation_plan_path(
         self,

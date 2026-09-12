@@ -37,7 +37,10 @@ class ToolPolicy:
             )
 
         # EXTERNAL_WRITE and DESTRUCTIVE tools require explicit confirmation
-        if tool_desc.risk_level in [RiskLevel.EXTERNAL_WRITE, RiskLevel.DESTRUCTIVE, RiskLevel.PRIVILEGED]:
+        if tool_desc.risk_level in [
+            RiskLevel.EXTERNAL_WRITE, RiskLevel.DESTRUCTIVE,
+            RiskLevel.PRIVILEGED, RiskLevel.UNKNOWN_EXTERNAL,
+        ]:
             preview = ToolPolicy.format_confirmation_preview(tool_desc, arguments)
             proposal = {
                 "tool_id": tool_desc.canonical_id,

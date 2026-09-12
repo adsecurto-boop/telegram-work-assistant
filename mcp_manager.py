@@ -1,22 +1,56 @@
-"""
-Central MCP Manager for Personal Work Assistant.
-Handles MCP server lifecycle, JSON-RPC communication over stdio/HTTP,
-tool discovery, health tracking, timeouts, and result normalization.
-"""
+"""Official MCP SDK based client manager with long-lived server sessions."""
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
 import os
 import re
-import sys
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-from mcp_registry import ToolRegistry, ToolDescriptor, RiskLevel
+from mcp import Client, StdioServerParameters
+from mcp.client.streamable_http import streamable_http_client
+
+from mcp_registry import ToolRegistry
 
 logger = logging.getLogger("mcp_manager")
+SUPPORTED_TRANSPORTS = {"stdio", "streamable_http"}
+TRUSTED_ANNOTATION_SERVERS = {"github"}
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _resolve_env_value(value: Any) -> str:
+    text = str(value)
+    return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}",
+                  lambda match: os.environ.get(match.group(1), ""), text)
+
+
+def _as_dict(value: Any) -> Dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "model_dump"):
+        return value.model_dump(by_alias=True, exclude_none=True)
+    return {}
+
+
+def _redact_model_value(value: Any) -> Any:
+    from ai import AIPayloadBuilder
+    if isinstance(value, str):
+        return AIPayloadBuilder.redact_text(value)
+    if isinstance(value, dict):
+        return {str(key): _redact_model_value(item) for key, item in value.items()
+                if str(key).casefold() not in {"authorization", "access_token", "refresh_token"}}
+    if isinstance(value, list):
+        return [_redact_model_value(item) for item in value]
+    return value
 
 
 @dataclass
@@ -30,315 +64,234 @@ class ToolResult:
     truncated: bool = False
     metadata: Dict[str, Any] = field(default_factory=dict)
 
+    def model_payload(self) -> Dict[str, Any]:
+        return {
+            "success": self.success,
+            "tool": self.tool_id,
+            "data": _redact_model_value(self.data),
+            "text": _redact_model_value(self.text),
+            "truncated": self.truncated,
+            **({"error": _redact_model_value(self.error)} if self.error else {}),
+        }
+
     def to_untrusted_prompt_block(self) -> str:
-        """
-        Format tool result wrapped in <UNTRUSTED_TOOL_RESULT> tags
-        to prevent prompt injection.
-        """
-        content = self.text if self.text else json.dumps(self.data, indent=2, default=str)
-        if self.truncated:
-            content += "\n... [Output truncated for budget limit]"
-        
-        status_str = "SUCCESS" if self.success else f"ERROR: {self.error}"
         return (
-            f'<UNTRUSTED_TOOL_RESULT tool="{self.tool_id}" status="{status_str}">\n'
-            f'{content}\n'
+            f'<UNTRUSTED_TOOL_RESULT tool="{self.tool_id}">\n'
+            f'{json.dumps(self.model_payload(), default=str, ensure_ascii=False)}\n'
             f'</UNTRUSTED_TOOL_RESULT>'
         )
 
 
-class MCPServerProcess:
-    """Manages stdio JSON-RPC process lifecycle for an MCP server."""
+class MCPServerConnection:
+    """One configured SDK client and its transport/resource lifecycle."""
 
-    def __init__(self, name: str, command: str, args: List[str], env: Dict[str, str]):
+    def __init__(self, name: str, config: Dict[str, Any]):
         self.name = name
-        self.command = command
-        self.args = args
-        self.env = env
-        self.process: Optional[asyncio.subprocess.Process] = None
+        self.config = dict(config)
+        self.enabled = bool(config.get("enabled", False))
+        self.transport = config.get("transport", "stdio")
         self.status = "disabled"
+        self.protocol_version: Optional[str] = None
         self.last_error: Optional[str] = None
         self.last_connected: Optional[str] = None
-        self.request_id = 0
+        self.last_successful_tool_call: Optional[str] = None
+        self.client: Optional[Client] = None
+        self._http_client: Any = None
 
     async def start(self, timeout: float = 10.0) -> bool:
+        if not self.enabled:
+            return False
         self.status = "connecting"
         try:
-            full_env = os.environ.copy()
-            full_env.update(self.env)
+            if self.transport == "stdio":
+                raw_env = self.config.get("env", {})
+                params = StdioServerParameters(
+                    command=self.config["command"],
+                    args=list(self.config.get("args", [])),
+                    env={k: _resolve_env_value(v) for k, v in raw_env.items()},
+                    cwd=self.config.get("cwd"),
+                )
+                self.client = Client(params)
+            elif self.transport == "streamable_http":
+                import httpx2
+                url = self.config.get("url")
+                if not url:
+                    raise ValueError(f"MCP server '{self.name}' requires a url")
+                raw_headers = self.config.get("headers", {})
+                missing_env = [
+                    var for value in raw_headers.values()
+                    for var in re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", str(value))
+                    if not os.environ.get(var)
+                ]
+                headers = {k: _resolve_env_value(v) for k, v in raw_headers.items()}
+                if missing_env or any(not value for value in headers.values()):
+                    raise RuntimeError("required credential environment variable is unavailable")
+                self._http_client = httpx2.AsyncClient(headers=headers)
+                transport = streamable_http_client(url, http_client=self._http_client)
+                self.client = Client(transport)
+            else:
+                raise ValueError(f"Unsupported MCP transport: {self.transport}")
 
-            self.process = await asyncio.create_subprocess_exec(
-                self.command,
-                *self.args,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=full_env
-            )
-
-            # Standard MCP Initialize Request
-            init_req = {
-                "jsonrpc": "2.0",
-                "id": self._next_id(),
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {},
-                    "clientInfo": {
-                        "name": "PersonalWorkAssistant",
-                        "version": "1.0.0"
-                    }
-                }
-            }
-
-            resp = await self._send_request(init_req, timeout=timeout)
-            if not resp or "error" in resp:
-                err_msg = resp.get("error", {}).get("message", "Initialize failed") if resp else "No response"
-                self.status = "failed"
-                self.last_error = f"Initialization error: {err_msg}"
-                return False
-
-            # Send initialized notification
-            init_notif = {
-                "jsonrpc": "2.0",
-                "method": "notifications/initialized"
-            }
-            await self._send_notification(init_notif)
-
+            await asyncio.wait_for(self.client.__aenter__(), timeout=timeout)
+            self.protocol_version = str(self.client.protocol_version)
             self.status = "ready"
-            self.last_connected = datetime.now().isoformat()
+            self.last_connected = _utc_now()
             self.last_error = None
             return True
-
-        except Exception as e:
+        except Exception as exc:
             self.status = "failed"
-            self.last_error = str(e)
-            logger.warning(f"Failed to start MCP server {self.name}: {e}")
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            logger.warning("Failed to start MCP server %s: %s", self.name, exc)
+            await self.shutdown(final_status="failed")
             return False
 
-    def _next_id(self) -> int:
-        self.request_id += 1
-        return self.request_id
+    async def list_tools(self, timeout: float = 10.0) -> List[Any]:
+        if not self.client:
+            return []
+        result = await asyncio.wait_for(self.client.list_tools(), timeout=timeout)
+        return list(result.tools)
 
-    async def _send_notification(self, notif: Dict[str, Any]):
-        if not self.process or not self.process.stdin:
-            return
-        line = json.dumps(notif) + "\n"
-        self.process.stdin.write(line.encode('utf-8'))
-        await self.process.stdin.drain()
+    async def call_tool(self, tool_name: str, arguments: Dict[str, Any], timeout: float = 30.0) -> Any:
+        if not self.client:
+            raise RuntimeError(f"MCP server {self.name} is not connected")
+        return await asyncio.wait_for(
+            self.client.call_tool(tool_name, arguments, read_timeout_seconds=timeout),
+            timeout=timeout + 1,
+        )
 
-    async def _send_request(self, req: Dict[str, Any], timeout: float = 10.0) -> Optional[Dict[str, Any]]:
-        if not self.process or not self.process.stdin or not self.process.stdout:
-            raise RuntimeError(f"MCP server {self.name} process not running")
-
-        line = json.dumps(req) + "\n"
-        self.process.stdin.write(line.encode('utf-8'))
-        await self.process.stdin.drain()
-
-        async def _read_response():
-            while True:
-                line_bytes = await self.process.stdout.readline()
-                if not line_bytes:
-                    return None
-                text = line_bytes.decode('utf-8').strip()
-                if not text:
-                    continue
-                try:
-                    data = json.loads(text)
-                    if data.get("id") == req.get("id"):
-                        return data
-                except json.JSONDecodeError:
-                    continue
-
-        return await asyncio.wait_for(_read_response(), timeout=timeout)
-
-    async def list_tools(self, timeout: float = 10.0) -> List[Dict[str, Any]]:
-        req = {
-            "jsonrpc": "2.0",
-            "id": self._next_id(),
-            "method": "tools/list",
-            "params": {}
-        }
-        resp = await self._send_request(req, timeout=timeout)
-        if resp and "result" in resp:
-            return resp["result"].get("tools", [])
-        return []
-
-    async def call_tool(self, tool_name: str, arguments: Dict[str, Any], timeout: float = 30.0) -> Dict[str, Any]:
-        req = {
-            "jsonrpc": "2.0",
-            "id": self._next_id(),
-            "method": "tools/call",
-            "params": {
-                "name": tool_name,
-                "arguments": arguments or {}
-            }
-        }
-        resp = await self._send_request(req, timeout=timeout)
-        if not resp:
-            raise TimeoutError(f"Tool call {tool_name} on {self.name} timed out")
-        if "error" in resp:
-            raise RuntimeError(resp["error"].get("message", f"Tool call {tool_name} failed"))
-        return resp.get("result", {})
-
-    async def shutdown(self):
-        if self.process:
+    async def shutdown(self, final_status: str = "disabled") -> None:
+        client, self.client = self.client, None
+        if client:
             try:
-                self.process.terminate()
-                await asyncio.wait_for(self.process.wait(), timeout=3.0)
+                await client.__aexit__(None, None, None)
+            except Exception as exc:
+                logger.debug("MCP client close failed for %s: %s", self.name, exc)
+        if self._http_client:
+            try:
+                await self._http_client.aclose()
             except Exception:
-                try:
-                    self.process.kill()
-                except Exception:
-                    pass
-            self.process = None
-        self.status = "disabled"
+                pass
+            self._http_client = None
+        self.status = final_status
+
+
+MCPServerProcess = MCPServerConnection
 
 
 class MCPManager:
     def __init__(self, config_path: Optional[Path] = None, registry: Optional[ToolRegistry] = None):
         self.config_path = config_path or (Path(__file__).parent / "mcp_config.json")
         self.registry = registry or ToolRegistry()
-        self.servers: Dict[str, MCPServerProcess] = {}
+        self.servers: Dict[str, MCPServerConnection] = {}
         self.max_result_chars = 12000
 
     def load_config(self, config_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        if config_override:
+        if config_override is not None:
             cfg = config_override
         elif self.config_path.exists():
-            with open(self.config_path, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
+            cfg = json.loads(self.config_path.read_text(encoding="utf-8"))
         else:
             cfg = {"mcpServers": {}}
-
-        mcp_servers = cfg.get("mcpServers", {})
-        for name, s_cfg in mcp_servers.items():
-            if not s_cfg.get("enabled", False):
-                continue
-
-            command = s_cfg.get("command", "npx")
-            args = s_cfg.get("args", [])
-            raw_env = s_cfg.get("env", {})
-
-            # Resolve environment variables
-            resolved_env = {}
-            for k, v in raw_env.items():
-                if isinstance(v, str) and v.startswith("${") and v.endswith("}"):
-                    env_var = v[2:-1]
-                    resolved_env[k] = os.environ.get(env_var, "")
-                else:
-                    resolved_env[k] = str(v)
-
-            self.servers[name] = MCPServerProcess(
-                name=name,
-                command=command,
-                args=args,
-                env=resolved_env
-            )
+        self.servers.clear()
+        for name, server_config in cfg.get("mcpServers", {}).items():
+            transport = server_config.get("transport", "stdio")
+            if transport not in SUPPORTED_TRANSPORTS:
+                raise ValueError(f"Unsupported MCP transport '{transport}' for server '{name}'")
+            if transport == "stdio" and server_config.get("enabled") and not server_config.get("command"):
+                raise ValueError(f"MCP stdio server '{name}' requires a command")
+            self.servers[name] = MCPServerConnection(name, server_config)
         return cfg
 
-    async def initialize_all(self, timeout: float = 10.0):
-        """Start all configured enabled servers and discover tools."""
-        for name, server in list(self.servers.items()):
-            ok = await server.start(timeout=timeout)
-            if ok:
+    async def initialize_all(self, timeout: float = 10.0) -> None:
+        for name, server in self.servers.items():
+            if await server.start(timeout=timeout):
                 await self.discover_server_tools(name, timeout=timeout)
 
-    async def discover_server_tools(self, server_name: str, timeout: float = 10.0):
+    async def discover_server_tools(self, server_name: str, timeout: float = 10.0) -> None:
         server = self.servers.get(server_name)
         if not server or server.status != "ready":
             return
-
         try:
             raw_tools = await server.list_tools(timeout=timeout)
             self.registry.clear_server_tools(server_name)
-            for tool_def in raw_tools:
-                orig_name = tool_def.get("name")
-                desc = tool_def.get("description", "")
-                schema = tool_def.get("inputSchema", {})
-                if orig_name:
-                    self.registry.register_tool(
-                        server_name=server_name,
-                        original_name=orig_name,
-                        description=desc,
-                        input_schema=schema,
-                        external=True
-                    )
-        except Exception as e:
+            for tool in raw_tools:
+                annotations = _as_dict(getattr(tool, "annotations", None))
+                self.registry.register_tool(
+                    server_name=server_name,
+                    original_name=tool.name,
+                    description=getattr(tool, "description", "") or "",
+                    input_schema=getattr(tool, "input_schema", None) or {},
+                    external=True,
+                    annotations=annotations,
+                    trusted_annotations=server_name.casefold() in TRUSTED_ANNOTATION_SERVERS,
+                )
+        except Exception as exc:
             server.status = "degraded"
-            server.last_error = f"Tool discovery failed: {e}"
-            logger.warning(f"Error discovering tools for {server_name}: {e}")
+            server.last_error = f"Tool discovery failed: {type(exc).__name__}: {exc}"
+            logger.warning("Error discovering tools for %s: %s", server_name, exc)
 
-    async def call_tool(self, gemini_or_canonical_name: str, arguments: Dict[str, Any], timeout: float = 30.0) -> ToolResult:
-        tool_desc = self.registry.get_by_gemini_name(gemini_or_canonical_name)
-        if not tool_desc:
-            tool_desc = self.registry.get_by_canonical_id(gemini_or_canonical_name)
-
-        if not tool_desc:
-            return ToolResult(
-                tool_id=gemini_or_canonical_name,
-                gemini_name=gemini_or_canonical_name,
-                success=False,
-                error=f"Unknown tool '{gemini_or_canonical_name}' in registry"
-            )
-
-        server = self.servers.get(tool_desc.server_name)
+    async def call_tool(self, name: str, arguments: Dict[str, Any], timeout: float = 30.0) -> ToolResult:
+        desc = self.registry.get_by_gemini_name(name) or self.registry.get_by_canonical_id(name)
+        if not desc:
+            return ToolResult(name, name, False, error=f"Unknown tool '{name}' in registry")
+        server = self.servers.get(desc.server_name)
         if not server or server.status != "ready":
-            return ToolResult(
-                tool_id=tool_desc.canonical_id,
-                gemini_name=tool_desc.gemini_name,
-                success=False,
-                error=f"MCP server '{tool_desc.server_name}' is unavailable (status={server.status if server else 'not_configured'})"
-            )
-
+            status = server.status if server else "not_configured"
+            return ToolResult(desc.canonical_id, desc.gemini_name, False,
+                              error=f"MCP server '{desc.server_name}' is unavailable (status={status})")
         try:
-            raw_result = await server.call_tool(tool_desc.original_name, arguments, timeout=timeout)
-            content_items = raw_result.get("content", [])
-            text_chunks = []
-            for item in content_items:
-                if isinstance(item, dict) and item.get("type") == "text":
-                    text_chunks.append(item.get("text", ""))
-                elif isinstance(item, str):
-                    text_chunks.append(item)
-
-            full_text = "\n".join(text_chunks) if text_chunks else json.dumps(raw_result, default=str)
-            
-            # Truncate if exceeds budget
-            truncated = False
-            if len(full_text) > self.max_result_chars:
+            result = await server.call_tool(desc.original_name, arguments, timeout)
+            structured = getattr(result, "structured_content", None)
+            chunks = []
+            content_data = []
+            for item in getattr(result, "content", []) or []:
+                item_text = getattr(item, "text", None)
+                if item_text:
+                    chunks.append(item_text)
+                    content_data.append({"type": "text", "text": item_text})
+            data = structured if structured is not None else {"content": content_data}
+            full_text = "\n".join(chunks) or json.dumps(data, default=str, ensure_ascii=False)
+            truncated = len(full_text) > self.max_result_chars
+            if truncated:
                 full_text = full_text[:self.max_result_chars]
-                truncated = True
+            success = not bool(getattr(result, "is_error", False))
+            if success:
+                server.last_successful_tool_call = _utc_now()
+            return ToolResult(desc.canonical_id, desc.gemini_name, success,
+                              data=data, text=full_text, truncated=truncated)
+        except Exception as exc:
+            server.last_error = f"Tool call failed: {type(exc).__name__}: {exc}"
+            return ToolResult(desc.canonical_id, desc.gemini_name, False,
+                              error="External tool call failed")
 
-            return ToolResult(
-                tool_id=tool_desc.canonical_id,
-                gemini_name=tool_desc.gemini_name,
-                success=not raw_result.get("isError", False),
-                data=raw_result,
-                text=full_text,
-                truncated=truncated
-            )
-
-        except Exception as e:
-            return ToolResult(
-                tool_id=tool_desc.canonical_id,
-                gemini_name=tool_desc.gemini_name,
-                success=False,
-                error=str(e)
-            )
+    def validate_tool_call(self, name: str, arguments: Dict[str, Any]):
+        from jsonschema import validate
+        desc = self.registry.get_by_gemini_name(name) or self.registry.get_by_canonical_id(name)
+        if not desc:
+            raise ValueError("Persisted MCP tool is no longer available.")
+        server = self.servers.get(desc.server_name)
+        if not server or server.status != "ready":
+            raise ValueError(f"MCP server '{desc.server_name}' is not ready.")
+        validate(instance=arguments, schema=desc.input_schema or {"type": "object"})
+        return desc
 
     def get_health_status(self) -> Dict[str, Any]:
-        res = {}
-        for name, server in self.servers.items():
-            tool_count = len(self.registry.list_tools(server_name=name))
-            res[name] = {
+        return {
+            name: {
+                "enabled": server.enabled,
+                "transport": server.transport,
                 "status": server.status,
-                "tools": tool_count,
+                "protocol_version": server.protocol_version,
+                "tool_count": len(self.registry.list_tools(server_name=name)),
+                "tools": len(self.registry.list_tools(server_name=name)),
+                "last_connected": server.last_connected,
                 "last_error": server.last_error,
-                "last_connected": server.last_connected
+                "last_successful_tool_call": server.last_successful_tool_call,
             }
-        return res
+            for name, server in self.servers.items()
+        }
 
-    async def shutdown(self):
+    async def shutdown(self) -> None:
         for server in self.servers.values():
             await server.shutdown()
-        self.servers.clear()
+        self.registry = ToolRegistry()

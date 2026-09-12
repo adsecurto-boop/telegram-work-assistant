@@ -105,7 +105,12 @@ class AIPayloadBuilder:
 
     EMAIL_PATTERN = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b')
     PHONE_PATTERN = re.compile(r'(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b')
-    SECRET_PATTERN = re.compile(r'\b(?:Bearer\s+[A-Za-z0-9_\-\.]{10,}|bearer-[A-Za-z0-9_\-\.]{6,}|sk-[A-Za-z0-9_\-\.]{6,}|(?:api[_-]?key|secret|token|password|auth|credential)\s*[:=]\s*["\']?[A-Za-z0-9_\-\.]{6,}["\']?)\b', re.I)
+    SECRET_PATTERN = re.compile(
+        r'\b(?:Bearer\s+[A-Za-z0-9_\-\.]{10,}|bearer-[A-Za-z0-9_\-\.]{6,}|'
+        r'sk-[A-Za-z0-9_\-\.]{6,}|gh[pousr]_[A-Za-z0-9]{10,}|AIza[A-Za-z0-9_\-]{20,}|'
+        r'\d{6,12}:[A-Za-z0-9_\-]{20,}|'
+        r'(?:api[_-]?key|secret|token|password|auth|credential)\s*[:=]\s*["\']?'
+        r'[A-Za-z0-9_\-\.]{6,}["\']?)\b', re.I)
 
     @classmethod
     def redact_text(cls, text: str, mask_client: bool = False, client_name: str | None = None, replacement: str | None = None) -> str:

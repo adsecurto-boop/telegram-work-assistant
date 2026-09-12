@@ -66,6 +66,7 @@ Telegram is one interface to the assistant. The localhost dashboard is another. 
 | **Gemini Copilot Tools** | **Requires Credentials** | Optional `/casesummary`, `/nextaction`, `/draftclient`, `/draftescalation`, `/analyzetest`, and report polishing. Works with fallback deterministic text when offline. Bounded, field-allowlisted context payloads. |
 | **Voice Transcription & Single-Logging** | **Requires Credentials** | Voice messages transcribed via Gemini and routed cleanly to semantic NLP execution without phantom duplicate notes. Captured locally when offline. |
 | **Read-Only Connectors** | **Requires Credentials** | Freshdesk and Freshchat pollers with HTTPS enforcement, pagination, and untrusted payload tagging (`author_is_owner=False`, `trusted=False`). CSV sync via CLI. |
+| **MCP External Tools** | **Optional** | Official MCP Python SDK v2 client, long-lived stdio and Streamable HTTP sessions, live health, conservative policy classification, and exact persisted-call confirmation. GitHub is disabled by default. |
 | **Multi-User / Public Cloud** | **Planned or Unavailable** | Designed exclusively as a private, single-owner assistant on a local Windows PC. Access is restricted to `OWNER_ID` in private chats. |
 
 ---
@@ -95,6 +96,25 @@ Key environment variables:
 - `AI_FALLBACK_MODEL`: Fallback Gemini model (default: `gemini-3.5-flash-lite`).
 - `AI_DAILY_LIMIT`: Maximum daily Gemini calls (default: `30`).
 - `DASHBOARD_PORT`: Localhost port for dashboard (default: `8765`).
+
+### MCP and GitHub
+
+`mcp_config.json` selects each server's transport explicitly. Supported values are
+`stdio` and `streamable_http`; unknown values stop configuration loading. Disabled
+or unavailable integrations do not prevent the bot or local commands from starting.
+
+The supplied GitHub entry uses GitHub's official hosted MCP endpoint in server-side
+read-only mode and is disabled by default. To enable it, set `GITHUB_TOKEN` in the
+environment and change only `enabled` to `true`. The token is expanded into an HTTP
+authorization header at runtime and is never stored in JSON or sent to Gemini.
+For a local installation, use GitHub's official `ghcr.io/github/github-mcp-server`
+Docker image or official binary with `transport: "stdio"`; do not use the repository
+name as an npm package. Keep `GITHUB_READ_ONLY=1` and limit toolsets for read-first use.
+
+Tool annotations are recorded as hints. Explicit policy and known GitHub mutation
+semantics take priority, and any unknown external operation requires Telegram
+confirmation. Confirming atomically claims the persisted proposal, revalidates the
+tool/schema/server/risk, and executes those exact stored arguments once.
 
 Run the interactive setup wizard:
 ```powershell

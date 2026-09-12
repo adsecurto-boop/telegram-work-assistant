@@ -53,6 +53,13 @@ async def startup(application):
     except Exception as exc:
         logging.getLogger(__name__).warning('MCP Manager initialization warning: %s', exc)
 
+    if config.AI_KEY and config.AI_MODEL:
+        try:
+            from gemini_tool_model import GeminiToolModel
+            application.bot_data['gemini_tool_model'] = GeminiToolModel(config.AI_KEY, config.AI_MODEL)
+        except Exception as exc:
+            logging.getLogger(__name__).warning('Gemini tool model unavailable: %s', type(exc).__name__)
+
     await application.bot.set_my_commands([
         BotCommand('shift','Start a flexible shift'), BotCommand('task','Plan a rich task'),
         BotCommand('briefing','Morning work briefing'), BotCommand('integrations','MCP tool status'),
@@ -87,6 +94,9 @@ async def shutdown(application):
     mcp_mgr = application.bot_data.get('mcp_manager')
     if mcp_mgr:
         await mcp_mgr.shutdown()
+    tool_model = application.bot_data.get('gemini_tool_model')
+    if tool_model:
+        await tool_model.close()
 
 
 async def wrap_handle(update, context):

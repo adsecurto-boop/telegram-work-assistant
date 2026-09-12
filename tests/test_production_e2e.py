@@ -29,6 +29,7 @@ class MockGeminiClientForE2E:
         self.tool_responses = tool_responses or []
         self.plan_count = 0
         self.tool_count = 0
+        self.tool_requests = []
 
     async def interpret_plan(self, text, context_data):
         if self.plan_count < len(self.plan_responses):
@@ -40,6 +41,7 @@ class MockGeminiClientForE2E:
         ])
 
     def generate_content(self, prompt, tools=None):
+        self.tool_requests.append(prompt)
         if self.tool_count < len(self.tool_responses):
             res = self.tool_responses[self.tool_count]
             self.tool_count += 1
@@ -112,7 +114,9 @@ class ProductionE2ETests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(res.success)
         self.assertIn("issue #61", res.reply_text)
-        self.assertEqual(res.active_external_refs.get("github_issue", {}).get("number"), 61)
+        issue_ref = res.active_external_refs.get("github_issue", {})
+        self.assertEqual(issue_ref.get("number"), 61)
+        self.assertEqual(issue_ref.get("repository"), "owner/telegram-work-assistant")
 
     async def test_03_mcp_followup_entity_resolution(self):
         # Initial turn saved issue #61 in active_external_refs
@@ -120,7 +124,8 @@ class ProductionE2ETests(unittest.IsolatedAsyncioTestCase):
             self.owner_id,
             "assistant",
             "Found issue #61",
-            entities_json=json.dumps({"active_external_refs": {"github_issue": {"number": 61}}})
+            entities_json=json.dumps({"active_external_refs": {"github_issue": {
+                "provider": "github", "repository": "owner/telegram-work-assistant", "number": 61}}})
         )
 
         fn_call = {"function_calls": [{"name": "mcp__mock__get_issue", "args": {"issue_number": 61}}]}
@@ -137,7 +142,8 @@ class ProductionE2ETests(unittest.IsolatedAsyncioTestCase):
             self.owner_id,
             "assistant",
             "Issue #61 is open",
-            entities_json=json.dumps({"active_external_refs": {"github_issue": {"number": 61}}})
+            entities_json=json.dumps({"active_external_refs": {"github_issue": {
+                "provider": "github", "repository": "owner/telegram-work-assistant", "number": 61}}})
         )
         fn_call = {"function_calls": [{"name": "mcp__mock__get_issue", "args": {"issue_number": 61}}]}
         final_answer = {"text": "I checked GitHub again and issue #61 is still open."}
@@ -160,9 +166,25 @@ class ProductionE2ETests(unittest.IsolatedAsyncioTestCase):
             source_update_id=105
         )
         self.assertTrue(res.success)
-        # Assert local followup record was actually created in database
         pending_followups = self.db.list_followups()
-        self.assertTrue(len(pending_followups) > 0 or len(self.db.search_historical_memory("issue #61")) > 0)
+        self.assertEqual(len(pending_followups), 1)
+        self.assertEqual(pending_followups[0]["case_id"], self.case_id)
+        self.assertIn("external issue state", pending_followups[0]["note"])
+
+    async def test_05b_closed_issue_does_not_create_conditional_reminder(self):
+        fn_call = {"function_calls": [{"name": "mcp__mock__get_issue",
+                                        "args": {"issue_number": 61, "state": "closed"}}]}
+        final_answer = {"text": "Issue #61 is closed."}
+        mock_ai = MockGeminiClientForE2E(tool_responses=[fn_call, final_answer])
+        orchestrator = AssistantOrchestrator(self.db, mcp_manager=self.mcp_manager, ai_client=mock_ai)
+
+        res = await orchestrator.route_and_process(
+            "Check if issue #61 is still open and remind me tomorrow if it is.",
+            owner_id=self.owner_id, source_update_id=1051)
+
+        self.assertTrue(res.success)
+        self.assertEqual(self.db.list_followups(), [])
+        self.assertIn("did not create a reminder", res.reply_text)
 
     async def test_06_external_write_confirmation(self):
         fn_call = {"function_calls": [{"name": "mcp__mock__create_issue", "args": {"title": "Ubuntu 24 Wayland Blank"}}]}
@@ -179,7 +201,7 @@ class ProductionE2ETests(unittest.IsolatedAsyncioTestCase):
 
     async def test_07_confirm_executes_exact_proposal(self):
         import handlers
-        from unittest.mock import AsyncMock, MagicMock
+        from unittest.mock import AsyncMock, MagicMock, patch
         from types import SimpleNamespace
 
         prop_id = "prop_e2e_confirm"
@@ -205,12 +227,39 @@ class ProductionE2ETests(unittest.IsolatedAsyncioTestCase):
         context.application.bot_data = {"mcp_manager": self.mcp_manager, "db": self.db}
 
         # Invoke actual production Telegram callback handler
-        await handlers.handle_callback(update, context)
+        original_call = self.mcp_manager.call_tool
+        with patch.object(self.mcp_manager, 'call_tool', new=AsyncMock(wraps=original_call)) as call:
+            await handlers.handle_callback(update, context)
+            await handlers.handle_callback(update, context)
+            call.assert_awaited_once_with(
+                "mcp__mock__create_issue", {"title": "Confirmed Wayland Issue"})
 
-        # Verify proposal state transitioned to accepted in DB
+        # Verify proposal state transitioned only after successful execution.
         prop_after = self.db.get_nl_proposal(prop_id)
-        self.assertEqual(prop_after['status'], 'accepted')
+        self.assertEqual(prop_after['status'], 'executed')
         self.assertTrue(msg.reply_text.called)
+
+    async def test_07b_external_write_failure_marks_failed(self):
+        import handlers
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from types import SimpleNamespace
+
+        prop_id = "prop_e2e_failure"
+        payload = {"gemini_name": "mcp__mock__create_issue",
+                   "arguments": {"title": "Must Fail"}, "risk_level": "EXTERNAL_WRITE"}
+        self.db.create_proposal(prop_id, self.owner_id, "mcp_external_write", payload)
+        msg = MagicMock(reply_text=AsyncMock(), edit_text=AsyncMock(), forward_origin=None)
+        query = MagicMock(data=f"mcp:confirm:{prop_id}", answer=AsyncMock(),
+                          edit_message_text=AsyncMock(), from_user=SimpleNamespace(id=self.owner_id),
+                          message=msg)
+        update = MagicMock(callback_query=query, effective_message=msg)
+        context = MagicMock()
+        context.application.bot_data = {"mcp_manager": self.mcp_manager, "db": self.db}
+        failed = ToolResult("mock.create_issue", "mcp__mock__create_issue", False,
+                            error="controlled failure")
+        with patch.object(self.mcp_manager, 'call_tool', new=AsyncMock(return_value=failed)):
+            await handlers.handle_callback(update, context)
+        self.assertEqual(self.db.get_nl_proposal(prop_id)["status"], "failed")
 
     async def test_08_cancel_proposal(self):
         prop_id = "prop_e2e_cancel"
@@ -245,6 +294,36 @@ class ProductionE2ETests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(ValueError):
             self.db.claim_nl_proposal(prop_id, self.owner_id)
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from types import SimpleNamespace
+        import handlers
+        msg = MagicMock(reply_text=AsyncMock(), edit_text=AsyncMock(), forward_origin=None)
+        query = MagicMock(data=f"mcp:confirm:{prop_id}", answer=AsyncMock(),
+                          from_user=SimpleNamespace(id=self.owner_id), message=msg)
+        update = MagicMock(callback_query=query, effective_message=msg)
+        context = MagicMock()
+        context.application.bot_data = {"mcp_manager": self.mcp_manager, "db": self.db}
+        with patch.object(self.mcp_manager, 'call_tool', new=AsyncMock()) as call:
+            await handlers.handle_callback(update, context)
+            call.assert_not_awaited()
+
+    async def test_10b_compound_plan_failure_marks_failed(self):
+        import handlers
+        from unittest.mock import AsyncMock, MagicMock
+        from types import SimpleNamespace
+        plan = ConversationPlan(actions=[PlannedAction(
+            intent=NLIntent.ADD_CASE_EVENT, confidence=1.0,
+            entities=NLEntities(case_id=999999, event_detail="cannot succeed"))])
+        prop_id = "prop_plan_failure"
+        self.db.create_proposal(prop_id, self.owner_id, "compound_plan", plan.model_dump())
+        msg = MagicMock(reply_text=AsyncMock(), edit_text=AsyncMock(), forward_origin=None)
+        query = MagicMock(data=f"prop:accept:{prop_id}", answer=AsyncMock(),
+                          from_user=SimpleNamespace(id=self.owner_id), message=msg)
+        update = MagicMock(callback_query=query, effective_message=msg)
+        context = MagicMock()
+        context.application.bot_data = {"mcp_manager": self.mcp_manager, "db": self.db}
+        await handlers.handle_callback(update, context)
+        self.assertEqual(self.db.get_nl_proposal(prop_id)["status"], "failed")
 
     async def test_11_prompt_injection_containment(self):
         from agent_orchestrator import SYSTEM_INSTRUCTION_MCP_AGENT
@@ -312,6 +391,18 @@ class ProductionE2ETests(unittest.IsolatedAsyncioTestCase):
         res = ReportValidator.validate('eod', 'Explicit resolved queries: 4', shift, activities=[], tasks=[], cases=[])
         self.assertFalse(any(w.code == 'UNSUPPORTED_INTERACTION_COUNT' for w in res.warnings))
 
+    def test_15b_memory_summary_live_fts_and_idempotent_reindex(self):
+        summary_id = self.db.save_memory_summary(
+            self.owner_id, "rolling", "Wayland compositor investigation summary", self.shift_id)
+        live = [r for r in self.db.search_historical_memory("compositor")
+                if r["source_type"] == "conversation_summary" and r["source_id"] == str(summary_id)]
+        self.assertEqual(len(live), 1)
+        self.db.rebuild_work_memory_index()
+        self.db.rebuild_work_memory_index()
+        rebuilt = [r for r in self.db.search_historical_memory("compositor")
+                   if r["source_type"] == "conversation_summary" and r["source_id"] == str(summary_id)]
+        self.assertEqual(len(rebuilt), 1)
+
     async def test_16_telegram_handler_end_to_end_flow(self):
         import handlers
         from unittest.mock import AsyncMock, MagicMock
@@ -335,3 +426,35 @@ class ProductionE2ETests(unittest.IsolatedAsyncioTestCase):
         # Verify turn was recorded in DB
         turns = self.db.get_recent_turns(self.owner_id, 5)
         self.assertTrue(len(turns) > 0)
+
+    async def test_16b_telegram_gemini_mcp_roundtrip_and_durable_reply(self):
+        import handlers
+        from gemini_tool_model import CompatibleToolModel
+        from unittest.mock import AsyncMock, MagicMock
+
+        fn_call = {"function_calls": [{"name": "mcp__mock__search_issues",
+                                        "args": {"query": "Wayland"}}]}
+        final_answer = {"text": "I found issue #61 in owner/telegram-work-assistant."}
+        ai = MockGeminiClientForE2E(tool_responses=[fn_call, final_answer])
+        msg = MagicMock(forward_origin=None, reply_text=AsyncMock())
+        update = MagicMock(update_id=889, effective_message=msg, message=msg)
+        context = MagicMock()
+        context.application.bot_data = {
+            "mcp_manager": self.mcp_manager, "db": self.db,
+            "gemini_tool_model": CompatibleToolModel(ai),
+        }
+
+        await handlers.save_plain_message(
+            update, context, "Check GitHub for the Wayland screenshot issue")
+
+        sent_reply = msg.reply_text.await_args.args[0]
+        self.assertIn("issue #61", sent_reply)
+        turns = self.db.get_recent_turns(self.owner_id, 5)
+        self.assertEqual(turns[-1]["role"], "assistant")
+        self.assertIn("issue #61", turns[-1]["text"])
+        metadata = json.loads(turns[-1]["entities_json"])
+        self.assertEqual(metadata["active_external_refs"]["github_issue"]["repository"],
+                         "owner/telegram-work-assistant")
+        function_responses = [part["function_response"] for msg_request in ai.tool_requests[1]
+                              for part in msg_request.get("parts", []) if "function_response" in part]
+        self.assertTrue(function_responses[0]["response"]["success"])

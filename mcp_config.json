@@ -2,11 +2,12 @@
   "mcpServers": {
     "github": {
       "enabled": false,
-      "transport": "stdio",
-      "command": "npx",
-      "args": ["-y", "github/github-mcp-server"],
-      "env": {
-        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"
+      "transport": "streamable_http",
+      "url": "https://api.githubcopilot.com/mcp/",
+      "headers": {
+        "Authorization": "Bearer ${GITHUB_TOKEN}",
+        "X-MCP-Toolsets": "issues,pull_requests,repos,users",
+        "X-MCP-Readonly": "true"
       }
     },
     "filesystem": {

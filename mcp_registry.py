@@ -13,6 +13,7 @@ class RiskLevel(Enum):
     EXTERNAL_WRITE = "EXTERNAL_WRITE"
     DESTRUCTIVE = "DESTRUCTIVE"
     PRIVILEGED = "PRIVILEGED"
+    UNKNOWN_EXTERNAL = "UNKNOWN_EXTERNAL"
 
 
 @dataclass
@@ -23,9 +24,13 @@ class ToolDescriptor:
     original_name: str         # e.g., "search_issues"
     description: str
     input_schema: Dict[str, Any]
-    risk_level: RiskLevel = RiskLevel.READ_ONLY
+    risk_level: RiskLevel = RiskLevel.UNKNOWN_EXTERNAL
     external: bool = True
     enabled: bool = True
+    read_only_hint: Optional[bool] = None
+    destructive_hint: Optional[bool] = None
+    idempotent_hint: Optional[bool] = None
+    open_world_hint: Optional[bool] = None
 
 
 def format_gemini_name(server_name: str, tool_name: str) -> str:
@@ -35,21 +40,48 @@ def format_gemini_name(server_name: str, tool_name: str) -> str:
     return f"mcp__{clean_server}__{clean_tool}"
 
 
-def classify_tool_risk(server_name: str, tool_name: str) -> RiskLevel:
-    """Classify tool risk level based on server and operation semantics."""
+_GITHUB_WRITES = {
+    "merge_pull_request", "create_issue", "update_issue", "add_issue_comment",
+    "create_pull_request", "request_review", "mark_notifications_read",
+    "assign_copilot_to_issue", "add_sub_issue", "reprioritize_sub_issue",
+    "push_files", "create_or_update_file", "create_branch", "fork_repository",
+}
+_READ_PREFIXES = ("get_", "list_", "search_", "read_", "fetch_", "show_", "view_")
+
+
+def classify_tool_risk(
+    server_name: str,
+    tool_name: str,
+    *,
+    external: bool = True,
+    read_only_hint: Optional[bool] = None,
+    destructive_hint: Optional[bool] = None,
+    trusted_annotations: bool = False,
+) -> RiskLevel:
+    """Classify risk conservatively; unknown external operations never auto-run."""
     name_lower = tool_name.lower()
-    
-    # Destructive keywords
+
+    if server_name.casefold() == "github" and name_lower in _GITHUB_WRITES:
+        return RiskLevel.EXTERNAL_WRITE
+    if destructive_hint is True:
+        return RiskLevel.DESTRUCTIVE
     if any(k in name_lower for k in ['delete', 'destroy', 'drop', 'purge', 'remove', 'unlink']):
         return RiskLevel.DESTRUCTIVE
-    
-    # Write keywords
-    if any(k in name_lower for k in ['create', 'add', 'insert', 'update', 'edit', 'patch', 'send', 'post', 'put', 'write', 'move']):
-        if server_name in ['local', 'assistant', 'system']:
+    if any(k in name_lower for k in [
+        'create', 'add', 'insert', 'update', 'edit', 'patch', 'send', 'post',
+        'put', 'write', 'move', 'merge', 'assign', 'label', 'approve', 'deploy',
+        'publish', 'close', 'reopen', 'cancel', 'trigger', 'dispatch', 'invite',
+    ]):
+        if not external or server_name in ['local', 'assistant', 'system']:
             return RiskLevel.LOCAL_WRITE
         return RiskLevel.EXTERNAL_WRITE
-    
-    return RiskLevel.READ_ONLY
+    if not external:
+        return RiskLevel.READ_ONLY
+    if trusted_annotations and read_only_hint is True:
+        return RiskLevel.READ_ONLY
+    if name_lower.startswith(_READ_PREFIXES):
+        return RiskLevel.READ_ONLY
+    return RiskLevel.UNKNOWN_EXTERNAL
 
 
 class ToolRegistry:
@@ -64,13 +96,25 @@ class ToolRegistry:
         description: str,
         input_schema: Dict[str, Any],
         risk_level: Optional[RiskLevel] = None,
-        external: bool = True
+        external: bool = True,
+        annotations: Optional[Dict[str, Any]] = None,
+        trusted_annotations: bool = False,
     ) -> ToolDescriptor:
         canonical_id = f"{server_name}.{original_name}"
         gemini_name = format_gemini_name(server_name, original_name)
         
+        annotations = annotations or {}
+        read_only_hint = annotations.get("readOnlyHint", annotations.get("read_only_hint"))
+        destructive_hint = annotations.get("destructiveHint", annotations.get("destructive_hint"))
+        idempotent_hint = annotations.get("idempotentHint", annotations.get("idempotent_hint"))
+        open_world_hint = annotations.get("openWorldHint", annotations.get("open_world_hint"))
         if risk_level is None:
-            risk_level = classify_tool_risk(server_name, original_name)
+            risk_level = classify_tool_risk(
+                server_name, original_name, external=external,
+                read_only_hint=read_only_hint,
+                destructive_hint=destructive_hint,
+                trusted_annotations=trusted_annotations,
+            )
 
         desc = ToolDescriptor(
             canonical_id=canonical_id,
@@ -81,7 +125,11 @@ class ToolRegistry:
             input_schema=input_schema or {},
             risk_level=risk_level,
             external=external,
-            enabled=True
+            enabled=True,
+            read_only_hint=read_only_hint,
+            destructive_hint=destructive_hint,
+            idempotent_hint=idempotent_hint,
+            open_world_hint=open_world_hint,
         )
 
         self._tools_by_gemini_name[gemini_name] = desc

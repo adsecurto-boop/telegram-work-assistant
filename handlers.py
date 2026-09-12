@@ -276,7 +276,9 @@ async def save_plain_message(update, context, text):
         ai_client = GeminiNLParser(config.AI_KEY, config.AI_MODEL, config.AI_FALLBACK_MODEL)
 
     mcp_mgr = context.application.bot_data.get('mcp_manager') if context and hasattr(context, 'application') and hasattr(context.application, 'bot_data') else None
-    orchestrator = AssistantOrchestrator(database, mcp_manager=mcp_mgr, ai_client=ai_client)
+    tool_model = context.application.bot_data.get('gemini_tool_model') if context and hasattr(context, 'application') and hasattr(context.application, 'bot_data') else None
+    orchestrator = AssistantOrchestrator(
+        database, mcp_manager=mcp_mgr, ai_client=ai_client, tool_model=tool_model)
 
     orch_res = await orchestrator.route_and_process(text, owner_id=config.OWNER_ID, source_update_id=update.update_id)
 
@@ -779,11 +781,25 @@ async def handle_callback(update, context):
             gemini_name = payload.get('gemini_name') or payload.get('tool_id')
             args = payload.get('arguments', {})
             if mcp_mgr and gemini_name:
-                res = await mcp_mgr.call_tool(gemini_name, args)
-                await asyncio.to_thread(db(context).finish_nl_proposal, prop_id, 'accepted')
+                try:
+                    desc = mcp_mgr.validate_tool_call(gemini_name, args)
+                    from mcp_policy import ToolPolicy, PolicyDecision
+                    current_policy = ToolPolicy.evaluate(desc, args)
+                    stored_risk = payload.get('risk_level')
+                    if current_policy.decision != PolicyDecision.CONFIRMATION_REQUIRED:
+                        raise ValueError('Tool risk policy changed; create a new proposal.')
+                    if stored_risk and stored_risk != desc.risk_level.value:
+                        raise ValueError('Tool risk classification changed; create a new proposal.')
+                    res = await mcp_mgr.call_tool(gemini_name, args)
+                except Exception as exc:
+                    await asyncio.to_thread(db(context).finish_nl_proposal, prop_id, 'failed')
+                    await reply(update, f"❌ **External Tool Action Failed**\n\n{exc}")
+                    return
                 if res.success:
+                    await asyncio.to_thread(db(context).finish_nl_proposal, prop_id, 'executed')
                     await reply(update, f"✅ **External Tool Action Executed**\n\n{res.text}")
                 else:
+                    await asyncio.to_thread(db(context).finish_nl_proposal, prop_id, 'failed')
                     await reply(update, f"❌ **External Tool Action Failed**\n\nError: {res.error}")
             else:
                 await asyncio.to_thread(db(context).finish_nl_proposal, prop_id, 'failed')
@@ -796,7 +812,9 @@ async def handle_callback(update, context):
             shift = await asyncio.to_thread(db(context).active_shift)
             plan = ConversationPlan.model_validate(payload)
             res = await nlp.execute_plan(plan, shift)
-            await asyncio.to_thread(db(context).finish_nl_proposal, prop_id, 'accepted')
+            await asyncio.to_thread(
+                db(context).finish_nl_proposal, prop_id,
+                'executed' if res.success else 'failed')
             await reply(update, res.reply)
             return
 
@@ -954,7 +972,10 @@ async def handle(update, context):
             else:
                 for s_name, s_info in health.items():
                     status_icon = '🟢' if s_info['status'] == 'ready' else ('🟡' if s_info['status'] == 'connecting' else '🔴')
-                    lines.append(f"{status_icon} **{s_name.upper()}**: {s_info['status']} ({s_info['tools']} tools available)")
+                    lines.append(
+                        f"{status_icon} **{s_name.upper()}**: {s_info['status']} "
+                        f"({s_info['tool_count']} tools; {s_info['transport']}; "
+                        f"protocol {s_info.get('protocol_version') or 'not connected'})")
                     if s_info.get('last_error'):
                         lines.append(f"   └ Error: `{s_info['last_error']}`")
             await reply(update, '\n'.join(lines), MENU)
