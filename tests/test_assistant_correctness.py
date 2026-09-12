@@ -277,11 +277,11 @@ class DurableConversationMemoryTests(unittest.TestCase):
         self.path = Path(self.tmp.name) / 'work.sqlite3'
         self.db = Database(self.path)
 
-    def test_schema_version_is_12(self):
-        """PRAGMA user_version is 12."""
-        self.assertEqual(SCHEMA_VERSION, 12)
+    def test_schema_version_is_13(self):
+        """PRAGMA user_version is 13."""
+        self.assertEqual(SCHEMA_VERSION, 13)
         with self.db.connect() as conn:
-            self.assertEqual(conn.execute('PRAGMA user_version').fetchone()[0], 12)
+            self.assertEqual(conn.execute('PRAGMA user_version').fetchone()[0], 13)
 
     def test_conversation_turns_persist(self):
         """record_conversation_turn persists turns and returns unique IDs."""

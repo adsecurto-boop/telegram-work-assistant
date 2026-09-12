@@ -62,16 +62,17 @@ class ReportValidator:
 
         # 1. Structured Metrics Calculation
         support_activities = [a for a in activities if a.get('category') == 'support']
-        unique_support_clients = {
-            (a.get('client') or '').strip()
-            for a in support_activities if (a.get('client') or '').strip()
-        }
-        case_clients = {
-            (c.get('client') or '').strip()
-            for c in cases if (c.get('client') or '').strip()
-        }
-        all_unique_clients = {c for c in (unique_support_clients | case_clients) if c.casefold() not in ('general', 'none', 'unknown')}
-        lowered_clients = {c.casefold(): c for c in all_unique_clients}
+        client_map = {}
+        for a in support_activities:
+            raw = (a.get('client') or '').strip()
+            if raw:
+                client_map[raw.casefold()] = raw
+        for c in cases:
+            raw = (c.get('client') or '').strip()
+            if raw:
+                client_map[raw.casefold()] = raw
+        all_unique_clients = {v for k, v in client_map.items() if k not in ('general', 'none', 'unknown', 'n/a', '')}
+        lowered_clients = {k: v for k, v in client_map.items() if k not in ('general', 'none', 'unknown', 'n/a', '')}
 
         # Tasks scoped to this shift/date
         completed_tasks = [t for t in tasks if getattr(t, 'status', None) and t.status.value == 'completed']

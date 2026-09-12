@@ -63,9 +63,67 @@ def build_assistant_context(
         'data': raw_ctx.get('data', {}),
     }
 
-    # 3. Durable conversation turns (bounded)
-    shift_id = active_shift.get('id') if active_shift else None
-    raw_turns = db.get_recent_turns(owner_id, limit=conversation_limit, shift_id=shift_id)
+    # 3. Active Object Details
+    active_case_detail = None
+    recent_case_events = []
+    if active_ctx.get('active_case_id') and hasattr(db, 'case'):
+        c = db.case(active_ctx['active_case_id'])
+        if c:
+            active_case_detail = {
+                'id': c.get('id'),
+                'title': redact(c.get('title') or ''),
+                'client': c.get('client'),
+                'product': c.get('product'),
+                'status': c.get('status'),
+                'waiting_on': c.get('waiting_on'),
+                'next_action': redact(c.get('next_action') or ''),
+            }
+            if hasattr(db, 'case_events'):
+                evs = db.case_events(c['id'])
+                for e in evs[-5:]:
+                    recent_case_events.append({
+                        'id': e.get('id'),
+                        'event_type': e.get('event_type'),
+                        'detail': redact(e.get('detail') or ''),
+                        'occurred_at': e.get('occurred_at'),
+                    })
+
+    active_task_detail = None
+    if active_ctx.get('active_task_id'):
+        t_row = db.get_task(active_ctx['active_task_id']) if hasattr(db, 'get_task') else (db.task(active_ctx['active_task_id']) if hasattr(db, 'task') else None)
+        if t_row:
+            if isinstance(t_row, dict):
+                t_id = t_row.get('id')
+                t_title = t_row.get('title')
+                t_status = t_row.get('status')
+                t_client = t_row.get('client')
+                t_priority = t_row.get('priority')
+                t_next_action = t_row.get('next_action')
+            else:
+                t_id = getattr(t_row, 'id', None)
+                t_title = getattr(t_row, 'title', '')
+                t_status = getattr(t_row, 'status', '')
+                t_client = getattr(t_row, 'client', None)
+                t_priority = getattr(t_row, 'priority', 0)
+                t_next_action = getattr(t_row, 'next_action', None)
+
+            active_task_detail = {
+                'id': t_id,
+                'title': redact(t_title or ''),
+                'status': str(t_status.value) if hasattr(t_status, 'value') else str(t_status or ''),
+                'client': t_client,
+                'priority': t_priority,
+                'next_action': redact(t_next_action or ''),
+            }
+
+    # 4. Rolling daily memory summary
+    s_id = active_shift.get('id') if active_shift else None
+    latest_summary = None
+    if hasattr(db, 'get_latest_memory_summary'):
+        latest_summary = db.get_latest_memory_summary(owner_id, shift_id=s_id)
+
+    # 5. Durable conversation turns (bounded)
+    raw_turns = db.get_recent_turns(owner_id, limit=conversation_limit, shift_id=s_id) if hasattr(db, 'get_recent_turns') else []
     recent_turns = []
     for turn in raw_turns:
         text = turn.get('text', '')
@@ -79,7 +137,20 @@ def build_assistant_context(
             'created_at': turn.get('created_at'),
         })
 
-    # 4. Pending tasks (bounded)
+    # Trigger automatic rolling summary if unsummarized turns >= 15
+    if len(raw_turns) >= 15 and hasattr(db, 'save_memory_summary'):
+        summary_lines = []
+        if active_case_detail:
+            summary_lines.append(f"Focus Case #{active_case_detail['id']} [{active_case_detail.get('client','Gen')}]: {active_case_detail['title']} ({active_case_detail['status']})")
+        for turn in raw_turns[:7]:
+            summary_lines.append(f"{turn.get('role', 'user').upper()}: {turn.get('text', '')}")
+        summary_text = redact("\n".join(summary_lines))
+        db.save_memory_summary(owner_id, 'rolling_daily', summary_text, shift_id=shift_id,
+                               source_turn_start_id=raw_turns[0].get('id'),
+                               source_turn_end_id=raw_turns[6].get('id'))
+        latest_summary = {'summary_text': summary_text}
+
+    # 6. Pending tasks (bounded)
     all_tasks = db.list_tasks() if hasattr(db, 'list_tasks') else []
     pending_tasks = []
     for t in all_tasks:
@@ -95,7 +166,7 @@ def build_assistant_context(
             if len(pending_tasks) >= retrieval_limit:
                 break
 
-    # 5. Due followups (bounded)
+    # 7. Due followups (bounded)
     due_followups = []
     if hasattr(db, 'due_followups'):
         raw_followups = db.due_followups(now.isoformat())
@@ -106,7 +177,7 @@ def build_assistant_context(
                 'due_at': f.get('due_at') if isinstance(f, dict) else getattr(f, 'due_at', None),
             })
 
-    # 6. Shift summary stats (if active)
+    # 8. Shift summary stats (if active)
     shift_stats = {}
     if active_shift and hasattr(db, 'activities'):
         acts = db.activities(active_shift['id'])
@@ -121,6 +192,10 @@ def build_assistant_context(
         'timezone': tz_name,
         'shift': shift_ctx,
         'active_context': active_ctx,
+        'active_case': active_case_detail,
+        'active_task': active_task_detail,
+        'recent_case_events': recent_case_events,
+        'latest_summary': latest_summary,
         'recent_turns': recent_turns,
         'pending_tasks': pending_tasks,
         'due_followups': due_followups,
@@ -150,6 +225,18 @@ def format_context_for_prompt(context: dict[str, Any], max_chars: int = 3500) ->
         ptrs.append(f"Case=#{act_ctx['active_case_id']}")
     if ptrs:
         lines.append("Active Focus: " + ", ".join(ptrs))
+
+    ac = context.get('active_case')
+    if ac:
+        lines.append(f"Active Case #{ac['id']} [{ac.get('client') or 'General'}]: {ac['title']} (status: {ac['status']}, waiting: {ac.get('waiting_on') or 'none'})")
+
+    at = context.get('active_task')
+    if at:
+        lines.append(f"Active Task #{at['id']}: {at['title']} ({at['status']})")
+
+    summary = context.get('latest_summary')
+    if summary and summary.get('summary_text'):
+        lines.append(f"Rolling Daily Summary:\n{summary['summary_text']}")
 
     # Pending tasks
     tasks = context.get('pending_tasks', [])

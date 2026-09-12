@@ -13,7 +13,7 @@ from pathlib import Path
 from models import Task, TaskStatus
 import config
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 
 _last_iso_time = 0.0
@@ -41,6 +41,11 @@ class Database:
     def connect(self):
         connection = sqlite3.connect(self.path, timeout=15)
         connection.row_factory = sqlite3.Row
+        try:
+            connection.execute('PRAGMA journal_mode=WAL')
+            connection.execute('PRAGMA synchronous=NORMAL')
+        except sqlite3.Error:
+            pass
         connection.execute('PRAGMA foreign_keys=ON')
         connection.execute('PRAGMA busy_timeout=15000')
         try:
@@ -96,6 +101,8 @@ class Database:
                 self._seed_v11_defaults(cursor)
             if version < 12:
                 self._seed_v12_defaults(cursor)
+            if version < 13:
+                self._seed_v13_defaults(cursor)
             self._create_indexes(cursor)
             self._validate_schema_integrity(cursor)
             cursor.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
@@ -426,6 +433,17 @@ class Database:
                 source_update_id INTEGER,
                 correlation_id TEXT,
                 created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS assistant_memory_summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_id INTEGER NOT NULL,
+                shift_id INTEGER REFERENCES shifts(id),
+                memory_type TEXT NOT NULL,
+                summary_text TEXT NOT NULL,
+                source_turn_start_id INTEGER,
+                source_turn_end_id INTEGER,
+                version INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL);
         ''')
 
     def _create_indexes(self, connection):
@@ -569,6 +587,27 @@ class Database:
         # v12 introduces conversation_turns table (created by _create_schema)
         pass
 
+    def _seed_v13_defaults(self, connection):
+        connection.execute('''CREATE TABLE IF NOT EXISTS assistant_memory_summaries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id INTEGER NOT NULL,
+            shift_id INTEGER REFERENCES shifts(id),
+            memory_type TEXT NOT NULL,
+            summary_text TEXT NOT NULL,
+            source_turn_start_id INTEGER,
+            source_turn_end_id INTEGER,
+            version INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL)''')
+        try:
+            connection.execute('''CREATE VIRTUAL TABLE IF NOT EXISTS fts_work_memory USING fts5(
+                source_type, source_id, title, content, client, product, created_at
+            )''')
+        except sqlite3.OperationalError:
+            connection.execute('''CREATE TABLE IF NOT EXISTS fts_work_memory (
+                source_type TEXT, source_id TEXT, title TEXT, content TEXT, client TEXT, product TEXT, created_at TEXT
+            )''')
+
     def _validate_schema_integrity(self, cursor):
         required_tables = {
             'tasks', 'settings', 'shifts', 'activities', 'clients',
@@ -581,7 +620,8 @@ class Database:
             'bulk_operations', 'shift_templates', 'shift_calendar',
             'report_provenance', 'nl_proposals', 'report_validations',
             'nl_corrections', 'plan_snapshots', 'record_links',
-            'planning_conversations', 'conversation_turns'
+            'planning_conversations', 'conversation_turns',
+            'assistant_memory_summaries', 'fts_work_memory'
         }
         rows = cursor.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         existing = {r['name'] if isinstance(r, sqlite3.Row) else r[0] for r in rows}
@@ -2320,6 +2360,16 @@ class Database:
 
     def add_evidence(self, kind, shift_id=None, case_id=None, test_session_id=None, path=None,
                      telegram_file_id=None, caption=None, sha256=None, mime_type=None):
+        if path and not sha256:
+            p = Path(path)
+            if p.is_file():
+                import hashlib
+                h = hashlib.sha256()
+                with p.open('rb') as fh:
+                    for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                        h.update(chunk)
+                sha256 = h.hexdigest()
+
         with self.connect() as connection:
             if test_session_id is not None:
                 ts = connection.execute('SELECT id, case_id FROM test_sessions WHERE id=?', (test_session_id,)).fetchone()
@@ -2342,7 +2392,7 @@ class Database:
             evidence_id = connection.execute('''INSERT OR IGNORE INTO evidence
                 (case_id,test_session_id,shift_id,kind,path,telegram_file_id,caption,sha256,mime_type,created_at)
                 VALUES (?,?,?,?,?,?,?,?,?,?)''',
-                (case_id, test_session_id, shift_id, kind, path, telegram_file_id, caption,
+                (case_id, test_session_id, shift_id, kind, str(path) if path else None, telegram_file_id, caption,
                  sha256, mime_type, now_iso())).lastrowid
             if not evidence_id and sha256:
                 row = connection.execute('''SELECT id FROM evidence WHERE sha256=?
@@ -3844,3 +3894,56 @@ class Database:
             )
 
             return sid, confirmed_tasks
+
+    def save_memory_summary(self, owner_id: int, memory_type: str, summary_text: str,
+                            shift_id: int | None = None, source_turn_start_id: int | None = None,
+                            source_turn_end_id: int | None = None) -> int:
+        stamp = now_iso()
+        with self.connect() as connection:
+            return connection.execute('''INSERT INTO assistant_memory_summaries
+                (owner_id, shift_id, memory_type, summary_text, source_turn_start_id, source_turn_end_id, version, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)''',
+                (owner_id, shift_id, memory_type, summary_text, source_turn_start_id, source_turn_end_id, stamp, stamp)).lastrowid
+
+    def get_latest_memory_summary(self, owner_id: int, shift_id: int | None = None) -> dict | None:
+        with self.connect() as connection:
+            if shift_id:
+                row = connection.execute('''SELECT * FROM assistant_memory_summaries
+                    WHERE owner_id=? AND shift_id=? ORDER BY id DESC LIMIT 1''', (owner_id, shift_id)).fetchone()
+            else:
+                row = connection.execute('''SELECT * FROM assistant_memory_summaries
+                    WHERE owner_id=? ORDER BY id DESC LIMIT 1''', (owner_id,)).fetchone()
+            return dict(row) if row else None
+
+    def index_fts_record(self, source_type: str, source_id: str | int, title: str, content: str,
+                         client: str | None = None, product: str | None = None, created_at: str | None = None):
+        stamp = created_at or now_iso()
+        with self.connect() as connection:
+            try:
+                connection.execute('''INSERT INTO fts_work_memory (source_type, source_id, title, content, client, product, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                    (str(source_type), str(source_id), title or '', content or '', client or '', product or '', stamp))
+            except sqlite3.Error:
+                pass
+
+    def search_historical_memory(self, query: str, limit: int = 10) -> list[dict]:
+        if not query or not query.strip():
+            return []
+        cleaned = re.sub(r'[^\w\s]', ' ', query).strip()
+        if not cleaned:
+            return []
+        with self.connect() as connection:
+            try:
+                rows = connection.execute('''SELECT * FROM fts_work_memory WHERE fts_work_memory MATCH ?
+                    ORDER BY rowid DESC LIMIT ?''', (cleaned, limit)).fetchall()
+            except sqlite3.OperationalError:
+                words = cleaned.split()
+                where_clause = ' OR '.join(['title LIKE ? OR content LIKE ?' for _ in words])
+                params = []
+                for w in words:
+                    params.extend([f'%{w}%', f'%{w}%'])
+                params.append(limit)
+                rows = connection.execute(f'''SELECT * FROM fts_work_memory WHERE {where_clause}
+                    ORDER BY rowid DESC LIMIT ?''', params).fetchall()
+            return [dict(row) for row in rows]
+

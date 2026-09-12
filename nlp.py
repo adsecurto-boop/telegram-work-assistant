@@ -33,6 +33,18 @@ def get_tz_today() -> str:
     return datetime.now(ZoneInfo(config.TIMEZONE)).date().isoformat()
 
 
+def contains_contextual_reference(text: str) -> bool:
+    if not text:
+        return False
+    tokens = set(re.findall(r'\b[a-z0-9_-]+\b', text.lower()))
+    context_keywords = {
+        'it', 'that', 'this', 'same', 'there', 'again', 'also', 'then',
+        'still', 'previous', 'earlier', 'above', 'him', 'her', 'them',
+        'they', 'one', 'finding', 'result', 'case', 'issue'
+    }
+    return bool(tokens & context_keywords)
+
+
 class NLIntent(str, Enum):
     SHOW_SHIFT = 'show_shift'
     LOG_SUPPORT = 'log_support'
@@ -85,6 +97,7 @@ class NLEntities(BaseModel):
     product: str | None = None
     platform: str | None = None
     ticket: str | None = None
+    task_id: int | None = None
     case_id: int | None = None
     case_title: str | None = None
     status: str | None = None
@@ -2214,12 +2227,16 @@ class NaturalLanguagePipeline:
         if interpretation and interpretation.intent != NLIntent.UNKNOWN:
             interpretation = self.resolver.resolve(interpretation)
 
+
         # 4. Structured Gemini fallback if needed and available
         has_conflict = bool(interpretation and ReasonCode.CONFLICTING_CORRECTIONS.value in interpretation.reason_codes)
-        if (not interpretation or interpretation.confidence < 0.7) and self.ai and not has_conflict:
+        has_ref = contains_contextual_reference(text)
+        needs_ai = (not interpretation or interpretation.confidence < 0.7 or (has_ref and interpretation.confidence < 0.9))
+        if needs_ai and self.ai and not has_conflict:
             day = datetime.now(ZoneInfo(config.TIMEZONE)).date().isoformat()
             if self.db.reserve_ai(day, config.AI_DAILY_LIMIT):
-                context = self.db.get_conversation_context('owner')
+                from memory_service import build_assistant_context
+                context = build_assistant_context(self.db, owner_id=config.OWNER_ID, shift=shift)
                 corrections = self.db.get_relevant_corrections(text, limit=5)
                 context['approved_corrections'] = [
                     {

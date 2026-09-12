@@ -204,7 +204,7 @@ th{{background:#f8f9fa;font-weight:600}}
 .kanban-col h3{{margin:0 0 10px 0;font-size:14px;color:#333;display:flex;justify-content:space-between}}
 .kanban-item{{background:white;border:1px solid #dce2e8;border-radius:6px;padding:12px;margin-bottom:10px;box-shadow:0 1px 3px rgba(0,0,0,0.05)}}
 .filter-bar{{background:white;border:1px solid #dce2e8;border-radius:8px;padding:12px;margin-bottom:16px;display:flex;gap:10px;flex-wrap:wrap;align-items:center}}
-</style></head><body><header><strong>Telegram Work Assistant · Phase 4</strong><nav>
+</style></head><body><header><strong>Personal Work Assistant · Telegram Work Assistant</strong><nav>
 <a href="/">Overview</a><a href="/kanban">Kanban</a>
 <a href="/cases">Cases</a><a href="/inbox">Review Inbox</a>
 <a href="/clusters">Clusters</a><a href="/tests">Testing</a>
@@ -257,6 +257,7 @@ th{{background:#f8f9fa;font-weight:600}}
             def do_GET(self):
                 parsed = urlparse(self.path)
                 params = parse_qs(parsed.query)
+
                 authed, set_sid, csrf_token = self.authenticate_request(params)
                 if not authed:
                     self.send_html(self.page('<h2>Access denied</h2><p>Please use your authorized dashboard link with token parameter.</p>'), 403)
@@ -286,7 +287,7 @@ th{{background:#f8f9fa;font-weight:600}}
                         for c in col_cases:
                             items_html.append(f'''<div class="kanban-item">
 <strong><a href="/case?id={c['id']}">CASE-{c['id']}: {h(c['title'])}</a></strong>
-<p class="muted">{h(c.get('client') or 'General')} · {h(c.get('product') or 'General')}</p>
+<p class="muted">Client: {h(c.get('client') or 'General')} | Priority: P{c['priority']}</p>
 <span class="tag">{h(c['status'])}</span>
 <form method="post" action="/case/status"><input type="hidden" name="csrf_token" value="{csrf_token}"><input type="hidden" name="id" value="{c['id']}"><select name="status" onchange="this.form.submit()">
 {''.join(f'<option value="{s}" {"selected" if s==c["status"] else ""}>{s}</option>' for s in STATUSES)}
@@ -306,19 +307,22 @@ th{{background:#f8f9fa;font-weight:600}}
                     category_filter = (params.get('classification') or [''])[0]
                     search_q = (params.get('q') or [''])[0]
                     review_status = (params.get('review_status') or ['pending'])[0]
+                    page_num = max(1, int((params.get('page') or ['1'])[0]))
+                    limit = 50
+                    offset = (page_num - 1) * limit
 
-                    # Filter candidates
-                    filtered_items = service.database.inbox(limit=250)
-                    if client_filter:
-                        filtered_items = [i for i in filtered_items if client_filter.casefold() in (i.get('client') or '').casefold()]
-                    if product_filter:
-                        filtered_items = [i for i in filtered_items if product_filter.casefold() in (i.get('product') or '').casefold()]
-                    if category_filter:
-                        filtered_items = [i for i in filtered_items if i.get('classification') == category_filter]
-                    if search_q:
-                        filtered_items = [i for i in filtered_items if search_q.casefold() in (i.get('text') or '').casefold()]
+                    status_query = review_status if review_status != 'all' else None
 
-                    total_count = len(filtered_items)
+                    filtered_items, total_count = service.database.filter_inbox(
+                        review_status=status_query,
+                        client=client_filter or None,
+                        product=product_filter or None,
+                        classification=category_filter or None,
+                        search_text=search_q or None,
+                        offset=offset,
+                        limit=limit
+                    )
+
                     filter_form = f'''<form class="filter-bar" method="get" action="/inbox">
 <input name="q" placeholder="Text search..." value="{h(search_q)}">
 <input name="client" placeholder="Client..." value="{h(client_filter)}">
@@ -329,12 +333,18 @@ th{{background:#f8f9fa;font-weight:600}}
 <option value="testing" {"selected" if category_filter=="testing" else ""}>Testing</option>
 <option value="note" {"selected" if category_filter=="note" else ""}>Note</option>
 </select>
+<select name="review_status">
+<option value="pending" {"selected" if review_status=="pending" else ""}>Pending</option>
+<option value="accepted" {"selected" if review_status=="accepted" else ""}>Accepted</option>
+<option value="ignored" {"selected" if review_status=="ignored" else ""}>Ignored</option>
+<option value="all" {"selected" if review_status=="all" else ""}>All Statuses</option>
+</select>
 <button class="primary">Filter</button>
 <a href="/inbox">Reset</a>
 </form>'''
 
                     rows_html = []
-                    for item in filtered_items[:60]:
+                    for item in filtered_items:
                         txt = item.get('redacted_text') or item.get('text') or '(media only)'
                         meta = json.loads(item['metadata_json']) if item.get('metadata_json') else {}
                         rows_html.append(f'''<tr>
@@ -346,6 +356,11 @@ th{{background:#f8f9fa;font-weight:600}}
 <td>{h(item.get('occurred_at', '')[:16].replace('T', ' '))}</td>
 <td>{h(txt[:180])}</td>
 </tr>''')
+
+                    total_pages = max(1, (total_count + limit - 1) // limit)
+                    prev_link = f'<a href="/inbox?page={page_num-1}&q={h(search_q)}&client={h(client_filter)}&review_status={h(review_status)}">« Previous</a>' if page_num > 1 else '<span class="muted">« Previous</span>'
+                    next_link = f'<a href="/inbox?page={page_num+1}&q={h(search_q)}&client={h(client_filter)}&review_status={h(review_status)}">Next »</a>' if page_num < total_pages else '<span class="muted">Next »</span>'
+                    pagination_html = f'<div style="margin-top:12px;display:flex;gap:16px;align-items:center;">{prev_link} <span>Page {page_num} of {total_pages}</span> {next_link}</div>'
 
                     bulk_actions = f'''<form method="post" action="/inbox/bulk/preview"><input type="hidden" name="csrf_token" value="{csrf_token}">
 <div style="background:#fff;border:1px solid #dce2e8;border-radius:8px;padding:12px;margin-bottom:12px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
@@ -360,11 +375,12 @@ th{{background:#f8f9fa;font-weight:600}}
 <table class="card">
 <tr><th><input type="checkbox" onclick="document.querySelectorAll('input[name=message_ids]').forEach(c=>c.checked=this.checked)"></th>
 <th>ID</th><th>Type</th><th>Client</th><th>Product</th><th>When</th><th>Text Snippet</th></tr>
-{''.join(rows_html) or '<tr><td colspan="7" class="muted" style="text-align:center;">No pending messages matching filter.</td></tr>'}
+{''.join(rows_html) or '<tr><td colspan="7" class="muted" style="text-align:center;">No messages matching filter.</td></tr>'}
 </table>
+{pagination_html}
 </form>'''
 
-                    content = f'''<h1>Review Inbox ({total_count} Pending)</h1>
+                    content = f'''<h1>Review Inbox ({total_count} Messages)</h1>
 <p class="muted">Safe two-step bulk review with preview confirmation and atomic undo.</p>
 {filter_form}
 {bulk_actions}'''

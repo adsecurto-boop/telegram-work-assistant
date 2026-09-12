@@ -255,10 +255,20 @@ async def save_plain_message(update, context, text):
                         'Finalize EOD & close shift', callback_data=f'close:{report_id}')]]))
         return
 
-    # Phase 4 Natural Language Engine
+    # Phase 4 Natural Language Engine & Durable Conversation Memory
     from nlp import GeminiNLParser, NaturalLanguagePipeline
     database = db(context)
     shift = await asyncio.to_thread(database.active_shift)
+
+    # 1. Record USER turn before processing
+    await asyncio.to_thread(
+        database.record_conversation_turn,
+        config.OWNER_ID,
+        'user',
+        text,
+        shift_id=shift['id'] if shift else None,
+        source_update_id=update.update_id
+    )
 
     ai_client = None
     if config.AI_KEY and config.AI_MODEL:
@@ -266,6 +276,27 @@ async def save_plain_message(update, context, text):
     pipeline = NaturalLanguagePipeline(database, ai_client=ai_client)
 
     reply_text, interp = await pipeline.process(text, shift, source_update_id=update.update_id)
+
+    # 2. Record ASSISTANT turn after processing
+    intent_val = interp.intent.value if interp and interp.intent else None
+    ent_json = json.dumps(interp.entities.model_dump()) if interp and interp.entities else None
+    c_id = getattr(interp.entities, 'case_id', None) if interp and interp.entities else None
+    t_id = getattr(interp.entities, 'task_id', None) if interp and interp.entities else None
+    ts_id = getattr(interp.entities, 'test_session_id', None) if interp and interp.entities else None
+
+    await asyncio.to_thread(
+        database.record_conversation_turn,
+        config.OWNER_ID,
+        'assistant',
+        reply_text,
+        shift_id=shift['id'] if shift else None,
+        intent=intent_val,
+        entities_json=ent_json,
+        case_id=c_id,
+        task_id=t_id,
+        test_session_id=ts_id,
+        source_update_id=update.update_id
+    )
 
     markup = None
     if interp.needs_confirmation or (0.6 <= interp.confidence < 0.85):
@@ -299,8 +330,17 @@ async def save_plain_message(update, context, text):
         markup = InlineKeyboardMarkup(buttons)
     elif interp.intent.value in ('set_shift', 'create_task', 'complete_task', 'change_case_status',
                                  'create_test_session', 'add_learning', 'create_followup'):
+        corr_id = None
+        with database.connect() as conn:
+            r = conn.execute("SELECT applied_operations_json FROM nl_interactions WHERE source_update_id=? ORDER BY id DESC LIMIT 1", (update.update_id,)).fetchone()
+            if r and r['applied_operations_json']:
+                try:
+                    ops = json.loads(r['applied_operations_json'])
+                    corr_id = ops.get('correlation_id')
+                except Exception:
+                    pass
         last_audit = await asyncio.to_thread(database.get_last_reversible_audit)
-        if last_audit:
+        if last_audit and (corr_id is None or last_audit.get('correlation_id') == corr_id):
             markup = InlineKeyboardMarkup([[InlineKeyboardButton('Undo action', callback_data=f"audit:undo:{last_audit['id']}") ]])
 
     await reply(update, reply_text, markup=markup)
@@ -1551,6 +1591,10 @@ async def handle(update, context):
                 '   Use /undo to revert the most recent mutation.\n'
                 '   Bulk actions can also be undone from the dashboard Audit tab.'
             ))
+        elif command == 'briefing':
+            from daily_assistant import generate_morning_briefing
+            briefing_msg = await asyncio.to_thread(generate_morning_briefing, db(context))
+            await reply(update, briefing_msg)
         elif command == 'health':
             await reply(update, await health_text(context))
 
@@ -1568,11 +1612,20 @@ def authorized(update):
 
 
 async def error_handler(update, context):
+    import uuid
+    error_id = f"ERR-{uuid.uuid4().hex[:6].upper()}"
     if isinstance(context.error, Conflict):
         context.application.bot_data['last_polling_conflict'] = datetime.now(ZoneInfo(config.TIMEZONE)).isoformat()
         logging.getLogger(__name__).error(
             'Telegram polling Conflict: check for another runner using this bot token or a configured webhook.')
         return
-    logging.getLogger(__name__).error('Update failed (%s)', type(context.error).__name__)
+    logging.getLogger(__name__).error('Update %s failed [%s]: %s',
+                                       getattr(update, 'update_id', 'unknown'), error_id, context.error,
+                                       exc_info=context.error)
+    if update and hasattr(update, 'update_id') and context and 'db' in context.application.bot_data:
+        try:
+            db(context).fail_update(update.update_id, str(context.error)[:200])
+        except Exception:
+            pass
     if update and authorized(update):
-        await reply(update, 'The operation failed. Check /health and /activity before retrying.')
+        await reply(update, f'The operation failed safely. (Ref: {error_id})\nCheck /health and /activity before retrying.')

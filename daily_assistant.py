@@ -16,6 +16,43 @@ from models import Task, TaskStatus
 # Utility & Parsing Helpers
 # ---------------------------------------------------------------------------
 
+def generate_morning_briefing(db) -> str:
+    """Generate a factual morning work briefing."""
+    shift = db.active_shift()
+    tz_name = getattr(config, 'TIMEZONE', 'Asia/Kolkata')
+    now = datetime.now(ZoneInfo(tz_name))
+
+    lines = ["🌅 Personal Work Assistant — Morning Briefing"]
+    if shift:
+        lines.append(f"• Shift: {shift.get('start')} to {shift.get('end')} (ID #{shift['id']})")
+    else:
+        lines.append("• Shift: No active shift clocked yet (Use 'Start Shift' or /shift)")
+
+    all_tasks = db.list_tasks() if hasattr(db, 'list_tasks') else []
+    pending_tasks = [t for t in all_tasks if (t.status.value if hasattr(t.status, 'value') else str(t.status)) in ('pending', 'in_progress', 'blocked')]
+    lines.append(f"• Active Tasks: {len(pending_tasks)} pending")
+
+    open_cases = db.list_cases(limit=10) if hasattr(db, 'list_cases') else []
+    active_cases = [c for c in open_cases if c.get('status') not in ('closed', 'resolved', 'client_updated')]
+    lines.append(f"• Active Cases: {len(active_cases)} open")
+
+    now_iso_str = now.isoformat()
+    followups = db.due_followups(now_iso_str) if hasattr(db, 'due_followups') else []
+    lines.append(f"• Due Follow-ups: {len(followups)} scheduled")
+
+    if active_cases:
+        lines.append("\n📌 Focus Cases:")
+        for c in active_cases[:3]:
+            lines.append(f"  - CASE-{c['id']} [{c.get('client') or 'General'}]: {c['title']} ({c['status']})")
+
+    if pending_tasks:
+        lines.append("\n📋 Priority Tasks:")
+        for t in pending_tasks[:3]:
+            lines.append(f"  - #{t.id} {t.title} (priority: {t.priority})")
+
+    return "\n".join(lines)
+
+
 def parse_time_flexible(text: str) -> str | None:
     """Parse times like '12', '12:00', '4', '4pm', '4 pm', '16:00' into HH:MM."""
     clean = text.strip().lower()
