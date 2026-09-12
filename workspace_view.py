@@ -504,6 +504,73 @@ def render_workspace_view(service, csrf_token: str) -> str:
     );
   }});
 
+  // --- SERVER-SIDE WORKSPACE ACTION PIPELINE ---
+  const CSRF_TOKEN = '{h(csrf_token)}';
+
+  async function executeWorkspaceAction(action, args) {{
+    if (!cachedAccessToken) {{
+      alert('Please sign in with Google first.');
+      throw new Error('Google authentication required');
+    }}
+
+    // Step 1: Propose action to Python backend (validation & argument hashing)
+    let propData;
+    try {{
+      const propRes = await fetch('/workspace/action/propose', {{
+        method: 'POST',
+        headers: {{
+          'Content-Type': 'application/json',
+          'X-CSRF-Token': CSRF_TOKEN
+        }},
+        body: JSON.stringify({{ action: action, args: args, csrf_token: CSRF_TOKEN }})
+      }});
+      propData = await propRes.json();
+      if (!propRes.ok || !propData.success) {{
+        throw new Error(propData.error || 'Failed to propose workspace action');
+      }}
+    }} catch (e) {{
+      alert('Action Proposal Error: ' + e.message);
+      throw e;
+    }}
+
+    const proposal = propData.proposal;
+
+    // Step 2: Explicit Confirmation Gate
+    return new Promise((resolve, reject) => {{
+      requestConfirmation(
+        proposal.title,
+        proposal.description,
+        proposal.is_destructive,
+        async () => {{
+          try {{
+            // Step 3: Server-side execution through authorized Python backend
+            const execRes = await fetch('/workspace/action/execute', {{
+              method: 'POST',
+              headers: {{
+                'Content-Type': 'application/json',
+                'Authorization': 'Bearer ' + cachedAccessToken,
+                'X-CSRF-Token': CSRF_TOKEN
+              }},
+              body: JSON.stringify({{
+                proposal_id: proposal.proposal_id,
+                csrf_token: CSRF_TOKEN,
+                google_access_token: cachedAccessToken
+              }})
+            }});
+            const execData = await execRes.json();
+            if (!execRes.ok || !execData.success) {{
+              throw new Error(execData.error || 'Server-side execution failed');
+            }}
+            resolve(execData.result.data || execData.result);
+          }} catch (err) {{
+            alert('Execution Error: ' + err.message);
+            reject(err);
+          }}
+        }}
+      );
+    }});
+  }}
+
   // --- GOOGLE SHEETS INTEGRATION ---
   async function loadSpreadsheets() {{
     if (!cachedAccessToken) return;
@@ -586,12 +653,8 @@ def render_workspace_view(service, csrf_token: str) -> str:
 
   document.getElementById('btn-refresh-sheets').addEventListener('click', loadSpreadsheets);
 
-  // Export to Google Sheet (Requires Explicit User Confirmation)
-  document.getElementById('btn-export-sheet').addEventListener('click', () => {{
-    if (!cachedAccessToken) {{
-      alert('Please sign in with Google first.');
-      return;
-    }}
+  // Export to Google Sheet (Server-Side Pipeline)
+  document.getElementById('btn-export-sheet').addEventListener('click', async () => {{
     const exportType = document.getElementById('sheets-export-type').value;
     const title = document.getElementById('sheets-export-title').value.trim() || 'Personal Work Assistant Export';
     const opsData = JSON.parse(document.getElementById('ops-data').textContent);
@@ -615,50 +678,20 @@ def render_workspace_view(service, csrf_token: str) -> str:
       }});
     }}
 
-    requestConfirmation(
-      'Confirm Google Sheets Export',
-      `This operation will create a new Google Spreadsheet titled "${{title}}" with ${{rows.length}} rows of operational data in your Google Drive.`,
-      false,
-      async () => {{
-        const resultDiv = document.getElementById('sheets-export-result');
-        resultDiv.innerHTML = '<span class="tag">Creating spreadsheet in Google Sheets...</span>';
-        try {{
-          // 1. Create spreadsheet
-          const createRes = await fetch('https://sheets.googleapis.com/v4/spreadsheets', {{
-            method: 'POST',
-            headers: {{
-              Authorization: 'Bearer ' + cachedAccessToken,
-              'Content-Type': 'application/json'
-            }},
-            body: JSON.stringify({{
-              properties: {{ title: title }}
-            }})
-          }});
-          const newSheet = await createRes.json();
-          if (!newSheet.spreadsheetId) throw new Error(newSheet.error ? newSheet.error.message : 'Failed to create spreadsheet');
-
-          // 2. Append values
-          await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${{newSheet.spreadsheetId}}/values/A1:append?valueInputOption=USER_ENTERED`, {{
-            method: 'POST',
-            headers: {{
-              Authorization: 'Bearer ' + cachedAccessToken,
-              'Content-Type': 'application/json'
-            }},
-            body: JSON.stringify({{ values: rows }})
-          }});
-
-          resultDiv.innerHTML = `
-            <div style="margin-top:8px;">
-              <span class="tag tag-ok">Export Successful!</span>
-              <a href="https://docs.google.com/spreadsheets/d/${{newSheet.spreadsheetId}}/edit" target="_blank" style="margin-left:8px;font-weight:600;">Open in Google Sheets &rarr;</a>
-            </div>
-          `;
-          loadSpreadsheets();
-        }} catch (e) {{
-          resultDiv.innerHTML = `<span class="tag tag-err">Export error: ${{escapeHtml(e.message)}}</span>`;
-        }}
-      }}
-    );
+    const resultDiv = document.getElementById('sheets-export-result');
+    try {{
+      resultDiv.innerHTML = '<span class="tag">Initiating export through Python backend...</span>';
+      const result = await executeWorkspaceAction('sheets_export', {{ title: title, rows: rows }});
+      resultDiv.innerHTML = `
+        <div style="margin-top:8px;">
+          <span class="tag tag-ok">Export Successful!</span>
+          <a href="${{result.editUrl}}" target="_blank" style="margin-left:8px;font-weight:600;">Open in Google Sheets &rarr;</a>
+        </div>
+      `;
+      loadSpreadsheets();
+    }} catch (err) {{
+      resultDiv.innerHTML = `<span class="tag tag-err">Export error: ${{escapeHtml(err.message)}}</span>`;
+    }}
   }});
 
   // --- GOOGLE TASKS INTEGRATION ---
@@ -726,35 +759,26 @@ def render_workspace_view(service, csrf_token: str) -> str:
         `;
       }}).join('');
 
-      // Checkbox status toggle with confirmation
+      // Checkbox status toggle through server pipeline
       container.querySelectorAll('.task-toggle-cb').forEach(cb => {{
-        cb.addEventListener('change', (e) => {{
+        cb.addEventListener('change', async (e) => {{
           const taskId = cb.getAttribute('data-id');
           const taskTitle = cb.getAttribute('data-title');
           const newStatus = cb.checked ? 'completed' : 'needsAction';
-          // Revert checkbox state until confirmed
+          // Revert checkbox state visually until approved & executed
           cb.checked = !cb.checked;
 
-          requestConfirmation(
-            'Confirm Task Status Update',
-            `Mark task "${{taskTitle}}" as ${{newStatus === 'completed' ? 'COMPLETED' : 'NEEDS ACTION'}} in Google Tasks?`,
-            false,
-            async () => {{
-              try {{
-                await fetch(`https://tasks.googleapis.com/tasks/v1/lists/${{listId}}/tasks/${{taskId}}`, {{
-                  method: 'PATCH',
-                  headers: {{
-                    Authorization: 'Bearer ' + cachedAccessToken,
-                    'Content-Type': 'application/json'
-                  }},
-                  body: JSON.stringify({{ status: newStatus }})
-                }});
-                loadTasks(listId);
-              }} catch (err) {{
-                alert('Failed to update task status: ' + err.message);
-              }}
-            }}
-          );
+          try {{
+            await executeWorkspaceAction('tasks_patch', {{
+              list_id: listId,
+              task_id: taskId,
+              status: newStatus,
+              title: taskTitle
+            }});
+            loadTasks(listId);
+          }} catch (err) {{
+            // Rejected or failed
+          }}
         }});
       }});
 
@@ -783,12 +807,8 @@ def render_workspace_view(service, csrf_token: str) -> str:
     loadTasks(listId);
   }});
 
-  // Create Task (Requires Confirmation Dialog)
-  document.getElementById('btn-submit-task').addEventListener('click', () => {{
-    if (!cachedAccessToken) {{
-      alert('Please sign in with Google first.');
-      return;
-    }}
+  // Create Task (Server-Side Pipeline)
+  document.getElementById('btn-submit-task').addEventListener('click', async () => {{
     const listId = document.getElementById('task-list-selector').value;
     const title = document.getElementById('new-task-title').value.trim();
     const notes = document.getElementById('new-task-notes').value.trim();
@@ -799,38 +819,24 @@ def render_workspace_view(service, csrf_token: str) -> str:
       return;
     }}
 
-    requestConfirmation(
-      'Create Google Task',
-      `Add new task "${{title}}" to your Google Tasks list?`,
-      false,
-      async () => {{
-        const resultDiv = document.getElementById('create-task-result');
-        resultDiv.innerHTML = '<span class="tag">Creating task...</span>';
-        try {{
-          const body = {{ title: title }};
-          if (notes) body.notes = notes;
-          if (due) body.due = new Date(due).toISOString();
+    const resultDiv = document.getElementById('create-task-result');
+    resultDiv.innerHTML = '<span class="tag">Initiating task creation...</span>';
 
-          const res = await fetch(`https://tasks.googleapis.com/tasks/v1/lists/${{listId}}/tasks`, {{
-            method: 'POST',
-            headers: {{
-              Authorization: 'Bearer ' + cachedAccessToken,
-              'Content-Type': 'application/json'
-            }},
-            body: JSON.stringify(body)
-          }});
-          if (!res.ok) throw new Error('Failed to create task');
-
-          resultDiv.innerHTML = '<span class="tag tag-ok">Task created in Google Tasks!</span>';
-          document.getElementById('new-task-title').value = '';
-          document.getElementById('new-task-notes').value = '';
-          document.getElementById('new-task-due').value = '';
-          loadTasks(listId);
-        }} catch (e) {{
-          resultDiv.innerHTML = `<span class="tag tag-err">Error: ${{escapeHtml(e.message)}}</span>`;
-        }}
-      }}
-    );
+    try {{
+      await executeWorkspaceAction('tasks_create', {{
+        list_id: listId,
+        title: title,
+        notes: notes,
+        due: due ? new Date(due).toISOString() : null
+      }});
+      resultDiv.innerHTML = '<span class="tag tag-ok">Task created in Google Tasks!</span>';
+      document.getElementById('new-task-title').value = '';
+      document.getElementById('new-task-notes').value = '';
+      document.getElementById('new-task-due').value = '';
+      loadTasks(listId);
+    }} catch (err) {{
+      resultDiv.innerHTML = `<span class="tag tag-err">Error: ${{escapeHtml(err.message)}}</span>`;
+    }}
   }});
 
   // --- GOOGLE DRIVE INTEGRATION ---
@@ -882,31 +888,20 @@ def render_workspace_view(service, csrf_token: str) -> str:
         `;
       }}).join('');
 
-      // Delete file with Mandatory Confirmation Dialog
+      // Delete file through Server-Side Pipeline (High-Risk Confirmation)
       container.querySelectorAll('.btn-delete-file').forEach(b => {{
-        b.addEventListener('click', () => {{
+        b.addEventListener('click', async () => {{
           const fileId = b.getAttribute('data-id');
           const fileName = b.getAttribute('data-name');
-          requestConfirmation(
-            'Delete File from Google Drive',
-            `Are you sure you want to permanently delete "${{fileName}}" from your Google Drive? This action cannot be undone.`,
-            true,
-            async () => {{
-              try {{
-                const res = await fetch(`https://www.googleapis.com/drive/v3/files/${{fileId}}`, {{
-                  method: 'DELETE',
-                  headers: {{ Authorization: 'Bearer ' + cachedAccessToken }}
-                }});
-                if (res.ok || res.status === 204) {{
-                  loadDriveFiles();
-                }} else {{
-                  throw new Error('Delete returned status ' + res.status);
-                }}
-              }} catch (err) {{
-                alert('Failed to delete file: ' + err.message);
-              }}
-            }}
-          );
+          try {{
+            await executeWorkspaceAction('drive_delete_file', {{
+              file_id: fileId,
+              name: fileName
+            }});
+            loadDriveFiles();
+          }} catch (err) {{
+            // Handled or canceled
+          }}
         }});
       }});
     }} catch (e) {{
@@ -916,38 +911,19 @@ def render_workspace_view(service, csrf_token: str) -> str:
 
   document.getElementById('btn-refresh-drive').addEventListener('click', loadDriveFiles);
 
-  // Create Folder in Drive
-  document.getElementById('btn-create-drive-folder').addEventListener('click', () => {{
-    if (!cachedAccessToken) {{
-      alert('Please sign in with Google first.');
-      return;
-    }}
+  // Create Folder in Drive (Server-Side Pipeline)
+  document.getElementById('btn-create-drive-folder').addEventListener('click', async () => {{
     const folderName = prompt('Enter new folder name:');
     if (!folderName || !folderName.trim()) return;
 
-    requestConfirmation(
-      'Create Google Drive Folder',
-      `Create a new folder titled "${{folderName.trim()}}" in your Google Drive root?`,
-      false,
-      async () => {{
-        try {{
-          await fetch('https://www.googleapis.com/drive/v3/files', {{
-            method: 'POST',
-            headers: {{
-              Authorization: 'Bearer ' + cachedAccessToken,
-              'Content-Type': 'application/json'
-            }},
-            body: JSON.stringify({{
-              name: folderName.trim(),
-              mimeType: 'application/vnd.google-apps.folder'
-            }})
-          }});
-          loadDriveFiles();
-        }} catch (err) {{
-          alert('Failed to create folder: ' + err.message);
-        }}
-      }}
-    );
+    try {{
+      await executeWorkspaceAction('drive_create_folder', {{
+        name: folderName.trim()
+      }});
+      loadDriveFiles();
+    }} catch (err) {{
+      // Handled or canceled
+    }}
   }});
 
   // --- GOOGLE DOCS INTEGRATION ---
@@ -1027,12 +1003,8 @@ def render_workspace_view(service, csrf_token: str) -> str:
 
   document.getElementById('btn-refresh-docs').addEventListener('click', loadDocs);
 
-  // Generate & Export Daily Shift Handover to Google Doc (Confirmation Required)
-  document.getElementById('btn-export-doc').addEventListener('click', () => {{
-    if (!cachedAccessToken) {{
-      alert('Please sign in with Google first.');
-      return;
-    }}
+  // Generate & Export Daily Shift Handover to Google Doc (Server-Side Pipeline)
+  document.getElementById('btn-export-doc').addEventListener('click', async () => {{
     const title = document.getElementById('docs-export-title').value.trim() || 'Daily Operations Handover';
     const notes = document.getElementById('docs-handover-notes').value.trim();
     const opsData = JSON.parse(document.getElementById('ops-data').textContent);
@@ -1066,65 +1038,28 @@ def render_workspace_view(service, csrf_token: str) -> str:
       docBody += `• [${{w.status.toUpperCase()}}] #${{w.id}} ${{w.title}} (${{w.priority}}, Assigned: ${{w.assignee || 'Unassigned'}})\n`;
     }});
 
-    requestConfirmation(
-      'Generate Google Doc Handover Report',
-      `Create new Google Document titled "${{title}}" with operations status and shift handover content?`,
-      false,
-      async () => {{
-        const resultDiv = document.getElementById('docs-export-result');
-        resultDiv.innerHTML = '<span class="tag">Creating Google Doc...</span>';
-        try {{
-          // 1. Create blank doc
-          const createRes = await fetch('https://docs.googleapis.com/v1/documents', {{
-            method: 'POST',
-            headers: {{
-              Authorization: 'Bearer ' + cachedAccessToken,
-              'Content-Type': 'application/json'
-            }},
-            body: JSON.stringify({{ title: title }})
-          }});
-          const newDoc = await createRes.json();
-          if (!newDoc.documentId) throw new Error('Could not create Google Doc');
+    const resultDiv = document.getElementById('docs-export-result');
+    resultDiv.innerHTML = '<span class="tag">Initiating document export through Python backend...</span>';
 
-          // 2. Insert body text
-          await fetch(`https://docs.googleapis.com/v1/documents/${{newDoc.documentId}}:batchUpdate`, {{
-            method: 'POST',
-            headers: {{
-              Authorization: 'Bearer ' + cachedAccessToken,
-              'Content-Type': 'application/json'
-            }},
-            body: JSON.stringify({{
-              requests: [
-                {{
-                  insertText: {{
-                    location: {{ index: 1 }},
-                    text: docBody
-                  }}
-                }}
-              ]
-            }})
-          }});
-
-          resultDiv.innerHTML = `
-            <div style="margin-top:8px;">
-              <span class="tag tag-ok">Document Created!</span>
-              <a href="https://docs.google.com/document/d/${{newDoc.documentId}}/edit" target="_blank" style="margin-left:8px;font-weight:600;">Open in Google Docs &rarr;</a>
-            </div>
-          `;
-          loadDocs();
-        }} catch (e) {{
-          resultDiv.innerHTML = `<span class="tag tag-err">Export error: ${{escapeHtml(e.message)}}</span>`;
-        }}
-      }}
-    );
+    try {{
+      const res = await executeWorkspaceAction('docs_create_handover', {{
+        title: title,
+        body: docBody
+      }});
+      resultDiv.innerHTML = `
+        <div style="margin-top:8px;">
+          <span class="tag tag-ok">Document Created!</span>
+          <a href="${{res.editUrl}}" target="_blank" style="margin-left:8px;font-weight:600;">Open in Google Docs &rarr;</a>
+        </div>
+      `;
+      loadDocs();
+    }} catch (err) {{
+      resultDiv.innerHTML = `<span class="tag tag-err">Export error: ${{escapeHtml(err.message)}}</span>`;
+    }}
   }});
 
   // --- GOOGLE KEEP BRIDGE ---
-  document.getElementById('btn-bridge-to-tasks').addEventListener('click', () => {{
-    if (!cachedAccessToken) {{
-      alert('Please sign in with Google first.');
-      return;
-    }}
+  document.getElementById('btn-bridge-to-tasks').addEventListener('click', async () => {{
     const title = document.getElementById('keep-note-title').value.trim();
     const body = document.getElementById('keep-note-body').value.trim();
     if (!title) {{
@@ -1132,83 +1067,41 @@ def render_workspace_view(service, csrf_token: str) -> str:
       return;
     }}
     const listId = document.getElementById('task-list-selector').value || '@default';
+    const resultDiv = document.getElementById('keep-bridge-result');
+    resultDiv.innerHTML = '<span class="tag">Pushing to Google Tasks via server pipeline...</span>';
 
-    requestConfirmation(
-      'Push Note to Google Tasks',
-      `Create a new Google Task from note "${{title}}"?`,
-      false,
-      async () => {{
-        const resultDiv = document.getElementById('keep-bridge-result');
-        resultDiv.innerHTML = '<span class="tag">Pushing to Google Tasks...</span>';
-        try {{
-          const res = await fetch(`https://tasks.googleapis.com/tasks/v1/lists/${{listId}}/tasks`, {{
-            method: 'POST',
-            headers: {{
-              Authorization: 'Bearer ' + cachedAccessToken,
-              'Content-Type': 'application/json'
-            }},
-            body: JSON.stringify({{ title: title, notes: body }})
-          }});
-          if (!res.ok) throw new Error('Tasks API returned status ' + res.status);
-          resultDiv.innerHTML = '<span class="tag tag-ok">Note converted to Google Task!</span>';
-          loadTasks(listId);
-        }} catch (e) {{
-          resultDiv.innerHTML = `<span class="tag tag-err">Error: ${{escapeHtml(e.message)}}</span>`;
-        }}
-      }}
-    );
+    try {{
+      await executeWorkspaceAction('keep_bridge_tasks', {{
+        list_id: listId,
+        title: title,
+        body: body
+      }});
+      resultDiv.innerHTML = '<span class="tag tag-ok">Note converted to Google Task!</span>';
+      loadTasks(listId);
+    }} catch (err) {{
+      resultDiv.innerHTML = `<span class="tag tag-err">Error: ${{escapeHtml(err.message)}}</span>`;
+    }}
   }});
 
-  document.getElementById('btn-bridge-to-docs').addEventListener('click', () => {{
-    if (!cachedAccessToken) {{
-      alert('Please sign in with Google first.');
-      return;
-    }}
+  document.getElementById('btn-bridge-to-docs').addEventListener('click', async () => {{
     const title = document.getElementById('keep-note-title').value.trim() || 'Work Note';
     const body = document.getElementById('keep-note-body').value.trim();
+    const resultDiv = document.getElementById('keep-bridge-result');
+    resultDiv.innerHTML = '<span class="tag">Exporting to Google Docs via server pipeline...</span>';
 
-    requestConfirmation(
-      'Export Note to Google Doc',
-      `Create a new Google Document from note "${{title}}"?`,
-      false,
-      async () => {{
-        const resultDiv = document.getElementById('keep-bridge-result');
-        resultDiv.innerHTML = '<span class="tag">Exporting to Google Docs...</span>';
-        try {{
-          const createRes = await fetch('https://docs.googleapis.com/v1/documents', {{
-            method: 'POST',
-            headers: {{
-              Authorization: 'Bearer ' + cachedAccessToken,
-              'Content-Type': 'application/json'
-            }},
-            body: JSON.stringify({{ title: title }})
-          }});
-          const newDoc = await createRes.json();
-          if (!newDoc.documentId) throw new Error('Could not create doc');
-
-          if (body) {{
-            await fetch(`https://docs.googleapis.com/v1/documents/${{newDoc.documentId}}:batchUpdate`, {{
-              method: 'POST',
-              headers: {{
-                Authorization: 'Bearer ' + cachedAccessToken,
-                'Content-Type': 'application/json'
-              }},
-              body: JSON.stringify({{
-                requests: [{{ insertText: {{ location: {{ index: 1 }}, text: body }} }}]
-              }})
-            }});
-          }}
-
-          resultDiv.innerHTML = `
-            <span class="tag tag-ok">Exported!</span>
-            <a href="https://docs.google.com/document/d/${{newDoc.documentId}}/edit" target="_blank" style="margin-left:8px;font-weight:600;">Open in Google Docs &rarr;</a>
-          `;
-          loadDocs();
-        }} catch (e) {{
-          resultDiv.innerHTML = `<span class="tag tag-err">Error: ${{escapeHtml(e.message)}}</span>`;
-        }}
-      }}
-    );
+    try {{
+      const res = await executeWorkspaceAction('keep_bridge_docs', {{
+        title: title,
+        body: body
+      }});
+      resultDiv.innerHTML = `
+        <span class="tag tag-ok">Exported!</span>
+        <a href="${{res.editUrl}}" target="_blank" style="margin-left:8px;font-weight:600;">Open in Google Docs &rarr;</a>
+      `;
+      loadDocs();
+    }} catch (err) {{
+      resultDiv.innerHTML = `<span class="tag tag-err">Error: ${{escapeHtml(err.message)}}</span>`;
+    }}
   }});
 
   function escapeHtml(str) {{

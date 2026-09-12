@@ -75,7 +75,7 @@ class TestMigrationV16(unittest.TestCase):
 
         req = work_svc.get_requirement(req_id)
         self.assertEqual(req['title'], "User Profile Management")
-        self.assertEqual(req['current_stage_name'], "Requirement Analysis")
+        self.assertEqual(req['current_stage_name'], "Requirement Received")
         self.assertEqual(req['operational_status'], "active")
 
         # 2. Add test condition
@@ -139,6 +139,123 @@ class TestMigrationV16(unittest.TestCase):
         item = next((i for i in all_items if i['entity_type'] == 'requirement' and i['entity_id'] == req_id), None)
         self.assertIsNotNone(item)
         self.assertEqual(item['display_id'], f"REQ-{req_id}")
+
+    def test_testing_lifecycle_defects_posture_and_artifacts(self):
+        work_svc = WorkItemService(self.db)
+
+        # 1. Create requirement
+        r_res = work_svc.create_requirement(
+            title="Payment Processing Integration",
+            user_story="As a shopper, I want to checkout using Visa and Mastercard",
+            acceptance_criteria="Returns 200 OK and generates receipt"
+        )
+        self.assertTrue(r_res.success)
+        req_id = r_res.entity_id
+
+        # 2. Propose test conditions (AI drafting)
+        proposals = work_svc.propose_test_conditions(req_id)
+        self.assertGreaterEqual(len(proposals), 3)
+
+        # 3. Add & approve test condition
+        cond_res = work_svc.add_test_condition(
+            requirement_id=req_id,
+            title=proposals[0]['title'],
+            description=proposals[0]['description'],
+            category=proposals[0]['category'],
+            risk_level=proposals[0]['risk_level'],
+            status='approved'
+        )
+        self.assertTrue(cond_res.success)
+        cond_id = cond_res.entity_id
+
+        # 4. Add test case linked to condition
+        tc_res = work_svc.add_test_case(
+            requirement_id=req_id,
+            test_condition_id=cond_id,
+            title="Verify 3DS transaction authorization",
+            expected_result="200 OK and receipt"
+        )
+        self.assertTrue(tc_res.success)
+        tc_id = tc_res.entity_id
+
+        # 5. Execute test with failure
+        ex_res = work_svc.record_test_execution(
+            test_case_id=tc_id,
+            result="fail",
+            build="v1.0.0-rc1",
+            actual_result="500 Gateway Timeout"
+        )
+        self.assertTrue(ex_res.success)
+
+        # 6. Create defect linked to execution
+        def_res = work_svc.create_defect(
+            title="500 Timeout on 3DS authorization",
+            severity="critical",
+            priority=1,
+            requirement_id=req_id,
+            test_case_id=tc_id,
+            execution_id=ex_res.entity_id,
+            build_found="v1.0.0-rc1"
+        )
+        self.assertTrue(def_res.success)
+        defect_id = def_res.entity_id
+
+        # 7. Check posture (should be Blocked due to critical defect)
+        posture = work_svc.get_testing_posture(req_id)
+        self.assertEqual(posture['readiness'], 'Blocked')
+        self.assertEqual(posture['critical_defects'], 1)
+        self.assertEqual(posture['failed'], 1)
+
+        # 8. Retest defect with pass (closes defect)
+        retest_res = work_svc.retest_defect(
+            defect_id=defect_id,
+            result="pass",
+            build_fixed="v1.0.0-rc2",
+            retest_notes="Fixed timeout setting in payment gateway proxy"
+        )
+        self.assertTrue(retest_res.success)
+
+        defect = work_svc.get_defect(defect_id)
+        self.assertEqual(defect['status'], 'verified')
+
+        # 9. Record passing execution on test case
+        work_svc.record_test_execution(
+            test_case_id=tc_id,
+            result="pass",
+            build="v1.0.0-rc2",
+            actual_result="Authorized in 320ms"
+        )
+
+        # Posture should now be Ready for Release
+        posture_ready = work_svc.get_testing_posture(req_id)
+        self.assertEqual(posture_ready['readiness'], 'Ready for Release')
+        self.assertEqual(posture_ready['passed'], 1)
+        self.assertEqual(posture_ready['open_defects'], 0)
+
+        # 10. Link Google Workspace Artifact
+        art_res = work_svc.add_artifact(
+            entity_type="requirement",
+            entity_id=req_id,
+            artifact_type="doc",
+            name="Payment QA Test Plan",
+            url="https://docs.google.com/document/d/xyz"
+        )
+        self.assertTrue(art_res.success)
+        art_id = art_res.entity_id
+
+        artifacts = work_svc.list_artifacts("requirement", req_id)
+        self.assertEqual(len(artifacts), 1)
+        self.assertEqual(artifacts[0]['name'], "Payment QA Test Plan")
+
+        # 11. Timeline should contain aggregated events
+        timeline = work_svc.get_timeline("requirement", req_id)
+        self.assertGreaterEqual(len(timeline), 3)
+
+        # 12. Completion Report
+        report = work_svc.generate_completion_report(req_id)
+        self.assertEqual(report['requirement']['id'], req_id)
+        self.assertEqual(report['posture']['readiness'], 'Ready for Release')
+        self.assertEqual(len(report['artifacts']), 1)
 
 
 if __name__ == '__main__':

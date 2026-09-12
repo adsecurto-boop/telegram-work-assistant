@@ -603,6 +603,33 @@ class Database:
                 url TEXT,
                 details_json TEXT,
                 created_at TEXT NOT NULL);
+
+            CREATE TABLE IF NOT EXISTS defects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                description TEXT,
+                severity TEXT NOT NULL DEFAULT 'major',
+                priority INTEGER NOT NULL DEFAULT 2,
+                status TEXT NOT NULL DEFAULT 'new',
+                requirement_id INTEGER REFERENCES requirements(id) ON DELETE SET NULL,
+                test_condition_id INTEGER REFERENCES test_conditions(id) ON DELETE SET NULL,
+                test_case_id INTEGER REFERENCES test_cases(id) ON DELETE SET NULL,
+                execution_id INTEGER REFERENCES test_executions(id) ON DELETE SET NULL,
+                assigned_member_id INTEGER REFERENCES members(id) ON DELETE SET NULL,
+                client TEXT,
+                product TEXT,
+                ticket TEXT,
+                steps_to_reproduce TEXT,
+                expected_result TEXT,
+                actual_result TEXT,
+                build_found TEXT,
+                build_fixed TEXT,
+                environment TEXT,
+                retest_notes TEXT,
+                resolution TEXT,
+                closed_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL);
         ''')
 
     def _create_indexes(self, connection):
@@ -651,6 +678,10 @@ class Database:
             CREATE INDEX IF NOT EXISTS test_cases_cond_idx ON test_cases(test_condition_id);
             CREATE INDEX IF NOT EXISTS test_executions_case_idx ON test_executions(test_case_id, result);
             CREATE INDEX IF NOT EXISTS artifacts_entity_idx ON artifacts(entity_type, entity_id);
+            CREATE INDEX IF NOT EXISTS defects_status_idx ON defects(status, priority);
+            CREATE INDEX IF NOT EXISTS defects_req_idx ON defects(requirement_id);
+            CREATE INDEX IF NOT EXISTS defects_case_idx ON defects(test_case_id);
+            CREATE INDEX IF NOT EXISTS defects_assigned_idx ON defects(assigned_member_id);
         ''')
 
     def _ensure_columns(self, connection):
@@ -894,14 +925,20 @@ class Database:
         if row:
             template_id = row['id']
             stages = [
-                (1, 'Requirement Analysis', 'Review user story, acceptance criteria, and refine test conditions', 'Product Owner', 4.0, 0),
-                (2, 'Test Design & Preparation', 'Author test cases, prepare test data, identify risks', 'Lead Tester / QA', 6.0, 0),
-                (3, 'Waiting for Development', 'Waiting for engineering build, implementation, or API delivery', 'Developer', 16.0, 1),
-                (4, 'Test Execution', 'Execute test suite, log evidence, record test executions', 'Lead Tester / QA', 8.0, 0),
-                (5, 'Defect Investigation', 'Investigate failures, triage blockers, notify engineers', 'Lead Tester / QA', 4.0, 0),
-                (6, 'Waiting for Client / Stakeholder', 'Awaiting client sign-off, staging review, or feedback', 'Support Engineer', 24.0, 1),
-                (7, 'Ready for Release', 'All criteria met, release notes and documentation attached', 'Product Owner', 2.0, 0),
-                (8, 'Closed / Deployed', 'Feature live in production with verified telemetry', None, 0.0, 0),
+                (1, 'Requirement Received', 'Initial requirement intake and preliminary scope assessment', 'Product Owner', 2.0, 0),
+                (2, 'Requirement Analysis', 'Review user story, acceptance criteria, and refine test conditions', 'Product Owner', 4.0, 0),
+                (3, 'Test Conditions', 'Identify test conditions, quality criteria, and risk boundaries', 'Lead Tester / QA', 4.0, 0),
+                (4, 'Waiting for Development', 'Waiting for engineering build, implementation, or API delivery', 'Developer', 16.0, 1),
+                (5, 'Build Ready', 'New software build deployed to target QA / staging test environment', 'DevOps / Infrastructure', 1.0, 0),
+                (6, 'Implementation Analysis', 'Analyze implementation changes, inspect code/PRs, verify impact scope', 'Lead Tester / QA', 3.0, 0),
+                (7, 'Test Case Design', 'Author test cases, prepare preconditions, steps, test data, and expected results', 'Lead Tester / QA', 6.0, 0),
+                (8, 'Testware / Test Data Preparation', 'Prepare test accounts, mock payloads, SQL fixtures, and automation scripts', 'Lead Tester / QA', 4.0, 0),
+                (9, 'Test Execution', 'Execute manual and automated test suites, capture evidence, record logs', 'Lead Tester / QA', 8.0, 0),
+                (10, 'Defects', 'Investigate failures, triage bugs, log severity/priority, notify engineers', 'Lead Tester / QA', 4.0, 0),
+                (11, 'Waiting for Fix', 'Awaiting developer resolution, hotfix delivery, or revised build', 'Developer', 12.0, 1),
+                (12, 'Retest', 'Retest resolved defects on target build against original steps', 'Lead Tester / QA', 4.0, 0),
+                (13, 'Regression / Impact Validation', 'Execute regression test suite, verify side-effects on adjacent modules', 'Lead Tester / QA', 4.0, 0),
+                (14, 'Completion', 'All criteria met, release sign-off, completion report generated and verified', 'Product Owner', 1.0, 0),
             ]
             for order, name, desc, role, dur, waiting in stages:
                 connection.execute('''INSERT OR IGNORE INTO workflow_stages
@@ -919,10 +956,15 @@ class Database:
         if bug_row:
             b_id = bug_row['id']
             bug_stages = [
-                (1, 'Triage & Reproduction', 'Confirm bug steps, capture environment details, assess severity', 'Lead Tester / QA', 2.0, 0),
-                (2, 'Waiting for Fix', 'Awaiting developer resolution or PR merge', 'Developer', 12.0, 1),
-                (3, 'Retest Verification', 'Retest on target build, verify against original steps', 'Lead Tester / QA', 3.0, 0),
-                (4, 'Resolved & Closed', 'Verified resolved, defect closed', None, 0.0, 0),
+                (1, 'New', 'Defect reported and pending triage', 'Lead Tester / QA', 1.0, 0),
+                (2, 'Triaged', 'Defect confirmed reproducible, severity and priority assigned', 'Product Owner', 2.0, 0),
+                (3, 'Assigned', 'Assigned to developer for investigation and fix', 'Developer', 2.0, 0),
+                (4, 'In Development', 'Fix under active development', 'Developer', 12.0, 1),
+                (5, 'Fix Ready', 'Fix committed and packaged into candidate build', 'Developer', 1.0, 0),
+                (6, 'Retest Required', 'Deployed to test environment, awaiting tester verification', 'Lead Tester / QA', 1.0, 0),
+                (7, 'Retesting', 'Active retest execution in progress', 'Lead Tester / QA', 3.0, 0),
+                (8, 'Verified', 'Fix successfully verified against original issue', 'Lead Tester / QA', 1.0, 0),
+                (9, 'Closed', 'Defect closed with verified resolution notes', None, 0.0, 0),
             ]
             for order, name, desc, role, dur, waiting in bug_stages:
                 connection.execute('''INSERT OR IGNORE INTO workflow_stages
@@ -951,7 +993,7 @@ class Database:
             'workflow_templates', 'workflow_stages', 'members', 'roles',
             'member_roles', 'work_item_meta', 'stage_history',
             'blockers_dependencies', 'requirements', 'test_conditions',
-            'test_cases', 'test_executions', 'artifacts'
+            'test_cases', 'test_executions', 'artifacts', 'defects'
         }
         rows = cursor.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         existing = {r['name'] if isinstance(r, sqlite3.Row) else r[0] for r in rows}
@@ -4728,9 +4770,56 @@ class Database:
                 (requirement_id, title, description, category, risk_level, status, notes, now))
             return cur.lastrowid
 
-    def update_test_condition_status(self, condition_id: int, status: str) -> bool:
+    def get_test_condition(self, condition_id: int) -> dict | None:
         with self.connect() as conn:
-            res = conn.execute("UPDATE test_conditions SET status=? WHERE id=?", (status, condition_id))
+            row = conn.execute('''SELECT tc.*, r.title AS requirement_title
+                FROM test_conditions tc
+                LEFT JOIN requirements r ON r.id=tc.requirement_id
+                WHERE tc.id=?''', (condition_id,)).fetchone()
+            return dict(row) if row else None
+
+    def list_test_conditions(self, requirement_id: int | None = None, status: str | None = None) -> list[dict]:
+        with self.connect() as conn:
+            query = '''SELECT tc.*, r.title AS requirement_title,
+                (SELECT COUNT(*) FROM test_cases WHERE test_condition_id=tc.id) AS test_cases_count
+                FROM test_conditions tc
+                LEFT JOIN requirements r ON r.id=tc.requirement_id'''
+            params = []
+            clauses = []
+            if requirement_id:
+                clauses.append("tc.requirement_id=?")
+                params.append(requirement_id)
+            if status:
+                clauses.append("tc.status=?")
+                params.append(status)
+            if clauses:
+                query += " WHERE " + " AND ".join(clauses)
+            query += " ORDER BY tc.id ASC"
+            rows = conn.execute(query, params).fetchall()
+            return [dict(r) for r in rows]
+
+    def update_test_condition(self, condition_id: int, **kwargs) -> bool:
+        allowed = ('title', 'description', 'category', 'risk_level', 'status', 'notes')
+        updates = []
+        params = []
+        for k, v in kwargs.items():
+            if k in allowed:
+                updates.append(f"{k}=?")
+                params.append(v)
+        if not updates:
+            return False
+        params.append(condition_id)
+        with self.connect() as conn:
+            res = conn.execute(f"UPDATE test_conditions SET {', '.join(updates)} WHERE id=?", params)
+            return res.rowcount > 0
+
+    def update_test_condition_status(self, condition_id: int, status: str) -> bool:
+        return self.update_test_condition(condition_id, status=status)
+
+    def delete_test_condition(self, condition_id: int) -> bool:
+        with self.connect() as conn:
+            conn.execute("UPDATE test_cases SET test_condition_id=NULL WHERE test_condition_id=?", (condition_id,))
+            res = conn.execute("DELETE FROM test_conditions WHERE id=?", (condition_id,))
             return res.rowcount > 0
 
     def add_test_case(self, title: str, requirement_id: int | None = None,
@@ -4748,6 +4837,52 @@ class Database:
                  test_data, expected_result, priority, automation_status, now))
             return cur.lastrowid
 
+    def get_test_case(self, test_case_id: int) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute('''SELECT tc.*, r.title AS requirement_title, cond.title AS condition_title
+                FROM test_cases tc
+                LEFT JOIN requirements r ON r.id=tc.requirement_id
+                LEFT JOIN test_conditions cond ON cond.id=tc.test_condition_id
+                WHERE tc.id=?''', (test_case_id,)).fetchone()
+            if not row:
+                return None
+            res = dict(row)
+            latest = conn.execute(
+                "SELECT * FROM test_executions WHERE test_case_id=? ORDER BY id DESC LIMIT 1",
+                (test_case_id,)
+            ).fetchone()
+            if latest:
+                res['latest_result'] = latest['result']
+                res['latest_build'] = latest['build']
+                res['latest_executed_at'] = latest['executed_at']
+                res['latest_actual_result'] = latest['actual_result']
+            else:
+                res['latest_result'] = 'not_run'
+            return res
+
+    def update_test_case(self, test_case_id: int, **kwargs) -> bool:
+        allowed = ('title', 'objective', 'preconditions', 'steps', 'test_data',
+                   'expected_result', 'priority', 'automation_status', 'requirement_id', 'test_condition_id')
+        updates = []
+        params = []
+        for k, v in kwargs.items():
+            if k in allowed:
+                updates.append(f"{k}=?")
+                params.append(v)
+        if not updates:
+            return False
+        params.append(test_case_id)
+        with self.connect() as conn:
+            res = conn.execute(f"UPDATE test_cases SET {', '.join(updates)} WHERE id=?", params)
+            return res.rowcount > 0
+
+    def delete_test_case(self, test_case_id: int) -> bool:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM test_executions WHERE test_case_id=?", (test_case_id,))
+            conn.execute("UPDATE defects SET test_case_id=NULL WHERE test_case_id=?", (test_case_id,))
+            res = conn.execute("DELETE FROM test_cases WHERE id=?", (test_case_id,))
+            return res.rowcount > 0
+
     def list_test_cases(self, requirement_id: int | None = None) -> list[dict]:
         with self.connect() as conn:
             query = '''SELECT tc.*, r.title AS requirement_title, cond.title AS condition_title
@@ -4763,17 +4898,19 @@ class Database:
             cases = []
             for r in rows:
                 item = dict(r)
-                # Latest execution result
                 latest = conn.execute(
-                    "SELECT result, build, executed_at FROM test_executions WHERE test_case_id=? ORDER BY id DESC LIMIT 1",
+                    "SELECT result, build, executed_at, actual_result FROM test_executions WHERE test_case_id=? ORDER BY id DESC LIMIT 1",
                     (item['id'],)
                 ).fetchone()
                 if latest:
                     item['latest_result'] = latest['result']
                     item['latest_build'] = latest['build']
                     item['latest_executed_at'] = latest['executed_at']
+                    item['latest_actual_result'] = latest['actual_result']
+                    item['last_execution_result'] = latest['result']
                 else:
                     item['latest_result'] = 'not_run'
+                    item['last_execution_result'] = 'not_run'
                 cases.append(item)
             return cases
 
@@ -4790,6 +4927,476 @@ class Database:
                 (test_case_id, session_id, build, environment, result, actual_result, defect_id,
                  executed_by_member_id, notes, now))
             return cur.lastrowid
+
+    def list_test_executions(self, test_case_id: int | None = None, limit: int = 50) -> list[dict]:
+        with self.connect() as conn:
+            query = '''SELECT te.*, tc.title AS test_case_title, m.name AS executed_by_name,
+                d.title AS defect_title
+                FROM test_executions te
+                LEFT JOIN test_cases tc ON tc.id = te.test_case_id
+                LEFT JOIN members m ON m.id = te.executed_by_member_id
+                LEFT JOIN defects d ON d.id = te.defect_id'''
+            params = []
+            if test_case_id:
+                query += " WHERE te.test_case_id=?"
+                params.append(test_case_id)
+            query += " ORDER BY te.id DESC LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(query, params).fetchall()
+            return [dict(r) for r in rows]
+
+    # ==========================================================================
+    # Defects Management
+    # ==========================================================================
+
+    def create_defect(self, title: str, description: str | None = None,
+                      severity: str = 'major', priority: int = 2, status: str = 'new',
+                      requirement_id: int | None = None, test_condition_id: int | None = None,
+                      test_case_id: int | None = None, execution_id: int | None = None,
+                      assigned_member_id: int | None = None, client: str | None = None,
+                      product: str | None = None, ticket: str | None = None,
+                      steps_to_reproduce: str | None = None, expected_result: str | None = None,
+                      actual_result: str | None = None, build_found: str | None = None,
+                      environment: str | None = None) -> int:
+        now = now_iso()
+        with self.connect() as conn:
+            cur = conn.execute('''INSERT INTO defects
+                (title, description, severity, priority, status, requirement_id,
+                 test_condition_id, test_case_id, execution_id, assigned_member_id,
+                 client, product, ticket, steps_to_reproduce, expected_result,
+                 actual_result, build_found, environment, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                (title, description, severity, priority, status, requirement_id,
+                 test_condition_id, test_case_id, execution_id, assigned_member_id,
+                 client, product, ticket, steps_to_reproduce, expected_result,
+                 actual_result, build_found, environment, now, now))
+            defect_id = cur.lastrowid
+            return defect_id
+
+    def get_defect(self, defect_id: int) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute('''SELECT d.*, r.title AS requirement_title,
+                tc.title AS test_case_title, cond.title AS condition_title,
+                m.name AS assigned_member_name
+                FROM defects d
+                LEFT JOIN requirements r ON r.id = d.requirement_id
+                LEFT JOIN test_cases tc ON tc.id = d.test_case_id
+                LEFT JOIN test_conditions cond ON cond.id = d.test_condition_id
+                LEFT JOIN members m ON m.id = d.assigned_member_id
+                WHERE d.id=?''', (defect_id,)).fetchone()
+            if not row:
+                return None
+            res = dict(row)
+            res['display_id'] = f"DEF-{defect_id}"
+            return res
+
+    def list_defects(self, requirement_id: int | None = None, status: str | None = None,
+                     assigned_member_id: int | None = None, limit: int = 100) -> list[dict]:
+        with self.connect() as conn:
+            query = '''SELECT d.*, r.title AS requirement_title,
+                tc.title AS test_case_title, m.name AS assigned_member_name
+                FROM defects d
+                LEFT JOIN requirements r ON r.id = d.requirement_id
+                LEFT JOIN test_cases tc ON tc.id = d.test_case_id
+                LEFT JOIN members m ON m.id = d.assigned_member_id'''
+            params = []
+            clauses = []
+            if requirement_id:
+                clauses.append("d.requirement_id=?")
+                params.append(requirement_id)
+            if status:
+                if status == 'open':
+                    clauses.append("d.status NOT IN ('verified', 'closed')")
+                elif status == 'retesting':
+                    clauses.append("d.status IN ('fix_ready', 'retest_required', 'retesting')")
+                else:
+                    clauses.append("d.status=?")
+                    params.append(status)
+            if assigned_member_id:
+                clauses.append("d.assigned_member_id=?")
+                params.append(assigned_member_id)
+            if clauses:
+                query += " WHERE " + " AND ".join(clauses)
+            query += " ORDER BY d.priority ASC, d.id DESC LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(query, params).fetchall()
+            items = []
+            for r in rows:
+                d = dict(r)
+                d['display_id'] = f"DEF-{d['id']}"
+                items.append(d)
+            return items
+
+    def update_defect(self, defect_id: int, **kwargs) -> bool:
+        allowed = ('title', 'description', 'severity', 'priority', 'status',
+                   'requirement_id', 'test_condition_id', 'test_case_id', 'execution_id',
+                   'assigned_member_id', 'client', 'product', 'ticket', 'steps_to_reproduce',
+                   'expected_result', 'actual_result', 'build_found', 'build_fixed',
+                   'environment', 'retest_notes', 'resolution', 'closed_at')
+        updates = []
+        params = []
+        now = now_iso()
+        for k, v in kwargs.items():
+            if k in allowed:
+                updates.append(f"{k}=?")
+                params.append(v)
+        if not updates:
+            return False
+        updates.append("updated_at=?")
+        params.append(now)
+        params.append(defect_id)
+        with self.connect() as conn:
+            res = conn.execute(f"UPDATE defects SET {', '.join(updates)} WHERE id=?", params)
+            return res.rowcount > 0
+
+    def retest_defect(self, defect_id: int, result: str, build_fixed: str | None = None,
+                      retest_notes: str | None = None, tester_member_id: int | None = None) -> bool:
+        now = now_iso()
+        status = 'verified' if result.lower() in ('pass', 'verified') else 'reopened'
+        with self.connect() as conn:
+            conn.execute('''UPDATE defects
+                SET status=?, build_fixed=COALESCE(?, build_fixed),
+                    retest_notes=?, updated_at=?,
+                    closed_at=CASE WHEN ?='verified' THEN ? ELSE closed_at END
+                WHERE id=?''',
+                (status, build_fixed, retest_notes, now, status, now, defect_id))
+            return True
+
+    def reopen_defect(self, defect_id: int, reason: str | None = None) -> bool:
+        now = now_iso()
+        with self.connect() as conn:
+            conn.execute('''UPDATE defects
+                SET status='reopened', closed_at=NULL, updated_at=?
+                WHERE id=?''', (now, defect_id))
+            return True
+
+    # ==========================================================================
+    # Artifacts Management
+    # ==========================================================================
+
+    def add_artifact(self, entity_type: str, entity_id: int, artifact_type: str,
+                     name: str, path: str | None = None, url: str | None = None,
+                     details: dict | None = None) -> int:
+        now = now_iso()
+        details_str = json.dumps(details or {})
+        with self.connect() as conn:
+            cur = conn.execute('''INSERT INTO artifacts
+                (entity_type, entity_id, artifact_type, name, path, url, details_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                (entity_type, entity_id, artifact_type, name, path, url, details_str, now))
+            return cur.lastrowid
+
+    def list_artifacts(self, entity_type: str | None = None, entity_id: int | None = None) -> list[dict]:
+        with self.connect() as conn:
+            query = "SELECT * FROM artifacts"
+            params = []
+            clauses = []
+            if entity_type:
+                clauses.append("entity_type=?")
+                params.append(entity_type)
+            if entity_id:
+                clauses.append("entity_id=?")
+                params.append(entity_id)
+            if clauses:
+                query += " WHERE " + " AND ".join(clauses)
+            query += " ORDER BY id DESC"
+            rows = conn.execute(query, params).fetchall()
+            res = []
+            for r in rows:
+                item = dict(r)
+                try:
+                    item['details'] = json.loads(item.get('details_json') or '{}')
+                except Exception:
+                    item['details'] = {}
+                res.append(item)
+            return res
+
+    def delete_artifact(self, artifact_id: int) -> bool:
+        with self.connect() as conn:
+            res = conn.execute("DELETE FROM artifacts WHERE id=?", (artifact_id,))
+            return res.rowcount > 0
+
+    # ==========================================================================
+    # Human-Readable Timeline & Testing Posture & Completion Reports
+    # ==========================================================================
+
+    def get_timeline(self, entity_type: str, entity_id: int) -> list[dict]:
+        """
+        Builds a comprehensive, unified, human-readable timeline for any work item or requirement.
+        """
+        events = []
+        with self.connect() as conn:
+            # 1. Base Item Creation
+            if entity_type == 'requirement':
+                req = conn.execute("SELECT * FROM requirements WHERE id=?", (entity_id,)).fetchone()
+                if req:
+                    events.append({
+                        'timestamp': req['created_at'],
+                        'event_type': 'created',
+                        'title': 'Requirement Created',
+                        'actor': 'User / System',
+                        'description': f"Requirement REQ-{entity_id} '{req['title']}' was logged into intake.",
+                        'badge_class': 'tag-info'
+                    })
+            elif entity_type == 'defect':
+                def_row = conn.execute("SELECT * FROM defects WHERE id=?", (entity_id,)).fetchone()
+                if def_row:
+                    events.append({
+                        'timestamp': def_row['created_at'],
+                        'event_type': 'created',
+                        'title': 'Defect Logged',
+                        'actor': 'QA / Reporter',
+                        'description': f"Defect DEF-{entity_id} '{def_row['title']}' logged with severity {def_row['severity']}.",
+                        'badge_class': 'tag-err'
+                    })
+
+            # 2. Stage Transitions
+            stg_rows = conn.execute('''SELECT sh.*, s.name AS stage_name,
+                m.name AS actor_name
+                FROM stage_history sh
+                LEFT JOIN workflow_stages s ON s.id=sh.stage_id
+                LEFT JOIN members m ON m.id=sh.actor_member_id
+                WHERE sh.entity_type=? AND sh.entity_id=?
+                ORDER BY sh.entered_at ASC''', (entity_type, entity_id)).fetchall()
+            for s in stg_rows:
+                s_dict = dict(s)
+                stg_name = s_dict.get('stage_name') or 'Stage Progress'
+                desc = f"Entered stage '{stg_name}'"
+                if s_dict.get('note'):
+                    desc += f" — {s_dict['note']}"
+                events.append({
+                    'timestamp': s_dict.get('entered_at'),
+                    'event_type': 'stage_transition',
+                    'title': f"Stage: {stg_name}",
+                    'actor': s_dict.get('actor_name') or 'Team Member',
+                    'description': desc,
+                    'badge_class': 'tag-ok'
+                })
+
+            # 3. Blockers
+            b_rows = conn.execute('''SELECT b.*, m.name AS waiting_name
+                FROM blockers_dependencies b
+                LEFT JOIN members m ON m.id=b.waiting_on_member_id
+                WHERE b.entity_type=? AND b.entity_id=?
+                ORDER BY b.started_at ASC''', (entity_type, entity_id)).fetchall()
+            for b in b_rows:
+                b_dict = dict(b)
+                events.append({
+                    'timestamp': b_dict.get('started_at'),
+                    'event_type': 'blocker_logged',
+                    'title': f"Blocker: {(b_dict.get('dependency_type') or 'dependency').replace('_', ' ').title()}",
+                    'actor': 'Operations',
+                    'description': f"{b_dict.get('description') or ''}" + (f" (Waiting on {b_dict['waiting_name']})" if b_dict.get('waiting_name') else ""),
+                    'badge_class': 'tag-err'
+                })
+                if b_dict.get('resolved_at'):
+                    events.append({
+                        'timestamp': b_dict['resolved_at'],
+                        'event_type': 'blocker_resolved',
+                        'title': 'Blocker Resolved',
+                        'actor': 'Operations',
+                        'description': f"Resolved: {b_dict.get('description') or ''}" + (f" — {b_dict['resolution_notes']}" if b_dict.get('resolution_notes') else ""),
+                        'badge_class': 'tag-ok'
+                    })
+
+            # 4. Test Executions (for requirements)
+            if entity_type == 'requirement':
+                tcs = conn.execute("SELECT id, title FROM test_cases WHERE requirement_id=?", (entity_id,)).fetchall()
+                tc_map = {tc['id']: tc['title'] for tc in tcs}
+                if tc_map:
+                    placeholders = ','.join('?' for _ in tc_map)
+                    execs = conn.execute(f'''SELECT te.*, m.name AS tester_name
+                        FROM test_executions te
+                        LEFT JOIN members m ON m.id=te.executed_by_member_id
+                        WHERE te.test_case_id IN ({placeholders})
+                        ORDER BY te.executed_at ASC''', list(tc_map.keys())).fetchall()
+                    for ex in execs:
+                        ex_dict = dict(ex)
+                        tc_title = tc_map.get(ex_dict['test_case_id'], 'Test Case')
+                        res = (ex_dict.get('result') or 'pass').upper()
+                        b_cls = 'tag-ok' if res == 'PASS' else ('tag-err' if res == 'FAIL' else 'tag')
+                        events.append({
+                            'timestamp': ex_dict.get('executed_at'),
+                            'event_type': 'test_execution',
+                            'title': f"Execution: TC-{ex_dict['test_case_id']} ({res})",
+                            'actor': ex_dict.get('tester_name') or 'QA Tester',
+                            'description': f"{tc_title} evaluated as {res}" + (f" on build {ex_dict['build']}" if ex_dict.get('build') else "") + (f" — {ex_dict['actual_result']}" if ex_dict.get('actual_result') else ""),
+                            'badge_class': b_cls
+                        })
+
+            # 5. Defects Logged (for requirements)
+            if entity_type == 'requirement':
+                defs = conn.execute("SELECT * FROM defects WHERE requirement_id=? ORDER BY created_at ASC", (entity_id,)).fetchall()
+                for d in defs:
+                    d_dict = dict(d)
+                    events.append({
+                        'timestamp': d_dict.get('created_at'),
+                        'event_type': 'defect_created',
+                        'title': f"Defect DEF-{d_dict['id']}: {d_dict['title']}",
+                        'actor': 'QA Reporter',
+                        'description': f"Defect logged ({d_dict.get('severity', 'major')}) — {d_dict.get('description') or d_dict.get('actual_result') or ''}",
+                        'badge_class': 'tag-err'
+                    })
+                    if d_dict.get('status') == 'verified':
+                        events.append({
+                            'timestamp': d_dict.get('updated_at'),
+                            'event_type': 'defect_verified',
+                            'title': f"Defect DEF-{d_dict['id']} Verified",
+                            'actor': 'QA Tester',
+                            'description': f"Fix verified on target build: {d_dict.get('retest_notes') or 'Retest passed.'}",
+                            'badge_class': 'tag-ok'
+                        })
+
+            # 6. Artifacts Linked
+            arts = conn.execute("SELECT * FROM artifacts WHERE entity_type=? AND entity_id=? ORDER BY created_at ASC",
+                                (entity_type, entity_id)).fetchall()
+            for a in arts:
+                a_dict = dict(a)
+                events.append({
+                    'timestamp': a_dict.get('created_at'),
+                    'event_type': 'artifact_linked',
+                    'title': f"Artifact: {a_dict['name']}",
+                    'actor': 'System / User',
+                    'description': f"Linked {(a_dict.get('artifact_type') or 'doc').replace('_', ' ').title()}: {a_dict.get('url') or a_dict.get('path') or a_dict['name']}",
+                    'badge_class': 'tag-info'
+                })
+
+        events.sort(key=lambda x: x.get('timestamp') or '', reverse=True)
+        return events
+
+    def get_testing_posture(self, requirement_id: int) -> dict:
+        """
+        Calculates actionable testing posture for a requirement.
+        """
+        with self.connect() as conn:
+            req = conn.execute("SELECT * FROM requirements WHERE id=?", (requirement_id,)).fetchone()
+            if not req:
+                return {}
+            
+            tcs = conn.execute("SELECT id FROM test_cases WHERE requirement_id=?", (requirement_id,)).fetchall()
+            total_tc = len(tcs)
+            passed = 0
+            failed = 0
+            blocked = 0
+            not_run = 0
+
+            for tc in tcs:
+                latest = conn.execute(
+                    "SELECT result FROM test_executions WHERE test_case_id=? ORDER BY id DESC LIMIT 1",
+                    (tc['id'],)
+                ).fetchone()
+                if not latest:
+                    not_run += 1
+                else:
+                    res = latest['result'].lower()
+                    if res == 'pass':
+                        passed += 1
+                    elif res == 'fail':
+                        failed += 1
+                    elif res == 'blocked':
+                        blocked += 1
+                    else:
+                        not_run += 1
+
+            # Defects count
+            open_defects = conn.execute(
+                "SELECT COUNT(*) AS c FROM defects WHERE requirement_id=? AND status NOT IN ('verified', 'closed')",
+                (requirement_id,)
+            ).fetchone()['c']
+            critical_defects = conn.execute(
+                "SELECT COUNT(*) AS c FROM defects WHERE requirement_id=? AND status NOT IN ('verified', 'closed') AND severity IN ('critical', 'blocker')",
+                (requirement_id,)
+            ).fetchone()['c']
+
+            # Active Blockers
+            active_blockers = conn.execute(
+                "SELECT COUNT(*) AS c FROM blockers_dependencies WHERE entity_type='requirement' AND entity_id=? AND status='active'",
+                (requirement_id,)
+            ).fetchone()['c']
+
+            # Test conditions
+            total_conditions = conn.execute(
+                "SELECT COUNT(*) AS c FROM test_conditions WHERE requirement_id=?", (requirement_id,)
+            ).fetchone()['c']
+            approved_conditions = conn.execute(
+                "SELECT COUNT(*) AS c FROM test_conditions WHERE requirement_id=? AND status='approved'", (requirement_id,)
+            ).fetchone()['c']
+
+            verified_pct = int((passed / total_tc) * 100) if total_tc > 0 else 0
+
+            # Overall Status Assessment
+            if active_blockers > 0 or critical_defects > 0:
+                readiness = 'Blocked'
+                readiness_badge = 'tag-err'
+            elif failed > 0 or open_defects > 0:
+                readiness = 'Defects Pending'
+                readiness_badge = 'tag-err'
+            elif total_tc == 0 or not_run > 0 or total_conditions == 0:
+                readiness = 'In Progress'
+                readiness_badge = 'tag'
+            elif passed == total_tc and total_tc > 0 and open_defects == 0 and active_blockers == 0:
+                readiness = 'Ready for Release'
+                readiness_badge = 'tag-ok'
+            else:
+                readiness = 'In Progress'
+                readiness_badge = 'tag'
+
+            return {
+                'requirement_id': requirement_id,
+                'total_test_cases': total_tc,
+                'passed': passed,
+                'failed': failed,
+                'blocked': blocked,
+                'not_run': not_run,
+                'verified_percentage': verified_pct,
+                'open_defects': open_defects,
+                'critical_defects': critical_defects,
+                'active_blockers': active_blockers,
+                'total_conditions': total_conditions,
+                'approved_conditions': approved_conditions,
+                'readiness': readiness,
+                'readiness_badge': readiness_badge
+            }
+
+    def generate_completion_report(self, requirement_id: int) -> dict:
+        """
+        Generates a comprehensive testing completion report for release sign-off.
+        """
+        with self.connect() as conn:
+            req = self.get_requirement(requirement_id)
+            if not req:
+                return {}
+            posture = self.get_testing_posture(requirement_id)
+            conditions = self.list_test_conditions(requirement_id=requirement_id)
+            cases = self.list_test_cases(requirement_id=requirement_id)
+            defects = self.list_defects(requirement_id=requirement_id)
+            blockers = self.get_blockers('requirement', requirement_id, status=None)
+            artifacts = self.list_artifacts('requirement', requirement_id)
+            timeline = self.get_timeline('requirement', requirement_id)
+
+            report = {
+                'requirement_id': requirement_id,
+                'requirement': req,
+                'title': req.get('title'),
+                'client': req.get('client'),
+                'product': req.get('product'),
+                'ticket': req.get('ticket'),
+                'owner_name': req.get('owner_name'),
+                'current_stage_name': req.get('current_stage_name'),
+                'operational_status': req.get('operational_status'),
+                'user_story': req.get('user_story'),
+                'acceptance_criteria': req.get('acceptance_criteria'),
+                'generated_at': now_iso(),
+                'posture': posture,
+                'conditions': conditions,
+                'test_cases': cases,
+                'defects': defects,
+                'blockers': blockers,
+                'artifacts': artifacts,
+                'timeline': timeline[:10], # recent 10 events
+                'is_ready_for_release': posture.get('readiness') == 'Ready for Release'
+            }
+            return report
 
     # Unified Work Items Aggregator
     def get_all_work_items(self) -> list[dict]:
@@ -4935,5 +5542,229 @@ class Database:
                     it['is_blocked'] = True
 
             return items
+
+    def get_work_item_detail(self, entity_type: str, entity_id: int) -> dict | None:
+        """Retrieves full, enriched work item details including base data, workflow pipeline, stage history, blockers, and related items."""
+        with self.connect() as conn:
+            base_data = None
+            if entity_type == 'requirement':
+                row = conn.execute('''SELECT r.*, m.name AS owner_name, m.id AS owner_member_id
+                    FROM requirements r
+                    LEFT JOIN members m ON m.id=r.owner_member_id
+                    WHERE r.id=?''', (entity_id,)).fetchone()
+                if row:
+                    base_data = dict(row)
+                    base_data['display_id'] = f"REQ-{entity_id}"
+                    base_data['type_name'] = 'Requirement'
+            elif entity_type == 'case':
+                row = conn.execute('''SELECT c.*, cl.name AS client_name, m.name AS owner_name, m.id AS owner_member_id
+                    FROM work_cases c
+                    LEFT JOIN clients cl ON cl.id=c.client_id
+                    LEFT JOIN members m ON m.id=c.owner_user_id
+                    WHERE c.id=?''', (entity_id,)).fetchone()
+                if row:
+                    base_data = dict(row)
+                    base_data['display_id'] = f"CASE-{entity_id}"
+                    base_data['type_name'] = 'Support Case'
+                    base_data['client'] = base_data.get('client_name') or base_data.get('client')
+            elif entity_type == 'task':
+                row = conn.execute('''SELECT t.*, m.name AS owner_name, m.id AS owner_member_id
+                    FROM tasks t
+                    LEFT JOIN members m ON m.id=t.assigned_member_id
+                    WHERE t.id=?''', (entity_id,)).fetchone()
+                if row:
+                    base_data = dict(row)
+                    base_data['display_id'] = f"TASK-{entity_id}"
+                    base_data['type_name'] = 'Task'
+                    base_data['product'] = base_data.get('project')
+
+            if not base_data:
+                return None
+
+            # Get metadata
+            meta = self.get_work_item_meta(entity_type, entity_id)
+            base_data['meta'] = meta or {}
+            base_data['operational_status'] = (meta and meta.get('operational_status')) or base_data.get('status') or 'active'
+            base_data['workflow_template_id'] = meta and meta.get('workflow_template_id')
+            base_data['current_stage_id'] = meta and meta.get('current_stage_id')
+
+            # Workflow template and stages
+            template = None
+            stages = []
+            if base_data['workflow_template_id']:
+                template = self.get_workflow_template(base_data['workflow_template_id'])
+                if template:
+                    stages = template.get('stages', [])
+            elif entity_type == 'requirement':
+                # Try default template for requirement
+                def_tmpl = conn.execute("SELECT id FROM workflow_templates WHERE work_type='requirement' AND is_default=1 LIMIT 1").fetchone()
+                if not def_tmpl:
+                    def_tmpl = conn.execute("SELECT id FROM workflow_templates WHERE work_type='requirement' ORDER BY id ASC LIMIT 1").fetchone()
+                if def_tmpl:
+                    template = self.get_workflow_template(def_tmpl['id'])
+                    if template:
+                        stages = template.get('stages', [])
+
+            base_data['workflow_template'] = template
+            base_data['stages'] = stages
+
+            # Determine current stage object
+            current_stage_obj = None
+            if base_data['current_stage_id']:
+                for s in stages:
+                    if s['id'] == base_data['current_stage_id']:
+                        current_stage_obj = s
+                        break
+            if not current_stage_obj and stages:
+                current_stage_obj = stages[0]
+            base_data['current_stage'] = current_stage_obj
+
+            # Stage history
+            base_data['stage_history'] = self.get_stage_history(entity_type, entity_id)
+
+            # Blockers
+            base_data['blockers'] = self.get_blockers(entity_type=entity_type, entity_id=entity_id, status=None)
+            base_data['active_blockers'] = [b for b in base_data['blockers'] if b.get('status') == 'active']
+
+            # Related items
+            related_test_cases = []
+            test_conditions = []
+            defects = []
+            posture = {}
+            if entity_type == 'requirement':
+                related_test_cases = self.list_test_cases(requirement_id=entity_id)
+                test_conditions = self.list_test_conditions(requirement_id=entity_id)
+                defects = self.list_defects(requirement_id=entity_id)
+                posture = self.get_testing_posture(requirement_id=entity_id)
+
+            base_data['related_test_cases'] = related_test_cases
+            base_data['test_conditions'] = test_conditions
+            base_data['defects'] = defects
+            base_data['posture'] = posture
+            base_data['artifacts'] = self.list_artifacts(entity_type=entity_type, entity_id=entity_id)
+            base_data['timeline'] = self.get_timeline(entity_type=entity_type, entity_id=entity_id)
+
+            related_tasks = []
+            ticket = base_data.get('ticket')
+            client = base_data.get('client')
+            if ticket:
+                t_rows = conn.execute("SELECT id, title, status, priority, due_date FROM tasks WHERE ticket=? AND id!=?",
+                                      (ticket, entity_id if entity_type == 'task' else 0)).fetchall()
+                related_tasks = [dict(r) for r in t_rows]
+            base_data['related_tasks'] = related_tasks
+
+            # Followups
+            followups = []
+            if entity_type == 'case':
+                f_rows = conn.execute("SELECT * FROM followups WHERE case_id=? ORDER BY id DESC", (entity_id,)).fetchall()
+                followups = [dict(r) for r in f_rows]
+            base_data['followups'] = followups
+
+            return base_data
+
+    def update_work_item(self, entity_type: str, entity_id: int, **kwargs) -> bool:
+        """Updates work item fields on base table and meta table."""
+        now = now_iso()
+        with self.connect() as conn:
+            if entity_type == 'requirement':
+                req_fields = ['title', 'description', 'requirement_text', 'user_story',
+                              'acceptance_criteria', 'client', 'product', 'ticket', 'priority',
+                              'due_date', 'status', 'owner_member_id']
+                updates = []
+                params = []
+                for k, v in kwargs.items():
+                    if k in req_fields:
+                        updates.append(f"{k}=?")
+                        params.append(v)
+                if updates:
+                    updates.append("updated_at=?")
+                    params.append(now)
+                    params.append(entity_id)
+                    conn.execute(f"UPDATE requirements SET {', '.join(updates)} WHERE id=?", params)
+
+            elif entity_type == 'case':
+                case_fields = ['title', 'product', 'platform', 'ticket', 'priority', 'status',
+                               'participation', 'next_action', 'waiting_on']
+                updates = []
+                params = []
+                for k, v in kwargs.items():
+                    if k in case_fields:
+                        updates.append(f"{k}=?")
+                        params.append(v)
+                if updates:
+                    updates.append("updated_at=?")
+                    params.append(now)
+                    params.append(entity_id)
+                    conn.execute(f"UPDATE work_cases SET {', '.join(updates)} WHERE id=?", params)
+
+            elif entity_type == 'task':
+                task_fields = ['title', 'status', 'priority', 'due_date', 'project', 'client',
+                               'ticket', 'next_action', 'blocked_reason']
+                updates = []
+                params = []
+                for k, v in kwargs.items():
+                    if k in task_fields:
+                        updates.append(f"{k}=?")
+                        params.append(v)
+                if updates:
+                    params.append(entity_id)
+                    conn.execute(f"UPDATE tasks SET {', '.join(updates)} WHERE id=?", params)
+
+            # Also update metadata
+            meta_fields = {}
+            for k in ('workflow_template_id', 'current_stage_id', 'operational_status',
+                      'owner_member_id', 'target_role', 'estimated_hours', 'actual_hours',
+                      'due_date', 'next_action', 'completion_note'):
+                if k in kwargs:
+                    meta_fields[k] = kwargs[k]
+            if meta_fields:
+                self.upsert_work_item_meta(entity_type, entity_id, **meta_fields)
+
+        return True
+
+    def delete_work_item(self, entity_type: str, entity_id: int) -> bool:
+        """Safely removes a work item and its associated metadata in a single transaction."""
+        with self.connect() as conn:
+            if entity_type == 'requirement':
+                conn.execute("DELETE FROM requirements WHERE id=?", (entity_id,))
+                conn.execute("DELETE FROM test_conditions WHERE requirement_id=?", (entity_id,))
+                conn.execute("UPDATE test_cases SET requirement_id=NULL WHERE requirement_id=?", (entity_id,))
+            elif entity_type == 'case':
+                conn.execute("DELETE FROM work_cases WHERE id=?", (entity_id,))
+                conn.execute("DELETE FROM followups WHERE case_id=?", (entity_id,))
+            elif entity_type == 'task':
+                conn.execute("DELETE FROM tasks WHERE id=?", (entity_id,))
+
+            conn.execute("DELETE FROM work_item_meta WHERE entity_type=? AND entity_id=?", (entity_type, entity_id))
+            conn.execute("DELETE FROM blockers_dependencies WHERE entity_type=? AND entity_id=?", (entity_type, entity_id))
+            conn.execute("DELETE FROM stage_history WHERE entity_type=? AND entity_id=?", (entity_type, entity_id))
+        return True
+
+    def snooze_followup(self, followup_id: int, days: int = 1) -> bool:
+        """Snoozes a followup by advancing its due_at date by specified number of days."""
+        with self.connect() as conn:
+            row = conn.execute("SELECT due_at FROM followups WHERE id=?", (followup_id,)).fetchone()
+            if not row:
+                return False
+            due_str = row['due_at']
+            try:
+                dt = datetime.fromisoformat(due_str.replace('Z', '+00:00')) if due_str else datetime.now(timezone.utc)
+            except Exception:
+                dt = datetime.now(timezone.utc)
+            new_due = (dt + timedelta(days=days)).isoformat()
+            conn.execute("UPDATE followups SET due_at=?, updated_at=? WHERE id=?", (new_due, now_iso(), followup_id))
+        return True
+
+    def add_workflow_stage(self, template_id: int, name: str, stage_order: int,
+                           description: str = '', expected_role: str = '',
+                           expected_duration_hours: float = 0.0, is_waiting: int = 0) -> int:
+        """Adds a new stage to an existing workflow template."""
+        with self.connect() as conn:
+            cur = conn.execute('''INSERT INTO workflow_stages
+                (template_id, name, stage_order, description, expected_role, expected_duration_hours, is_waiting, is_active, required_artifacts_json, checklist_items_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1, '[]', '[]')''',
+                (template_id, name, stage_order, description, expected_role, expected_duration_hours, 1 if is_waiting else 0))
+            return cur.lastrowid
+
 
 

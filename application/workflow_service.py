@@ -55,5 +55,27 @@ class WorkflowService:
                 summary=f"Failed to transition stage: {e}"
             )
 
+    def add_stage(self, template_id: int, name: str, stage_order: int,
+                  description: str = '', expected_role: str = '',
+                  expected_duration_hours: float = 0.0, is_waiting: bool = False) -> MutationResult:
+        try:
+            stage_id = self.db.add_workflow_stage(
+                template_id=template_id, name=name, stage_order=stage_order,
+                description=description, expected_role=expected_role,
+                expected_duration_hours=expected_duration_hours,
+                is_waiting=1 if is_waiting else 0
+            )
+            return MutationResult(
+                success=True,
+                entity_type='workflow_stage',
+                entity_id=stage_id,
+                summary=f"Added stage '{name}' to template #{template_id}"
+            )
+        except Exception as e:
+            return MutationResult(
+                success=False,
+                summary=f"Failed to add workflow stage: {e}"
+            )
+
     def get_stage_history(self, entity_type: str, entity_id: int) -> list[dict]:
         return self.db.get_stage_history(entity_type, entity_id)
