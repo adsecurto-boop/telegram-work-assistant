@@ -113,7 +113,7 @@ class ReportValidator:
                 ))
 
         # Check Interaction Counts (Rule 2)
-        interaction_count_matches = re.findall(r'\b(?:interactions|queries|support\s+queries)[:\s]+(\d+)\b', report_text, re.I)
+        interaction_count_matches = re.findall(r'\b(?:support\s+interactions|support\s+queries)[:\s]+(\d+)\b', report_text, re.I)
         for count_str in interaction_count_matches:
             claimed_interactions = int(count_str)
             if claimed_interactions != len(support_activities):
@@ -196,7 +196,7 @@ class ReportValidator:
             if c.get('priority', 1) >= 2 and c.get('status') not in ('resolved', 'closed')
         ]
         for c in high_priority_open_cases:
-            c_title = c.get('title', '').casefold()
+            c_title = (c.get('title') or '').casefold()
             c_id_str = f"case-{c['id']}"
             provenance.append({
                 'section_name': 'high_priority_cases',
@@ -233,7 +233,7 @@ class ReportValidator:
             # Verify if an actual resolved case exists matching this topic
             matching_resolved = [
                 c for c in cases
-                if c.get('status') in ('resolved', 'closed') and (target_topic in c.get('title', '').casefold() or c.get('client', '').casefold() in target_topic)
+                if c.get('status') in ('resolved', 'closed') and (target_topic in (c.get('title') or '').casefold() or ((c.get('client') or '').casefold() and (c.get('client') or '').casefold() in target_topic))
             ]
             if not matching_resolved and len(cases) > 0:
                 warnings.append(ReportWarning(

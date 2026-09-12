@@ -18,7 +18,7 @@ CALLBACK_PATTERN = (
     r'^task:[a-z_]+:\d+(:[a-z0-9_]+)?$|^src:(accept|ignore):\d+$|'
     r'^case:[a-z_]+:\d+$|^follow:(done|snooze):\d+$|'
     r'^audit:undo:\d+$|^nl:choose:\d+:[a-z_]+$|'
-    r'^prop:(accept|cancel):prop_[a-f0-9]+$|^prop:choose:prop_[a-f0-9]+:\d+$|'
+    r'^(prop|mcp):(accept|cancel|confirm):prop_[a-f0-9]+$|^prop:choose:prop_[a-f0-9]+:\d+$|'
     r'^plan:(confirm|cancel):\d+$|^checkpoint:update:\d+:[a-z_]+(:[a-z_]+)?$|'
     r'^corr:(confirm|cancel|pick_task|pick_client):prop_[a-f0-9]+(:[a-zA-Z0-9_ -]+)?$|'
     r'^late:(shift|cancel):prop_[a-f0-9]+(:\d+)?$'
@@ -43,6 +43,16 @@ async def startup(application):
                 application.bot_data['db'], config.DASHBOARD_HOST, config.DASHBOARD_PORT).start()
         except OSError as exc:
             logging.getLogger(__name__).warning('Dashboard unavailable: %s', type(exc).__name__)
+
+    try:
+        from mcp_manager import MCPManager
+        mcp_mgr = MCPManager()
+        mcp_mgr.load_config()
+        await mcp_mgr.initialize_all()
+        application.bot_data['mcp_manager'] = mcp_mgr
+    except Exception as exc:
+        logging.getLogger(__name__).warning('MCP Manager initialization warning: %s', exc)
+
     await application.bot.set_my_commands([
         BotCommand('shift','Start a flexible shift'), BotCommand('task','Plan a rich task'),
         BotCommand('briefing','Morning work briefing'), BotCommand('integrations','MCP tool status'),
@@ -74,6 +84,9 @@ async def shutdown(application):
     service = application.bot_data.get('dashboard')
     if service:
         await asyncio.to_thread(service.stop)
+    mcp_mgr = application.bot_data.get('mcp_manager')
+    if mcp_mgr:
+        await mcp_mgr.shutdown()
 
 
 async def wrap_handle(update, context):

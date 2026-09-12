@@ -150,7 +150,8 @@ class DashboardTests(unittest.TestCase):
             with self.assertRaises(urllib.error.HTTPError) as denied:
                 urllib.request.urlopen(f'http://127.0.0.1:{port}/', timeout=3)
             self.assertEqual(denied.exception.code, 403)
-            response = urllib.request.urlopen(
+            opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor())
+            response = opener.open(
                 f'http://127.0.0.1:{port}/?token={service.token}', timeout=3)
             self.assertIn('Telegram Work Assistant', response.read().decode())
 

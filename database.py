@@ -651,6 +651,21 @@ class Database:
         except Exception:
             pass
 
+        # Backfill case_events
+        try:
+            cursor = connection.execute("SELECT id, case_id, event_type, detail, occurred_at FROM case_events")
+            for row in cursor.fetchall():
+                connection.execute('''INSERT INTO fts_work_memory (source_type, source_id, title, content, client, product, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                    ('case_event', str(row['id']), f"CaseEvent #{row['id']}", f"Case #{row['case_id']} [{row['event_type']}]: {row['detail'] or ''}", '', '', row['occurred_at'] or now_iso()))
+        except Exception:
+            pass
+
+    def rebuild_work_memory_index(self):
+        with self.connect() as conn:
+            conn.execute("DELETE FROM fts_work_memory")
+            self._seed_v14_defaults(conn)
+
         # Backfill conversation summaries
         try:
             cursor = connection.execute("SELECT id, summary_text, created_at FROM assistant_memory_summaries")
@@ -3199,10 +3214,14 @@ class Database:
                                  test_session_id: int | None = None,
                                  source_update_id: int | None = None,
                                  correlation_id: str | None = None,
-                                 created_at: str | None = None) -> int:
+                                 created_at: str | None = None,
+                                 metadata: dict | str | None = None,
+                                 **kwargs) -> int:
         """Record a single conversational turn (user, assistant, or system)."""
         if role not in ('user', 'assistant', 'system'):
             raise ValueError(f"Invalid role: {role!r}. Must be 'user', 'assistant', or 'system'.")
+        if not entities_json and metadata:
+            entities_json = json.dumps(metadata) if isinstance(metadata, dict) else metadata
         stamp = created_at or now_iso()
         with self.connect() as connection:
             if source_update_id is not None:
@@ -3518,7 +3537,17 @@ class Database:
             d['metrics'] = json.loads(d['metrics_json'])
             return d
 
-    # --- Phase 4: NL Proposals ---
+    def create_proposal(self, prop_id: str, owner_id: int, action_type: str, payload_json: str | dict = None, source_update_id: int = None, expires_at: str = None) -> str:
+        now = datetime.now(timezone.utc)
+        exp = expires_at or (now + timedelta(minutes=15)).isoformat()
+        oid = int(owner_id) if owner_id is not None else (config.OWNER_ID or 1)
+        json_str = payload_json if isinstance(payload_json, str) else json.dumps(payload_json)
+        with self.connect() as connection:
+            connection.execute('''INSERT OR REPLACE INTO nl_proposals
+                (id, owner_id, source_update_id, intent, proposal_json, status, expires_at, created_at)
+                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)''',
+                (prop_id, oid, source_update_id, action_type, json_str, exp, now.isoformat()))
+        return prop_id
 
     def create_nl_proposal(self, owner_id=None, intent: str = 'unknown', proposal_dict: dict = None,
                            source_update_id: int = None, ttl_minutes: int = 15, proposal_data: dict = None, **kwargs) -> str:

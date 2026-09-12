@@ -255,8 +255,9 @@ async def save_plain_message(update, context, text):
                         'Finalize EOD & close shift', callback_data=f'close:{report_id}')]]))
         return
 
-    # Phase 4 Natural Language Engine & Durable Conversation Memory
-    from nlp import GeminiNLParser, NaturalLanguagePipeline
+    # Production Assistant Orchestrator & Durable Conversation Memory
+    from nlp import GeminiNLParser
+    from assistant_orchestrator import AssistantOrchestrator
     database = db(context)
     shift = await asyncio.to_thread(database.active_shift)
 
@@ -273,78 +274,49 @@ async def save_plain_message(update, context, text):
     ai_client = None
     if config.AI_KEY and config.AI_MODEL:
         ai_client = GeminiNLParser(config.AI_KEY, config.AI_MODEL, config.AI_FALLBACK_MODEL)
-    pipeline = NaturalLanguagePipeline(database, ai_client=ai_client)
 
-    reply_text, interp = await pipeline.process(text, shift, source_update_id=update.update_id)
+    mcp_mgr = context.application.bot_data.get('mcp_manager') if context and hasattr(context, 'application') and hasattr(context.application, 'bot_data') else None
+    orchestrator = AssistantOrchestrator(database, mcp_manager=mcp_mgr, ai_client=ai_client)
+
+    orch_res = await orchestrator.route_and_process(text, owner_id=config.OWNER_ID, source_update_id=update.update_id)
 
     # 2. Record ASSISTANT turn after processing
-    intent_val = interp.intent.value if interp and interp.intent else None
-    ent_json = json.dumps(interp.entities.model_dump()) if interp and interp.entities else None
-    c_id = getattr(interp.entities, 'case_id', None) if interp and interp.entities else None
-    t_id = getattr(interp.entities, 'task_id', None) if interp and interp.entities else None
-    ts_id = getattr(interp.entities, 'test_session_id', None) if interp and interp.entities else None
+    meta = {}
+    if orch_res.agent_run_id:
+        meta['agent_run_id'] = orch_res.agent_run_id
+    if orch_res.active_external_refs:
+        meta['active_external_refs'] = orch_res.active_external_refs
 
     await asyncio.to_thread(
         database.record_conversation_turn,
         config.OWNER_ID,
         'assistant',
-        reply_text,
+        orch_res.reply_text,
         shift_id=shift['id'] if shift else None,
-        intent=intent_val,
-        entities_json=ent_json,
-        case_id=c_id,
-        task_id=t_id,
-        test_session_id=ts_id,
-        source_update_id=update.update_id
+        source_update_id=update.update_id,
+        metadata=meta
     )
 
-    markup = None
-    if interp.needs_confirmation or (0.6 <= interp.confidence < 0.85):
-        prop_id = None
-        with database.connect() as conn:
-            r = conn.execute("SELECT applied_operations_json FROM nl_interactions WHERE source_update_id=? ORDER BY id DESC LIMIT 1", (update.update_id,)).fetchone()
-            if r and r['applied_operations_json']:
-                try:
-                    ops = json.loads(r['applied_operations_json'])
-                    prop_id = ops.get('proposal_id')
-                except Exception:
-                    pass
-        if prop_id:
-            if interp.choices:
-                buttons = []
-                for idx, ch in enumerate(interp.choices[:4]):
-                    cb = f"prop:choose:{prop_id}:{idx}"
-                    buttons.append([InlineKeyboardButton(ch.get('label', 'Option'), callback_data=cb)])
-                buttons.append([InlineKeyboardButton('Cancel', callback_data=f"prop:cancel:{prop_id}")])
-                markup = InlineKeyboardMarkup(buttons)
-            else:
-                markup = InlineKeyboardMarkup([[
-                    InlineKeyboardButton('Confirm', callback_data=f"prop:accept:{prop_id}"),
-                    InlineKeyboardButton('Cancel', callback_data=f"prop:cancel:{prop_id}")
-                ]])
-    elif interp.choices:
-        buttons = []
-        for ch in interp.choices[:4]:
-            cb = f"nl:choose:{ch.get('case_id')}:{interp.intent.value}"
-            buttons.append([InlineKeyboardButton(ch.get('label', 'Option'), callback_data=cb)])
-        markup = InlineKeyboardMarkup(buttons)
-    elif interp.intent.value in ('set_shift', 'create_task', 'complete_task', 'change_case_status',
-                                 'create_test_session', 'add_learning', 'create_followup'):
-        corr_id = None
-        with database.connect() as conn:
-            r = conn.execute("SELECT applied_operations_json FROM nl_interactions WHERE source_update_id=? ORDER BY id DESC LIMIT 1", (update.update_id,)).fetchone()
-            if r and r['applied_operations_json']:
-                try:
-                    ops = json.loads(r['applied_operations_json'])
-                    corr_id = ops.get('correlation_id')
-                except Exception:
-                    pass
-        if corr_id:
-            last_audit = await asyncio.to_thread(database.get_last_reversible_audit)
-            if last_audit and last_audit.get('correlation_id') == corr_id:
-                markup = InlineKeyboardMarkup([[InlineKeyboardButton('Undo action', callback_data=f"audit:undo:{last_audit['id']}") ]])
+    markup = MENU
+    if orch_res.proposal_id:
+        if orch_res.choices:
+            rows = [
+                [InlineKeyboardButton(
+                    c.label if hasattr(c, 'label') else c.get('label', 'Choice') if isinstance(c, dict) else str(c),
+                    callback_data=f"prop:choose:{orch_res.proposal_id}:{i}"
+                )]
+                for i, c in enumerate(orch_res.choices)
+            ]
+            rows.append([InlineKeyboardButton('Cancel', callback_data=f"prop:cancel:{orch_res.proposal_id}")])
+            markup = InlineKeyboardMarkup(rows)
+        else:
+            markup = InlineKeyboardMarkup([[
+                InlineKeyboardButton('Confirm', callback_data=f"prop:accept:{orch_res.proposal_id}"),
+                InlineKeyboardButton('Cancel', callback_data=f"prop:cancel:{orch_res.proposal_id}")
+            ]])
 
-    await reply(update, reply_text, markup=markup)
+    await reply(update, orch_res.reply_text, markup=markup)
+
 
 
 async def report_preferences(context, requested=None):
@@ -767,7 +739,7 @@ async def handle_callback(update, context):
         undone = await asyncio.to_thread(db(context).undo_audit_record, int(parts[2]))
         details = f" {undone['details']}" if undone.get('details') else ''
         await reply(update, f"Undid action #{undone['id']} ({undone['operation_type']} on {undone['affected_table']} #{undone['record_id']}).{details}")
-    elif action == 'prop':
+    elif action in ('prop', 'mcp'):
         prop_action = parts[1]
         prop_id = parts[2]
         callback_user = getattr(query, 'from_user', None)
@@ -790,6 +762,44 @@ async def handle_callback(update, context):
         except Exception as exc:
             await reply(update, f'Could not accept proposal: {exc}')
             return
+
+        action_type = accepted.get('action_type')
+        raw_payload = accepted.get('proposal')
+        payload = {}
+        if isinstance(raw_payload, dict):
+            payload = raw_payload
+        elif isinstance(raw_payload, str):
+            try:
+                payload = json.loads(raw_payload)
+            except Exception:
+                pass
+
+        if action_type == 'mcp_external_write':
+            mcp_mgr = context.application.bot_data.get('mcp_manager') if context and hasattr(context, 'application') and hasattr(context.application, 'bot_data') else None
+            gemini_name = payload.get('gemini_name') or payload.get('tool_id')
+            args = payload.get('arguments', {})
+            if mcp_mgr and gemini_name:
+                res = await mcp_mgr.call_tool(gemini_name, args)
+                await asyncio.to_thread(db(context).finish_nl_proposal, prop_id, 'accepted')
+                if res.success:
+                    await reply(update, f"✅ **External Tool Action Executed**\n\n{res.text}")
+                else:
+                    await reply(update, f"❌ **External Tool Action Failed**\n\nError: {res.error}")
+            else:
+                await asyncio.to_thread(db(context).finish_nl_proposal, prop_id, 'failed')
+                await reply(update, f"MCP Manager unavailable to execute proposal {prop_id}.")
+            return
+
+        if action_type == 'compound_plan':
+            from nlp import NaturalLanguagePipeline, ConversationPlan
+            nlp = NaturalLanguagePipeline(db(context))
+            shift = await asyncio.to_thread(db(context).active_shift)
+            plan = ConversationPlan.model_validate(payload)
+            res = await nlp.execute_plan(plan, shift)
+            await asyncio.to_thread(db(context).finish_nl_proposal, prop_id, 'accepted')
+            await reply(update, res.summary_reply)
+            return
+
         from nlp import NLInterpretation, NLActionExecutor, NLIntent, ReasonCode
         saved_interp = NLInterpretation.model_validate(accepted['proposal'])
         if prop_action == 'choose' and len(parts) > 3:

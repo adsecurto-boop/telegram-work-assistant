@@ -138,22 +138,22 @@ class DashboardService:
                 except Exception:
                     return None
 
-            def authenticate_request(self, params: dict) -> tuple[bool, str | None, str | None]:
+            def authenticate_request(self, params: dict) -> tuple[bool, str | None, str | None, bool]:
                 """
-                Returns (is_authenticated, session_id, csrf_token).
+                Returns (is_authenticated, session_id, csrf_token, is_token_exchange).
                 Exchanges access token query param for local session cookie.
                 """
                 sid = self.get_cookie_sid()
                 if sid and service.get_session(sid):
                     session = service.get_session(sid)
-                    return True, sid, session['csrf_token']
+                    return True, sid, session['csrf_token'], False
 
                 supplied_token = (params.get('token') or [''])[0]
                 if supplied_token and secrets.compare_digest(supplied_token, service.token):
                     new_sid, csrf = service.create_session()
-                    return True, new_sid, csrf
+                    return True, new_sid, csrf, True
 
-                return False, None, None
+                return False, None, None, False
 
             def send_html(self, body: str, status=200, set_sid: str | None = None):
                 content = body.encode('utf-8')
@@ -173,7 +173,6 @@ class DashboardService:
             def page(self, content, title='Work Assistant', csrf_token: str = ''):
                 return f'''<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<script>if(window.location.search.includes('token=')){{const u=new URL(window.location);u.searchParams.delete('token');window.history.replaceState({{}},document.title,u.pathname+(u.search?u.search:''));}}</script>
 <title>{h(title)}</title><style>
 body{{font:14px system-ui,-apple-system,sans-serif;margin:0;background:#f4f6f8;color:#17212b}}
 header{{background:#17212b;color:white;padding:14px 4%;box-shadow:0 2px 4px rgba(0,0,0,0.1)}}
@@ -228,8 +227,6 @@ th{{background:#f8f9fa;font-weight:600}}
                 mime = raw_mime.lower().split(';')[0].strip()
                 safe_filename = re.sub(r'[\r\n"\\\x00-\x1f]', '_', path.name)
 
-                # Safe inline media: only safe images, audio, and video render inline.
-                # All potentially active content (HTML, SVG, XML, JS, EXE, PDF) is forced to download.
                 if mime in SAFE_INLINE_MIME_TYPES:
                     disposition = f'inline; filename="{safe_filename}"'
                 else:
@@ -258,9 +255,22 @@ th{{background:#f8f9fa;font-weight:600}}
                 parsed = urlparse(self.path)
                 params = parse_qs(parsed.query)
 
-                authed, set_sid, csrf_token = self.authenticate_request(params)
+                authed, set_sid, csrf_token, is_token_exchange = self.authenticate_request(params)
                 if not authed:
                     self.send_html(self.page('<h2>Access denied</h2><p>Please use your authorized dashboard link with token parameter.</p>'), 403)
+                    return
+
+                if is_token_exchange:
+                    clean_params = {k: v for k, v in params.items() if k != 'token'}
+                    redirect_path = parsed.path
+                    if clean_params:
+                        redirect_path += '?' + urlencode(clean_params, doseq=True)
+
+                    self.send_response(303)
+                    self.send_header('Location', redirect_path)
+                    self.send_header('Set-Cookie', f'dashboard_session={set_sid}; Path=/; HttpOnly; SameSite=Strict')
+                    self.send_header('Cache-Control', 'no-store')
+                    self.end_headers()
                     return
 
                 route = parsed.path
@@ -680,7 +690,7 @@ Source case <input name="source" type="number" min="1" required> into target <in
                 form = parse_qs(self.rfile.read(length).decode('utf-8'))
 
                 # Authenticate and verify CSRF
-                authed, set_sid, expected_csrf = self.authenticate_request(query)
+                authed, set_sid, expected_csrf, _ = self.authenticate_request(query)
                 if not authed:
                     self.send_html(self.page('<h2>Access denied</h2><p>Authentication required.</p>'), 403)
                     return

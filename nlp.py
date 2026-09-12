@@ -160,6 +160,7 @@ class NLInterpretation(BaseModel):
     has_negation: bool = False
     current_date: str | None = None
     correlation_id: str | None = None
+    proposal_id: str | None = None
 
 
 class GeminiInterpretationPayload(BaseModel):
@@ -2510,6 +2511,7 @@ class NaturalLanguagePipeline:
                 proposal_data=interpretation.model_dump(),
                 expires_at=expires_at
             )
+            interpretation.proposal_id = prop_id
             clarification = interpretation.clarification_question or f"Proposed: {interpretation.proposed_summary}. Would you like to proceed?"
             self.db.record_nl_interaction(
                 raw_text=text,
