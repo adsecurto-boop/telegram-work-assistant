@@ -376,8 +376,12 @@ class GeminiChatService:
         assistant_reply = ""
         error_msg = None
         used_model = model_name
+        # In production _get_client is None without a key.  Looking it up here
+        # retains one injectable SDK seam without enabling an unauthenticated
+        # REST fallback.
+        client = self._get_client()
 
-        if not api_key:
+        if not api_key and not client:
             assistant_reply = (
                 f"**[Offline Assistant Mode - {role_info['title']}]**\n\n"
                 f"I received your message: *\"{clean_user_message}\"*\n\n"
@@ -386,7 +390,6 @@ class GeminiChatService:
             )
         else:
             try:
-                client = self._get_client()
                 if client:
                     try:
                         from google.genai import types
@@ -414,7 +417,7 @@ class GeminiChatService:
                         logger.warning("SDK call failed, using REST API fallback: %s", sdk_err)
                         client = None
 
-                if not client or not assistant_reply:
+                if api_key and (not client or not assistant_reply):
                     loop = asyncio.get_running_loop()
                     assistant_reply, used_model = await loop.run_in_executor(
                         None,

@@ -73,7 +73,8 @@ class TestGeminiChatService(unittest.TestCase):
         self.assertIn("QA", qa_role["title"])
         self.assertIn("test", qa_role["system_instruction"].lower())
 
-    def test_multi_turn_history_persistence(self):
+    @patch.object(GeminiChatService, "_get_api_key", return_value="")
+    def test_multi_turn_history_persistence(self, _mock_key):
         # Send offline message (no API key)
         result = asyncio.run(self.service.send_message(
             message="Hello, can you review defect #4?",

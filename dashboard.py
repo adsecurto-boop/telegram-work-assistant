@@ -22,6 +22,8 @@ import config
 from domain import CASE_STATUSES
 from shifts import assign_template_range, check_missing_shift_assignments, format_shift_preview, preview_calendar_week
 from application.work_item_service import WorkItemService
+from application.task_service import TaskService
+from application.case_service import CaseService
 from application.workflow_service import WorkflowService
 from application.member_service import MemberService
 from application.workspace_service import WorkspaceActionService, WorkspaceActionError
@@ -111,6 +113,8 @@ class DashboardService:
         self.token = database.get_setting('dashboard_token') or secrets.token_urlsafe(24)
         database.set_setting('dashboard_token', self.token)
         self.work_item_service = WorkItemService(database)
+        self.task_service = TaskService(database)
+        self.case_service = CaseService(database)
         self.workflow_service = WorkflowService(database)
         self.member_service = MemberService(database)
         self.workspace_service = WorkspaceActionService(database)
@@ -2114,7 +2118,7 @@ document.addEventListener('click', function(e) {{
                         due = (form.get('due_date') or [''])[0] or None
                         prio = int((form.get('priority') or ['2'])[0])
                         project = (form.get('product') or form.get('project') or [''])[0] or None
-                        service.database.add_task(title=title, priority=prio, client=client, ticket=ticket, due_date=due, project=project)
+                        service.task_service.create_task(title=title, priority=prio, client=client, ticket=ticket, due_date=due, project=project, actor='dashboard')
 
                     elif parsed.path == '/cases/create':
                         title = form['title'][0]
@@ -2122,7 +2126,7 @@ document.addEventListener('click', function(e) {{
                         ticket = (form.get('ticket') or [''])[0] or None
                         channel = (form.get('channel') or [''])[0] or None
                         prio = int((form.get('priority') or ['1'])[0])
-                        service.database.create_case(title=title, client=client, ticket=ticket, channel=channel, priority=prio)
+                        service.case_service.create_case(title=title, client=client, ticket=ticket, channel=channel, priority=prio)
 
                     elif parsed.path == '/work/item/update':
                         e_type = form['entity_type'][0]

@@ -2883,9 +2883,20 @@ class Database:
                     connection, correlation_id, 'complete_followup', actor, 'followups', followup_id,
                     {k: before[k] for k in fields}, {k: after[k] for k in fields})
 
-    def snooze_followup(self, followup_id, due_at, correlation_id=None, actor='system'):
+    def snooze_followup(self, followup_id, due_at=None, *, days=None, correlation_id=None, actor='system'):
+        """Set or advance a pending follow-up due date through one audited path."""
         with self.connect() as connection:
             before = connection.execute('SELECT * FROM followups WHERE id=?', (followup_id,)).fetchone()
+            if not before:
+                return False
+            if days is not None:
+                try:
+                    base = datetime.fromisoformat((before['due_at'] or now_iso()).replace('Z', '+00:00'))
+                except ValueError:
+                    base = datetime.now(timezone.utc)
+                due_at = (base + timedelta(days=int(days))).isoformat()
+            if not due_at:
+                raise ValueError('A due_at value or days offset is required.')
             if connection.execute('''UPDATE followups SET due_at=?,reminded_at=NULL
                 WHERE id=? AND status='pending' ''', (due_at, followup_id)).rowcount != 1:
                 raise ValueError('Follow-up is unavailable or already completed.')
@@ -2895,6 +2906,7 @@ class Database:
                 self._record_audit_in_connection(
                     connection, correlation_id, 'snooze_followup', actor, 'followups', followup_id,
                     {k: before[k] for k in fields}, {k: after[k] for k in fields})
+        return True
 
     def connector_state(self, connector):
         with self.connect() as connection:
@@ -5747,21 +5759,6 @@ class Database:
             conn.execute("DELETE FROM work_item_meta WHERE entity_type=? AND entity_id=?", (entity_type, entity_id))
             conn.execute("DELETE FROM blockers_dependencies WHERE entity_type=? AND entity_id=?", (entity_type, entity_id))
             conn.execute("DELETE FROM stage_history WHERE entity_type=? AND entity_id=?", (entity_type, entity_id))
-        return True
-
-    def snooze_followup(self, followup_id: int, days: int = 1) -> bool:
-        """Snoozes a followup by advancing its due_at date by specified number of days."""
-        with self.connect() as conn:
-            row = conn.execute("SELECT due_at FROM followups WHERE id=?", (followup_id,)).fetchone()
-            if not row:
-                return False
-            due_str = row['due_at']
-            try:
-                dt = datetime.fromisoformat(due_str.replace('Z', '+00:00')) if due_str else datetime.now(timezone.utc)
-            except Exception:
-                dt = datetime.now(timezone.utc)
-            new_due = (dt + timedelta(days=days)).isoformat()
-            conn.execute("UPDATE followups SET due_at=?, updated_at=? WHERE id=?", (new_due, now_iso(), followup_id))
         return True
 
     def add_workflow_stage(self, template_id: int, name: str, stage_order: int,
