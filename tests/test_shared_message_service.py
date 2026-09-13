@@ -2,6 +2,7 @@ import asyncio
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from application.message_service import AssistantMessageService
@@ -45,3 +46,33 @@ class SharedMessageServiceTests(unittest.TestCase):
                 asyncio.run(orchestrator.route_and_process('What is pending today?', owner_id=1))
             self.assertTrue(any(call.kwargs.get('thread_id') == active_thread
                                 for call in recent.call_args_list))
+
+    def test_concurrent_web_retry_claims_one_orchestrator_execution(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
+            db = Database(Path(temp) / 'work.sqlite3')
+            service = AssistantMessageService(db)
+            calls = 0
+
+            async def delayed_route(*_args, **_kwargs):
+                nonlocal calls
+                calls += 1
+                await asyncio.sleep(0.05)
+                return SimpleNamespace(reply_text='done', proposal_id=None, choices=[],
+                    correlation_id=None, active_external_refs=None, success=True, error=None)
+
+            service.orchestrator.route_and_process = delayed_route
+
+            async def submit_twice():
+                return await asyncio.gather(*[
+                    service.process_user_message(owner_id=1, text='Create a task',
+                        source_channel='web', client_message_id='web:concurrent')
+                    for _ in range(2)
+                ])
+
+            first, second = asyncio.run(submit_twice())
+            self.assertEqual(calls, 1)
+            self.assertEqual(sum(bool(item['success']) for item in (first, second)), 1)
+            replay = asyncio.run(service.process_user_message(owner_id=1, text='Create a task',
+                source_channel='web', client_message_id='web:concurrent'))
+            self.assertTrue(replay['success'])
+            self.assertTrue(replay['idempotent_replay'])

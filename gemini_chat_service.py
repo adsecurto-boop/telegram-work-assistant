@@ -292,6 +292,9 @@ class GeminiChatService:
         include_workspace_context: bool = True,
     ) -> Dict[str, Any]:
         """
+        Legacy compatibility path. New dashboard and channel requests must use
+        AssistantMessageService so they share one orchestration runtime.
+
         Processes a multi-turn chat message:
         1. Selects the appropriate Gemini model (pro / flash / flash-lite).
         2. Retrieves and bounds conversation history.

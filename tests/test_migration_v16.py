@@ -19,11 +19,10 @@ class TestMigrationV16(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_schema_version_and_tables(self):
-        self.assertEqual(SCHEMA_VERSION, 17)
+        self.assertEqual(SCHEMA_VERSION, 18)
         with self.db.connect() as conn:
             ver = conn.execute("PRAGMA user_version").fetchone()[0]
-            self.assertEqual(ver, 17)
-
+            self.assertEqual(ver, 18)
             rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
             table_names = {r['name'] for r in rows}
             expected_new_tables = {

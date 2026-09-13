@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from mcp_registry import RiskLevel
+from mcp_policy import ExternalActionPolicy, PolicyDecision
 import config
 
 logger = logging.getLogger("workspace_service")
@@ -52,8 +53,6 @@ class WorkspaceActionService:
             raise WorkspaceActionError(f"Unsupported workspace action: '{action}'.")
 
         # Sanitize and hash exact arguments
-        args_json = json.dumps(args, sort_keys=True)
-        args_hash = hashlib.sha256(args_json.encode('utf-8')).hexdigest()
 
         # Determine risk level and required capabilities
         if action == 'drive_delete_file':
@@ -103,15 +102,18 @@ class WorkspaceActionService:
             title = action.replace('_', ' ').title()
             description = f"Execute {action} with {len(args)} parameters."
 
+        policy = ExternalActionPolicy.evaluate(args, risk, req_caps)
+        if policy.decision != PolicyDecision.CONFIRMATION_REQUIRED:
+            raise WorkspaceActionError('External Workspace actions require confirmation.')
         proposal_id = str(uuid.uuid4())
         payload = {
             'proposal_id': proposal_id,
             'actor': actor,
             'action': action,
             'args': args,
-            'args_hash': args_hash,
-            'risk_level': risk.name,
-            'required_capabilities': req_caps,
+            'args_hash': policy.arguments_hash,
+            'risk_level': policy.risk_level.name,
+            'required_capabilities': policy.required_capabilities,
             'title': title,
             'description': description,
         }
@@ -122,10 +124,10 @@ class WorkspaceActionService:
             'action': action,
             'risk': risk.name,
             'is_destructive': risk == RiskLevel.DESTRUCTIVE,
-            'required_capabilities': req_caps,
+            'required_capabilities': policy.required_capabilities,
             'title': title,
             'description': description,
-            'arguments_hash': args_hash,
+            'arguments_hash': policy.arguments_hash,
         }
 
     def execute_action(

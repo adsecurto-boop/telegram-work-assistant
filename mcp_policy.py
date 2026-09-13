@@ -25,6 +25,35 @@ class ToolPolicyResult:
     proposal_data: Optional[Dict[str, Any]] = None
 
 
+@dataclass
+class ExternalActionPolicyResult:
+    decision: str
+    arguments_hash: str
+    risk_level: RiskLevel
+    required_capabilities: list[str]
+
+
+class ExternalActionPolicy:
+    """Canonical confirmation and integrity policy for every external adapter.
+
+    MCP tools and first-party adapters may classify their own operation, but the
+    confirmation decision and immutable argument fingerprint live in one place.
+    """
+    @staticmethod
+    def evaluate(arguments: Dict[str, Any], risk_level: RiskLevel,
+                 required_capabilities: list[str] | tuple[str, ...] | set[str]) -> ExternalActionPolicyResult:
+        required = sorted(required_capabilities)
+        decision = (PolicyDecision.CONFIRMATION_REQUIRED if risk_level in {
+            RiskLevel.EXTERNAL_WRITE, RiskLevel.DESTRUCTIVE,
+            RiskLevel.PRIVILEGED, RiskLevel.UNKNOWN_EXTERNAL,
+        } else PolicyDecision.ALLOWED)
+        return ExternalActionPolicyResult(
+            decision=decision,
+            arguments_hash=hashlib.sha256(json.dumps(arguments, sort_keys=True, default=str).encode()).hexdigest(),
+            risk_level=risk_level,
+            required_capabilities=required)
+
+
 class ToolPolicy:
     """Enforces safety rules on tool calls."""
 
@@ -32,6 +61,7 @@ class ToolPolicy:
     def evaluate(tool_desc: ToolDescriptor, arguments: Dict[str, Any]) -> ToolPolicyResult:
         effective_risk = effective_risk_for_call(tool_desc, arguments)
         required = sorted(required_capabilities_for_call(tool_desc, arguments))
+        external_policy = ExternalActionPolicy.evaluate(arguments, effective_risk, required)
         # READ_ONLY tools are automatically allowed
         if effective_risk == RiskLevel.READ_ONLY:
             return ToolPolicyResult(
@@ -41,10 +71,7 @@ class ToolPolicy:
             )
 
         # EXTERNAL_WRITE and DESTRUCTIVE tools require explicit confirmation
-        if effective_risk in [
-            RiskLevel.EXTERNAL_WRITE, RiskLevel.DESTRUCTIVE,
-            RiskLevel.PRIVILEGED, RiskLevel.UNKNOWN_EXTERNAL,
-        ]:
+        if external_policy.decision == PolicyDecision.CONFIRMATION_REQUIRED:
             preview = ToolPolicy.format_confirmation_preview(tool_desc, arguments)
             proposal = {
                 "tool_id": tool_desc.canonical_id,
@@ -53,8 +80,7 @@ class ToolPolicy:
                 "arguments": arguments,
                 "risk_level": effective_risk.value,
                 "required_capabilities": required,
-                "arguments_hash": hashlib.sha256(
-                    json.dumps(arguments, sort_keys=True, default=str).encode()).hexdigest(),
+                "arguments_hash": external_policy.arguments_hash,
             }
             return ToolPolicyResult(
                 decision=PolicyDecision.CONFIRMATION_REQUIRED,

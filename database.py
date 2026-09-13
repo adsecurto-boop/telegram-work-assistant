@@ -13,7 +13,7 @@ from pathlib import Path
 from models import Task, TaskStatus
 import config
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 
 _last_iso_time = 0.0
@@ -111,6 +111,8 @@ class Database:
                 self._seed_v16_defaults(cursor)
             if version < 17:
                 self._seed_v17_defaults(cursor)
+            if version < 18:
+                self._seed_v18_defaults(cursor)
             self._create_indexes(cursor)
             self._validate_schema_integrity(cursor)
             cursor.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
@@ -449,6 +451,11 @@ class Database:
                 id TEXT PRIMARY KEY, owner_id INTEGER NOT NULL, title TEXT,
                 status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL, archived_at TEXT);
+            CREATE TABLE IF NOT EXISTS conversation_message_requests (
+                owner_id INTEGER NOT NULL, client_message_id TEXT NOT NULL,
+                source_channel TEXT NOT NULL, status TEXT NOT NULL,
+                response_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                PRIMARY KEY (owner_id, client_message_id));
             CREATE TABLE IF NOT EXISTS assistant_memory_summaries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 owner_id INTEGER NOT NULL,
@@ -813,6 +820,13 @@ class Database:
         connection.execute('CREATE INDEX IF NOT EXISTS conversation_turns_thread_idx ON conversation_turns(owner_id, thread_id, created_at)')
         connection.execute('CREATE UNIQUE INDEX IF NOT EXISTS conversation_turns_web_idempotency_idx ON conversation_turns(owner_id, client_message_id, role) WHERE client_message_id IS NOT NULL')
 
+    def _seed_v18_defaults(self, connection):
+        connection.execute('''CREATE TABLE IF NOT EXISTS conversation_message_requests (
+            owner_id INTEGER NOT NULL, client_message_id TEXT NOT NULL,
+            source_channel TEXT NOT NULL, status TEXT NOT NULL,
+            response_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            PRIMARY KEY (owner_id, client_message_id))''')
+
     def _seed_v13_defaults(self, connection):
         connection.execute('''CREATE TABLE IF NOT EXISTS assistant_memory_summaries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1009,7 +1023,7 @@ class Database:
             'bulk_operations', 'shift_templates', 'shift_calendar',
             'report_provenance', 'nl_proposals', 'report_validations',
             'nl_corrections', 'plan_snapshots', 'record_links',
-            'planning_conversations', 'conversation_turns',
+            'planning_conversations', 'conversation_turns', 'conversation_message_requests',
             'assistant_memory_summaries', 'fts_work_memory',
             'workflow_templates', 'workflow_stages', 'members', 'roles',
             'member_roles', 'work_item_meta', 'stage_history',
@@ -3636,6 +3650,43 @@ class Database:
                 (owner_id, shift_id, role, text, intent, entities_json,
                  case_id, task_id, test_session_id, source_update_id, thread_id,
                  source_channel, source_message_id, client_message_id, correlation_id, stamp)).lastrowid
+
+    def claim_conversation_message_request(self, owner_id: int, client_message_id: str,
+                                           source_channel: str) -> dict:
+        """Atomically claim a browser message before any side effect is evaluated."""
+        stamp = now_iso()
+        with self.connect() as connection:
+            inserted = connection.execute('''INSERT OR IGNORE INTO conversation_message_requests
+                (owner_id, client_message_id, source_channel, status, created_at, updated_at)
+                VALUES (?, ?, ?, 'processing', ?, ?)''',
+                (owner_id, client_message_id, source_channel, stamp, stamp)).rowcount
+            if inserted:
+                return {'claimed': True, 'status': 'processing'}
+            row = connection.execute('''SELECT status, response_json FROM conversation_message_requests
+                WHERE owner_id=? AND client_message_id=?''', (owner_id, client_message_id)).fetchone()
+            if row and row['status'] == 'failed':
+                reclaimed = connection.execute('''UPDATE conversation_message_requests
+                    SET status='processing', updated_at=?
+                    WHERE owner_id=? AND client_message_id=? AND status='failed' ''',
+                    (stamp, owner_id, client_message_id)).rowcount
+                if reclaimed:
+                    return {'claimed': True, 'status': 'processing'}
+            return {'claimed': False, 'status': row['status'] if row else 'processing',
+                    'response_json': row['response_json'] if row else None}
+
+    def complete_conversation_message_request(self, owner_id: int, client_message_id: str,
+                                              response: dict) -> None:
+        with self.connect() as connection:
+            connection.execute('''UPDATE conversation_message_requests
+                SET status='completed', response_json=?, updated_at=?
+                WHERE owner_id=? AND client_message_id=? AND status='processing' ''',
+                (json.dumps(response), now_iso(), owner_id, client_message_id))
+
+    def fail_conversation_message_request(self, owner_id: int, client_message_id: str) -> None:
+        with self.connect() as connection:
+            connection.execute('''UPDATE conversation_message_requests SET status='failed', updated_at=?
+                WHERE owner_id=? AND client_message_id=? AND status='processing' ''',
+                (now_iso(), owner_id, client_message_id))
 
     def get_active_conversation_thread(self, owner_id: int) -> str:
         key = f'conversation_thread:{owner_id}'
