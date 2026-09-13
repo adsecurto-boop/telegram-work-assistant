@@ -13,7 +13,7 @@ from pathlib import Path
 from models import Task, TaskStatus
 import config
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 
 _last_iso_time = 0.0
@@ -109,6 +109,8 @@ class Database:
                 self._seed_v15_defaults(cursor)
             if version < 16:
                 self._seed_v16_defaults(cursor)
+            if version < 17:
+                self._seed_v17_defaults(cursor)
             self._create_indexes(cursor)
             self._validate_schema_integrity(cursor)
             cursor.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
@@ -437,6 +439,10 @@ class Database:
                 task_id INTEGER REFERENCES tasks(id),
                 test_session_id INTEGER REFERENCES test_sessions(id),
                 source_update_id INTEGER,
+                thread_id TEXT NOT NULL DEFAULT 'primary',
+                source_channel TEXT NOT NULL DEFAULT 'system',
+                source_message_id TEXT,
+                client_message_id TEXT,
                 correlation_id TEXT,
                 created_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS assistant_memory_summaries (
@@ -727,6 +733,9 @@ class Database:
                 'completed_at': 'TEXT',
                 'attempts': 'INTEGER NOT NULL DEFAULT 1',
                 'last_error': 'TEXT'},
+            'conversation_turns': {
+                'thread_id': "TEXT NOT NULL DEFAULT 'primary'", 'source_channel': "TEXT NOT NULL DEFAULT 'system'",
+                'source_message_id': 'TEXT', 'client_message_id': 'TEXT'},
         }
         for table, columns in additions.items():
             current = {row['name'] for row in connection.execute(f'PRAGMA table_info({table})')}
@@ -791,6 +800,10 @@ class Database:
     def _seed_v12_defaults(self, connection):
         # v12 introduces conversation_turns table (created by _create_schema)
         pass
+
+    def _seed_v17_defaults(self, connection):
+        connection.execute('CREATE INDEX IF NOT EXISTS conversation_turns_thread_idx ON conversation_turns(owner_id, thread_id, created_at)')
+        connection.execute('CREATE UNIQUE INDEX IF NOT EXISTS conversation_turns_web_idempotency_idx ON conversation_turns(owner_id, client_message_id, role) WHERE client_message_id IS NOT NULL')
 
     def _seed_v13_defaults(self, connection):
         connection.execute('''CREATE TABLE IF NOT EXISTS assistant_memory_summaries (
@@ -3582,6 +3595,8 @@ class Database:
                                  test_session_id: int | None = None,
                                  source_update_id: int | None = None,
                                  correlation_id: str | None = None,
+                                 thread_id: str = 'primary', source_channel: str = 'system',
+                                 source_message_id: str | None = None, client_message_id: str | None = None,
                                  created_at: str | None = None,
                                  metadata: dict | str | None = None,
                                  **kwargs) -> int:
@@ -3599,14 +3614,20 @@ class Database:
                 ).fetchone()
                 if existing:
                     return existing['id']
+            if client_message_id is not None:
+                existing = connection.execute(
+                    'SELECT id FROM conversation_turns WHERE owner_id=? AND client_message_id=? AND role=?',
+                    (owner_id, client_message_id, role)).fetchone()
+                if existing:
+                    return existing['id']
             return connection.execute('''INSERT INTO conversation_turns
                 (owner_id, shift_id, role, text, intent, entities_json,
-                 case_id, task_id, test_session_id, source_update_id,
-                 correlation_id, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                 case_id, task_id, test_session_id, source_update_id, thread_id,
+                 source_channel, source_message_id, client_message_id, correlation_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                 (owner_id, shift_id, role, text, intent, entities_json,
-                 case_id, task_id, test_session_id, source_update_id,
-                 correlation_id, stamp)).lastrowid
+                 case_id, task_id, test_session_id, source_update_id, thread_id,
+                 source_channel, source_message_id, client_message_id, correlation_id, stamp)).lastrowid
 
     def get_recent_turns(self, owner_id: int, limit: int = 20,
                          shift_id: int | None = None) -> list[dict]:

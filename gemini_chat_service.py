@@ -272,10 +272,9 @@ class GeminiChatService:
             return []
 
     def clear_conversation_history(self, owner_id: int = 1) -> bool:
-        """Clear conversation turns for the user."""
+        """Start a fresh UI thread without destroying durable shared history."""
         try:
-            with self.db.connect() as conn:
-                conn.execute("DELETE FROM conversation_turns WHERE owner_id=?", (owner_id,))
+            self.db.set_setting(f'conversation_thread:{owner_id}', 'primary')
             return True
         except Exception as e:
             logger.error("Failed to clear conversation history: %s", e)

@@ -24,6 +24,7 @@ from shifts import assign_template_range, check_missing_shift_assignments, forma
 from application.work_item_service import WorkItemService
 from application.task_service import TaskService
 from application.case_service import CaseService
+from application.message_service import AssistantMessageService
 from application.workflow_service import WorkflowService
 from application.member_service import MemberService
 from application.workspace_service import WorkspaceActionService, WorkspaceActionError
@@ -119,6 +120,7 @@ class DashboardService:
         self.member_service = MemberService(database)
         self.workspace_service = WorkspaceActionService(database)
         self.chat_service = GeminiChatService(database)
+        self.message_service = AssistantMessageService(database)
         self.server = None
         self.thread = None
         self._lock = threading.RLock()
@@ -1771,17 +1773,14 @@ document.addEventListener('click', function(e) {{
                         new_loop = asyncio.new_event_loop()
                         asyncio.set_event_loop(new_loop)
                         try:
-                            result = new_loop.run_until_complete(service.chat_service.send_message(
-                                message=msg,
-                                role_key=role_key,
-                                task_mode=task_mode,
-                                custom_system_instruction=custom_prompt,
-                                owner_id=owner_id
-                            ))
+                            result = new_loop.run_until_complete(service.message_service.process_user_message(
+                                owner_id=owner_id, text=msg, source_channel='web',
+                                client_message_id=json_body.get('client_message_id'),
+                                metadata={'role_key': role_key, 'task_mode': task_mode}))
                         finally:
                             new_loop.close()
 
-                        self.send_json(result)
+                        self.send_json(result if isinstance(result, dict) else {'success': result.success, 'reply': result.reply_text, 'proposal_id': result.proposal_id})
                         return
 
                     elif parsed.path == '/api/chat/clear':

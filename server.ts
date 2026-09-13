@@ -29,6 +29,7 @@ const __dirname = path.dirname(__filename);
 const PORT = 3000;
 const PYTHON_PORT = 8765;
 const PYTHON_HOST = '127.0.0.1';
+const AI_STUDIO_PREVIEW = process.env.AI_STUDIO_PREVIEW === 'true';
 
 let dashboardToken = '';
 let pythonProcess: ChildProcess | null = null;
@@ -82,7 +83,7 @@ async function ensurePythonDashboard() {
 
   console.log('[server] Starting Python dashboard on port', PYTHON_PORT);
   pythonProcess = spawn('python3', ['dashboard.py', '--host', PYTHON_HOST, '--port', String(PYTHON_PORT)], {
-    env: { ...process.env, ALLOW_IFRAME: 'true' },
+    env: { ...process.env, ALLOW_IFRAME: AI_STUDIO_PREVIEW ? 'true' : 'false' },
     stdio: ['ignore', 'pipe', 'pipe']
   });
 
@@ -221,7 +222,8 @@ const server = http.createServer(async (req, res) => {
     (proxyRes) => {
       const responseHeaders = { ...proxyRes.headers };
 
-      // Ensure iframe friendly headers for AI Studio preview
+      if (AI_STUDIO_PREVIEW) {
+      // Explicit preview-only iframe transforms.
       delete responseHeaders['x-frame-options'];
 
       if (responseHeaders['content-security-policy']) {
@@ -237,6 +239,7 @@ const server = http.createServer(async (req, res) => {
         responseHeaders['set-cookie'] = cookiesList.map((c) =>
           c.replace(/SameSite=Strict/i, 'SameSite=None; Secure')
         );
+      }
       }
 
       res.writeHead(proxyRes.statusCode || 200, responseHeaders);
@@ -255,8 +258,8 @@ const server = http.createServer(async (req, res) => {
   req.pipe(proxyReq);
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[server] Operations Hub server listening on http://0.0.0.0:${PORT}`);
+server.listen(PORT, '127.0.0.1', () => {
+  console.log(`[server] Operations Hub server listening on http://127.0.0.1:${PORT}`);
 });
 
 function handleShutdown() {

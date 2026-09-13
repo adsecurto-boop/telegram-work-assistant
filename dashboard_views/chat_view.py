@@ -741,6 +741,7 @@ async function submitChatMessage() {{
   const roleKey = document.getElementById('chat-role-select').value;
   const taskMode = document.getElementById('chat-mode-select').value;
   const customPrompt = document.getElementById('custom-system-prompt').value;
+  const clientMessageId = 'web:' + crypto.randomUUID();
   const sendBtn = document.getElementById('chat-send-btn');
   const container = document.getElementById('chat-thread-container');
   const emptyPlaceholder = document.getElementById('chat-empty-placeholder');
@@ -787,6 +788,7 @@ async function submitChatMessage() {{
         role_key: roleKey,
         task_mode: taskMode,
         custom_system_instruction: customPrompt,
+        client_message_id: clientMessageId,
         csrf_token: CSRF_TOKEN
       }})
     }});
