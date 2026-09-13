@@ -812,7 +812,7 @@ async function submitChatMessage() {{
           </div>
           <div class="message-bubble-wrapper">
             <div class="message-meta-header">
-              <span class="message-sender">Gemini Assistant</span>
+              <span class="message-sender">Assistant</span>
               <div class="meta-chips-group">
                 ${{modelBadge}}
                 ${{roleBadge}}
@@ -827,7 +827,13 @@ async function submitChatMessage() {{
       `;
       container.insertAdjacentHTML('beforeend', botRowHtml);
       if (data.proposal_id) {{
-        const proposalHtml = `<div class="chat-message-row assistant-row"><div class="message-bubble-wrapper"><div class="chat-message-bubble assistant-bubble"><strong>Confirmation required</strong><br><button onclick="resolveChatProposal('${{escapeHtml(data.proposal_id)}}','confirm')">Confirm</button> <button onclick="resolveChatProposal('${{escapeHtml(data.proposal_id)}}','cancel')">Cancel</button></div></div></div>`;
+        const choices = Array.isArray(data.choices) ? data.choices : [];
+        const choiceButtons = choices.map((choice, index) =>
+          `<button onclick="resolveChatProposal('${{escapeHtml(data.proposal_id)}}','choose',${{index}})">${{escapeHtml(choice.label || `Choice ${{index + 1}}`)}}</button>`
+        ).join(' ');
+        const actionButtons = choices.length ? choiceButtons :
+          `<button onclick="resolveChatProposal('${{escapeHtml(data.proposal_id)}}','confirm')">Confirm</button>`;
+        const proposalHtml = `<div class="chat-message-row assistant-row"><div class="message-bubble-wrapper"><div class="chat-message-bubble assistant-bubble"><strong>${{choices.length ? 'Choose an option' : 'Confirmation required'}}</strong><br>${{actionButtons}} <button onclick="resolveChatProposal('${{escapeHtml(data.proposal_id)}}','cancel')">Cancel</button></div></div></div>`;
         container.insertAdjacentHTML('beforeend', proposalHtml);
       }}
       scrollToBottom();
@@ -841,8 +847,8 @@ async function submitChatMessage() {{
   }}
 }}
 
-async function resolveChatProposal(proposalId, action) {{
-  const response = await fetch('/api/chat/proposal', {{method:'POST', headers:{{'Content-Type':'application/json','X-CSRF-Token':CSRF_TOKEN}}, body:JSON.stringify({{proposal_id:proposalId, action:action, csrf_token:CSRF_TOKEN}})}});
+async function resolveChatProposal(proposalId, action, choiceIndex) {{
+  const response = await fetch('/api/chat/proposal', {{method:'POST', headers:{{'Content-Type':'application/json','X-CSRF-Token':CSRF_TOKEN}}, body:JSON.stringify({{proposal_id:proposalId, action:action, choice_index:choiceIndex, csrf_token:CSRF_TOKEN}})}});
   const data = await response.json();
   if (!data.success) alert(data.error || 'Proposal could not be completed.');
   else window.location.reload();

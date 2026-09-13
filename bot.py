@@ -74,6 +74,11 @@ async def startup(application):
     if dashboard:
         dashboard.message_service = shared_messages
         dashboard.workspace_service.mcp_manager = application.bot_data.get('mcp_manager')
+        # The dashboard never accepts OAuth material from a browser.  Workspace
+        # credentials come from the operator-managed secure credential store.
+        from credential_store import configured_secret
+        dashboard.workspace_service.credential_provider = lambda: configured_secret(
+            'GOOGLE_WORKSPACE_ACCESS_TOKEN')
 
     await application.bot.set_my_commands([
         BotCommand('shift','Start a flexible shift'), BotCommand('task','Plan a rich task'),

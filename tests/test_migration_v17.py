@@ -13,6 +13,24 @@ class MigrationV17Tests(unittest.TestCase):
             db = Database(path)
             db.record_conversation_turn(1, 'user', 'preserved')
             with sqlite3.connect(path) as conn:
+                # Rebuild this one table exactly as it existed in v16.  The
+                # rest of the database is deliberately left intact so the
+                # fixture exercises the real upgrade path rather than merely
+                # changing PRAGMA user_version on an already-v17 table.
+                conn.execute('ALTER TABLE conversation_turns RENAME TO conversation_turns_v17')
+                conn.execute('''CREATE TABLE conversation_turns (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER NOT NULL,
+                    shift_id INTEGER, role TEXT NOT NULL, text TEXT NOT NULL,
+                    intent TEXT, entities_json TEXT, case_id INTEGER, task_id INTEGER,
+                    test_session_id INTEGER, source_update_id INTEGER,
+                    correlation_id TEXT, created_at TEXT NOT NULL)''')
+                conn.execute('''INSERT INTO conversation_turns
+                    (id, owner_id, shift_id, role, text, intent, entities_json, case_id,
+                     task_id, test_session_id, source_update_id, correlation_id, created_at)
+                    SELECT id, owner_id, shift_id, role, text, intent, entities_json, case_id,
+                           task_id, test_session_id, source_update_id, correlation_id, created_at
+                    FROM conversation_turns_v17''')
+                conn.execute('DROP TABLE conversation_turns_v17')
                 conn.execute('PRAGMA user_version=16')
             upgraded = Database(path)
             self.assertEqual(SCHEMA_VERSION, 17)

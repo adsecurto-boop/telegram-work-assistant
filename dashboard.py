@@ -1798,8 +1798,46 @@ document.addEventListener('click', function(e) {{
                             self.send_json({'success': True, 'reply': 'Confirmation cancelled.'})
                             return
                         claimed = service.database.claim_nl_proposal(proposal_id, owner_id)
-                        if claimed['action_type'] != 'mcp_external_write':
-                            raise ValueError('This proposal must be completed from its originating interface.')
+                        if claimed['action_type'] == 'compound_plan':
+                            from nlp import NaturalLanguagePipeline, ConversationPlan
+                            plan = ConversationPlan.model_validate(claimed['proposal'])
+                            result = asyncio.run(NaturalLanguagePipeline(service.database).execute_plan(
+                                plan, service.database.active_shift()))
+                            service.database.finish_nl_proposal(
+                                proposal_id, 'executed' if result.success else 'failed')
+                            self.send_json({'success': result.success, 'reply': result.reply})
+                            return
+                        if claimed['action_type'] not in ('mcp_external_write', 'workspace_external_write'):
+                            # Local NLP proposals and clarifications use the same durable
+                            # proposal record as Telegram; choice indices are never trusted
+                            # beyond the persisted choice list.
+                            from nlp import NLActionExecutor, NLInterpretation, ContextResolver
+                            interpretation = NLInterpretation.model_validate(claimed['proposal'])
+                            if action == 'choose':
+                                index = json_body.get('choice_index')
+                                if not isinstance(index, int) or not 0 <= index < len(interpretation.choices):
+                                    raise ValueError('That clarification choice is no longer available.')
+                                choice = interpretation.choices[index].model_dump()
+                                if choice.get('case_id'):
+                                    interpretation.entities.case_id = choice['case_id']
+                                if choice.get('task_id'):
+                                    interpretation.entities.reference = f"#{choice['task_id']}"
+                                    interpretation = ContextResolver(service.database).resolve(interpretation)
+                                if choice.get('test_result'):
+                                    interpretation.entities.test_result = choice['test_result']
+                            elif action != 'confirm':
+                                raise ValueError('Unknown proposal action.')
+                            interpretation.needs_confirmation = False
+                            interpretation.clarification_question = None
+                            try:
+                                reply, _ = asyncio.run(NLActionExecutor(service.database).execute(
+                                    interpretation, service.database.active_shift()))
+                            except Exception:
+                                service.database.finish_nl_proposal(proposal_id, 'failed')
+                                raise
+                            service.database.finish_nl_proposal(proposal_id, 'executed')
+                            self.send_json({'success': True, 'reply': reply})
+                            return
                         payload = claimed['proposal']
                         manager = service.message_service.orchestrator.mcp_manager
                         if not manager:

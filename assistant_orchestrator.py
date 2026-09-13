@@ -164,7 +164,11 @@ class AssistantOrchestrator:
         text = user_message.strip()
 
         # 1. Fetch recent conversation turns and active external entity references
-        turns = await asyncio.to_thread(self.db.get_recent_turns, owner_id, 10)
+        # Short-term context is deliberately scoped to the active conversation.
+        # Older threads remain available only through explicit memory/search paths.
+        thread_id = await asyncio.to_thread(self.db.get_active_conversation_thread, owner_id)
+        turns = await asyncio.to_thread(self.db.get_recent_turns, owner_id, 10,
+                                        thread_id=thread_id)
         active_refs = self._extract_active_external_refs(turns)
 
         # 2. Check if external integration tool call is needed
