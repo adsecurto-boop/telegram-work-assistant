@@ -80,6 +80,7 @@ def render_chat_view(
     current_role: str = "general_assistant",
     current_mode: str = "auto",
     custom_system_instruction: str = "",
+    csrf_token: str = "",
 ) -> str:
     """Render the full Chat View HTML for dashboard."""
     role_options_html = []
@@ -676,6 +677,7 @@ def render_chat_view(
 </style>
 
 <script>
+const CSRF_TOKEN = '{csrf_token}';
 const ROLES_INFO = {json.dumps(ROLE_DEFINITIONS)};
 const MODELS_INFO = {{
   'complex': '{MODEL_COMPLEX}',
@@ -778,12 +780,14 @@ async function submitChatMessage() {{
       method: 'POST',
       headers: {{
         'Content-Type': 'application/json',
+        'X-CSRF-Token': CSRF_TOKEN
       }},
       body: JSON.stringify({{
         message: messageText,
         role_key: roleKey,
         task_mode: taskMode,
-        custom_system_instruction: customPrompt
+        custom_system_instruction: customPrompt,
+        csrf_token: CSRF_TOKEN
       }})
     }});
 
@@ -831,7 +835,14 @@ async function submitChatMessage() {{
 async function clearChatHistory() {{
   if (!confirm('Are you sure you want to clear the conversation thread?')) return;
   try {{
-    const res = await fetch('/api/chat/clear', {{ method: 'POST' }});
+    const res = await fetch('/api/chat/clear', {{
+      method: 'POST',
+      headers: {{
+        'Content-Type': 'application/json',
+        'X-CSRF-Token': CSRF_TOKEN
+      }},
+      body: JSON.stringify({{ csrf_token: CSRF_TOKEN }})
+    }});
     const data = await res.json();
     if (data.success) {{
       window.location.reload();

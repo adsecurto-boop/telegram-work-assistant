@@ -23,12 +23,79 @@ from database import Database, now_iso
 from memory_service import build_assistant_context, format_context_for_prompt
 from telegram_import import redact
 
+import urllib.request
+
 logger = logging.getLogger("gemini_chat_service")
 
 # Model definitions per requirements
 MODEL_COMPLEX = "gemini-3.1-pro-preview"
 MODEL_GENERAL = "gemini-3.5-flash"
 MODEL_FAST = "gemini-3.1-flash-lite"
+
+
+def _call_gemini_rest(
+    api_key: str,
+    model_name: str,
+    contents: List[Dict[str, Any]],
+    system_instruction: Optional[str] = None,
+    temperature: float = 0.7,
+    max_tokens: int = 3000
+) -> Tuple[str, str]:
+    """Execute Gemini REST API call with fallback model candidates."""
+    models_to_try = [model_name]
+    if "flash" in model_name:
+        models_to_try.extend(["gemini-3.5-flash", "gemini-3-flash-preview", "gemini-flash-latest", "gemini-3.1-flash-lite"])
+    elif "pro" in model_name:
+        models_to_try.extend(["gemini-3.1-pro-preview", "gemini-3-flash-preview", "gemini-flash-latest"])
+    else:
+        models_to_try.extend(["gemini-flash-latest", "gemini-3.1-flash-lite"])
+
+    unique_models = []
+    for m in models_to_try:
+        if m not in unique_models:
+            unique_models.append(m)
+
+    payload: Dict[str, Any] = {
+        "contents": contents,
+        "generationConfig": {
+            "temperature": temperature,
+            "maxOutputTokens": max_tokens
+        }
+    }
+    if system_instruction:
+        payload["systemInstruction"] = {
+            "parts": [{"text": system_instruction}]
+        }
+
+    data_bytes = json.dumps(payload).encode("utf-8")
+    last_err = None
+
+    for m in unique_models:
+        model_path = m if m.startswith("models/") else f"models/{m}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/{model_path}:generateContent?key={api_key}"
+        req = urllib.request.Request(
+            url,
+            data=data_bytes,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "aistudio-build"
+            }
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                res_data = json.loads(resp.read().decode("utf-8"))
+                candidates = res_data.get("candidates", [])
+                if candidates and "content" in candidates[0]:
+                    parts = candidates[0]["content"].get("parts", [])
+                    text = "".join(p.get("text", "") for p in parts if "text" in p).strip()
+                    if text:
+                        return text, m
+        except Exception as e:
+            logger.warning("Gemini REST API call to %s failed: %s", m, e)
+            last_err = e
+
+    raise last_err or Exception("All Gemini model endpoints failed")
+
 
 ROUTING_MODES = {
     "auto": "Auto-Detect Complexity",
@@ -154,23 +221,29 @@ def select_model(task_mode: str, message: str) -> Tuple[str, str]:
 class GeminiChatService:
     def __init__(self, db: Database):
         self.db = db
-        self.api_key = os.environ.get("GEMINI_API_KEY", "") or getattr(config, "GEMINI_API_KEY", "")
+
+    def _get_api_key(self) -> str:
+        key = os.environ.get("GEMINI_API_KEY", "") or getattr(config, "GEMINI_API_KEY", "")
+        if not key:
+            key = self.db.get_setting("gemini_api_key") or ""
+        return key.strip()
 
     def _get_client(self):
-        if not self.api_key:
+        api_key = self._get_api_key()
+        if not api_key:
             return None
         try:
             from google import genai
             from google.genai import types
             return genai.Client(
-                api_key=self.api_key,
+                api_key=api_key,
                 http_options=types.HttpOptions(
                     timeout=45000,
                     headers={"User-Agent": "aistudio-build"}
                 )
             )
         except Exception as e:
-            logger.error("Failed to initialize Google GenAI Client: %s", e)
+            logger.warning("Google GenAI Client SDK unavailable: %s", e)
             return None
 
     def get_conversation_history(self, owner_id: int = 1, limit: int = 50) -> List[Dict[str, Any]]:
@@ -222,7 +295,7 @@ class GeminiChatService:
         1. Selects the appropriate Gemini model (pro / flash / flash-lite).
         2. Retrieves and bounds conversation history.
         3. Injects live workspace context (shifts, cases, tasks, test sessions).
-        4. Calls Gemini via @google/genai SDK.
+        4. Calls Gemini via SDK or REST API fallback.
         5. Saves user and assistant turns into conversation_turns.
         """
         clean_user_message = redact(message.strip())
@@ -258,7 +331,7 @@ class GeminiChatService:
             f"- Maintain awareness of past turns in this conversation."
         )
 
-        # 3. Retrieve recent history for multi-turn thread
+        # 3. Retrieve recent history BEFORE saving current turn
         past_turns = self.get_conversation_history(owner_id=owner_id, limit=20)
         
         # 4. Save User Turn to Database
@@ -274,13 +347,37 @@ class GeminiChatService:
             }
         )
 
-        # 5. Call Gemini
-        client = self._get_client()
+        # 5. Build alternating contents array
+        formatted_contents: List[Dict[str, Any]] = []
+        for pt in past_turns[-10:]:
+            r = pt.get("role")
+            t = pt.get("text", "")
+            if not t or r not in ("user", "assistant", "model"):
+                continue
+            genai_role = "user" if r == "user" else "model"
+            if formatted_contents and formatted_contents[-1]["role"] == genai_role:
+                formatted_contents[-1]["parts"][0]["text"] += f"\n\n{t}"
+            else:
+                formatted_contents.append({
+                    "role": genai_role,
+                    "parts": [{"text": t}]
+                })
+
+        if formatted_contents and formatted_contents[-1]["role"] == "user":
+            formatted_contents[-1]["parts"][0]["text"] += f"\n\n{clean_user_message}"
+        else:
+            formatted_contents.append({
+                "role": "user",
+                "parts": [{"text": clean_user_message}]
+            })
+
+        # 6. Call Gemini API
+        api_key = self._get_api_key()
         assistant_reply = ""
         error_msg = None
+        used_model = model_name
 
-        if not client:
-            # Deterministic Fallback if API key not available
+        if not api_key:
             assistant_reply = (
                 f"**[Offline Assistant Mode - {role_info['title']}]**\n\n"
                 f"I received your message: *\"{clean_user_message}\"*\n\n"
@@ -289,50 +386,46 @@ class GeminiChatService:
             )
         else:
             try:
-                from google.genai import types
-
-                # Build multi-turn content parts
-                contents = []
-                # Add past turns (up to 12 turns)
-                for pt in past_turns[-12:]:
-                    r = pt.get("role")
-                    t = pt.get("text", "")
-                    if not t or r == "system":
-                        continue
-                    genai_role = "user" if r == "user" else "model"
-                    contents.append(
-                        types.Content(
-                            role=genai_role,
-                            parts=[types.Part.from_text(text=t)]
+                client = self._get_client()
+                if client:
+                    try:
+                        from google.genai import types
+                        genai_contents = []
+                        for item in formatted_contents:
+                            genai_contents.append(
+                                types.Content(
+                                    role=item["role"],
+                                    parts=[types.Part.from_text(text=item["parts"][0]["text"])]
+                                )
+                            )
+                        config_obj = types.GenerateContentConfig(
+                            system_instruction=full_system_instruction,
+                            temperature=0.4 if task_mode == "complex" else 0.7,
+                            max_output_tokens=3000,
                         )
+                        response = await client.aio.models.generate_content(
+                            model=model_name,
+                            contents=genai_contents,
+                            config=config_obj
+                        )
+                        if response and response.text:
+                            assistant_reply = response.text.strip()
+                    except Exception as sdk_err:
+                        logger.warning("SDK call failed, using REST API fallback: %s", sdk_err)
+                        client = None
+
+                if not client or not assistant_reply:
+                    loop = asyncio.get_running_loop()
+                    assistant_reply, used_model = await loop.run_in_executor(
+                        None,
+                        _call_gemini_rest,
+                        api_key,
+                        model_name,
+                        formatted_contents,
+                        full_system_instruction,
+                        0.4 if task_mode == "complex" else 0.7,
+                        3000
                     )
-
-                # Add current user message
-                contents.append(
-                    types.Content(
-                        role="user",
-                        parts=[types.Part.from_text(text=clean_user_message)]
-                    )
-                )
-
-                config_obj = types.GenerateContentConfig(
-                    system_instruction=full_system_instruction,
-                    temperature=0.4 if task_mode == "complex" else 0.7,
-                    max_output_tokens=3000,
-                )
-
-                # Execute call
-                response = await client.aio.models.generate_content(
-                    model=model_name,
-                    contents=contents,
-                    config=config_obj
-                )
-
-                if response and response.text:
-                    assistant_reply = response.text.strip()
-                else:
-                    assistant_reply = "I processed your request, but the model did not produce a text response."
-
             except Exception as e:
                 logger.error("Gemini API call failed: %s", e)
                 error_msg = str(e)
@@ -342,7 +435,7 @@ class GeminiChatService:
                     f"Your message has been stored in conversation history. Please try again or switch to another model."
                 )
 
-        # 6. Save Assistant Turn to Database
+        # 7. Save Assistant Turn to Database
         assistant_turn_id = self.db.record_conversation_turn(
             owner_id=owner_id,
             role="assistant",
@@ -350,7 +443,7 @@ class GeminiChatService:
             intent=f"chat_reply_{role_key}",
             metadata={
                 "role_key": role_key,
-                "model_used": model_name,
+                "model_used": used_model,
                 "detected_mode": detected_mode,
                 "user_turn_id": user_turn_id,
                 "error": error_msg,
@@ -362,7 +455,7 @@ class GeminiChatService:
             "user_turn_id": user_turn_id,
             "assistant_turn_id": assistant_turn_id,
             "reply": assistant_reply,
-            "model_used": model_name,
+            "model_used": used_model,
             "detected_mode": detected_mode,
             "role_key": role_key,
             "role_title": role_info["title"],

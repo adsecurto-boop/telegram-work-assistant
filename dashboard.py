@@ -253,7 +253,7 @@ class DashboardService:
                 )
                 self.send_header('Content-Security-Policy', csp)
                 if set_sid:
-                    self.send_header('Set-Cookie', f'dashboard_session={set_sid}; Path=/; HttpOnly; SameSite=Strict')
+                    self.send_header('Set-Cookie', f'dashboard_session={set_sid}; Path=/; HttpOnly; SameSite=Lax')
                 self.end_headers()
                 self.wfile.write(content)
 
@@ -1544,7 +1544,7 @@ document.addEventListener('click', function(e) {{
 
                     self.send_response(303)
                     self.send_header('Location', redirect_path)
-                    self.send_header('Set-Cookie', f'dashboard_session={set_sid}; Path=/; HttpOnly; SameSite=Strict')
+                    self.send_header('Set-Cookie', f'dashboard_session={set_sid}; Path=/; HttpOnly; SameSite=Lax')
                     self.send_header('Cache-Control', 'no-store')
                     self.end_headers()
                     return
@@ -1705,7 +1705,8 @@ document.addEventListener('click', function(e) {{
                     content = render_chat_view(
                         conversation_turns=turns,
                         current_role=(params.get('role') or ['general_assistant'])[0],
-                        current_mode=(params.get('mode') or ['auto'])[0]
+                        current_mode=(params.get('mode') or ['auto'])[0],
+                        csrf_token=csrf_token
                     )
 
                 elif route == '/api/chat/history':

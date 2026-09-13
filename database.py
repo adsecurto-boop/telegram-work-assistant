@@ -1055,12 +1055,21 @@ class Database:
 
     def get_setting(self, key):
         with self.connect() as connection:
-            row = connection.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
-            return row[0] if row else None
+            try:
+                row = connection.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
+                return row[0] if row else None
+            except sqlite3.OperationalError:
+                connection.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+                row = connection.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
+                return row[0] if row else None
 
     def set_setting(self, key, value):
         with self.connect() as connection:
-            connection.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', (key, str(value)))
+            try:
+                connection.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', (key, str(value)))
+            except sqlite3.OperationalError:
+                connection.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+                connection.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', (key, str(value)))
 
     def active_shift(self):
         with self.connect() as connection:

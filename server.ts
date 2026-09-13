@@ -37,7 +37,7 @@ let isPythonReady = false;
 function getDbToken(): string {
   try {
     const out = execSync(
-      `python3 -c "import sqlite3; conn = sqlite3.connect('storage/work.sqlite3'); cur = conn.cursor(); cur.execute('SELECT value FROM settings WHERE key=\\'dashboard_token\\''); row = cur.fetchone(); print(row[0] if row else '')"`,
+      `python3 -c "from database import Database; import config; db = Database(config.DB_PATH); print(db.get_setting('dashboard_token') or '')"`,
       { encoding: 'utf-8', timeout: 3000 }
     ).trim();
     return out;
