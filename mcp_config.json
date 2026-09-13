@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "github": {
-      "enabled": false,
+      "enabled": true,
       "transport": "streamable_http",
       "url": "https://api.githubcopilot.com/mcp/",
       "trusted_endpoint": "https://api.githubcopilot.com/mcp/",
