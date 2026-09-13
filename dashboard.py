@@ -1789,6 +1789,50 @@ document.addEventListener('click', function(e) {{
                         self.send_json({'success': ok})
                         return
 
+                    elif parsed.path == '/api/chat/proposal':
+                        proposal_id = json_body.get('proposal_id')
+                        action = json_body.get('action')
+                        owner_id = config.OWNER_ID or 1
+                        if action == 'cancel':
+                            service.database.cancel_nl_proposal(proposal_id, owner_id)
+                            self.send_json({'success': True, 'reply': 'Confirmation cancelled.'})
+                            return
+                        claimed = service.database.claim_nl_proposal(proposal_id, owner_id)
+                        if claimed['action_type'] != 'mcp_external_write':
+                            raise ValueError('This proposal must be completed from its originating interface.')
+                        payload = claimed['proposal']
+                        manager = service.message_service.orchestrator.mcp_manager
+                        if not manager:
+                            raise ValueError('MCP integration is unavailable.')
+                        tool = payload.get('gemini_name') or payload.get('tool_id')
+                        args = payload.get('arguments', {})
+                        desc = manager.validate_tool_call(tool, args)
+                        from mcp_policy import ToolPolicy, PolicyDecision
+                        from mcp_registry import effective_risk_for_call, required_capabilities_for_call
+                        if ToolPolicy.evaluate(desc, args).decision != PolicyDecision.CONFIRMATION_REQUIRED:
+                            raise ValueError('Proposal policy changed; create a new proposal.')
+                        required = sorted(required_capabilities_for_call(desc, args))
+                        if required != sorted(payload.get('required_capabilities') or []):
+                            raise ValueError('Proposal capability semantics changed; create a new proposal.')
+                        if not set(required) <= set(payload.get('authorization_family') or []):
+                            raise ValueError('Proposal authority no longer covers this exact operation.')
+                        actual_hash = hashlib.sha256(json.dumps(args, sort_keys=True, default=str).encode()).hexdigest()
+                        if payload.get('arguments_hash') != actual_hash:
+                            raise ValueError('Proposal arguments changed; create a new proposal.')
+                        if payload.get('risk_level') != effective_risk_for_call(desc, args).value:
+                            raise ValueError('Proposal risk classification changed; create a new proposal.')
+                        result = asyncio.run(manager.call_tool(tool, args))
+                        service.database.record_external_write_audit(proposal_id, owner_id, {
+                            'server': desc.server_name, 'canonical_tool_id': desc.canonical_id,
+                            'arguments_hash': hashlib.sha256(json.dumps(args, sort_keys=True, default=str).encode()).hexdigest(),
+                            'risk': effective_risk_for_call(desc, args).value,
+                            'authorization_family': payload.get('authorization_family', []),
+                            'required_capabilities': required, 'execution_timestamp': datetime.now(timezone.utc).isoformat(),
+                            'status': 'success' if result.success else 'failed'})
+                        service.database.finish_nl_proposal(proposal_id, 'executed' if result.success else 'failed')
+                        self.send_json({'success': result.success, 'reply': result.text if result.success else result.error})
+                        return
+
                     # 0A. WORKSPACE SERVER-SIDE MUTATIONS (PROPOSE & EXECUTE)
                     elif parsed.path == '/workspace/action/propose':
                         act = json_body.get('action') or (form.get('action') or [''])[0]
@@ -1804,15 +1848,10 @@ document.addEventListener('click', function(e) {{
 
                     elif parsed.path == '/workspace/action/execute':
                         proposal_id = json_body.get('proposal_id') or (form.get('proposal_id') or [''])[0]
-                        auth_hdr = self.headers.get('Authorization', '')
-                        tok = ''
-                        if auth_hdr.startswith('Bearer '):
-                            tok = auth_hdr[7:].strip()
-                        if not tok:
-                            tok = json_body.get('google_access_token') or (form.get('google_access_token') or [''])[0]
+                        if json_body.get('google_access_token') or self.headers.get('Authorization'):
+                            raise WorkspaceActionError('Browser-supplied OAuth tokens are not accepted.')
                         result = service.workspace_service.execute_action(
                             proposal_id=proposal_id,
-                            google_access_token=tok,
                             actor='dashboard',
                             owner_id=config.OWNER_ID or None
                         )

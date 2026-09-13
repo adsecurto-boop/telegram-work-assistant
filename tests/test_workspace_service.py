@@ -49,6 +49,11 @@ class WorkspaceActionServiceTests(unittest.TestCase):
         with self.assertRaises(WorkspaceActionError):
             self.service.propose_action('owner', 'invalid_action', {})
 
+    def test_execution_requires_connector_managed_credential(self):
+        proposal = self.service.propose_action('owner', 'tasks_create', {'title': 'No token'})
+        with self.assertRaises(WorkspaceActionError):
+            self.service.execute_action(proposal['proposal_id'])
+
     def test_propose_tasks_create(self):
         proposal = self.service.propose_action('owner', 'tasks_create', {
             'list_id': '@default',
@@ -121,6 +126,17 @@ class WorkspaceActionServiceTests(unittest.TestCase):
         with self.db.connect() as conn:
             recent_audit = [dict(r) for r in conn.execute('SELECT * FROM audit_log ORDER BY id DESC LIMIT 10').fetchall()]
         self.assertTrue(any(e['operation_type'] == 'confirmed_external_write' and 'drive_delete_file' in (e['after_state_json'] or '') for e in recent_audit))
+
+    @patch('urllib.request.urlopen')
+    def test_proposal_survives_service_restart(self, mock_urlopen):
+        response = MagicMock()
+        response.read.return_value = b''
+        response.status = 204
+        cm = MagicMock(); cm.__enter__.return_value = response
+        mock_urlopen.return_value = cm
+        proposal = self.service.propose_action('owner', 'drive_delete_file', {'file_id': 'restart-file'})
+        restarted = WorkspaceActionService(self.db)
+        self.assertTrue(restarted.execute_action(proposal['proposal_id'], 'mock_access_token_abc')['success'])
 
 
 if __name__ == '__main__':

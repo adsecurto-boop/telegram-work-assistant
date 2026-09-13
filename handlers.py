@@ -263,21 +263,11 @@ async def save_plain_message(update, context, text):
                         'Finalize EOD & close shift', callback_data=f'close:{report_id}')]]))
         return
 
-    # Production Assistant Orchestrator & Durable Conversation Memory
+    # Shared message adapter: Telegram and web use the same orchestration and memory path.
+    from application.message_service import AssistantMessageService
     from nlp import GeminiNLParser
-    from assistant_orchestrator import AssistantOrchestrator
+    from types import SimpleNamespace
     database = db(context)
-    shift = await asyncio.to_thread(database.active_shift)
-
-    # 1. Record USER turn before processing
-    await asyncio.to_thread(
-        database.record_conversation_turn,
-        config.OWNER_ID,
-        'user',
-        text,
-        shift_id=shift['id'] if shift else None,
-        source_update_id=update.update_id
-    )
 
     ai_client = None
     if config.AI_KEY and config.AI_MODEL:
@@ -285,27 +275,16 @@ async def save_plain_message(update, context, text):
 
     mcp_mgr = context.application.bot_data.get('mcp_manager') if context and hasattr(context, 'application') and hasattr(context.application, 'bot_data') else None
     tool_model = context.application.bot_data.get('gemini_tool_model') if context and hasattr(context, 'application') and hasattr(context.application, 'bot_data') else None
-    orchestrator = AssistantOrchestrator(
-        database, mcp_manager=mcp_mgr, ai_client=ai_client, tool_model=tool_model)
-
-    orch_res = await orchestrator.route_and_process(text, owner_id=config.OWNER_ID, source_update_id=update.update_id)
-
-    # 2. Record ASSISTANT turn after processing
-    meta = {}
-    if orch_res.agent_run_id:
-        meta['agent_run_id'] = orch_res.agent_run_id
-    if orch_res.active_external_refs:
-        meta['active_external_refs'] = orch_res.active_external_refs
-
-    await asyncio.to_thread(
-        database.record_conversation_turn,
-        config.OWNER_ID,
-        'assistant',
-        orch_res.reply_text,
-        shift_id=shift['id'] if shift else None,
-        source_update_id=update.update_id,
-        metadata=meta
-    )
+    message_service = context.application.bot_data.get('assistant_message_service')
+    if message_service is None:
+        message_service = AssistantMessageService(database, mcp_manager=mcp_mgr, ai_client=ai_client, tool_model=tool_model)
+        context.application.bot_data['assistant_message_service'] = message_service
+    else:
+        message_service.configure_runtime(mcp_manager=mcp_mgr, ai_client=ai_client, tool_model=tool_model)
+    result = await message_service.process_user_message(owner_id=config.OWNER_ID, text=text,
+        source_channel='telegram', source_message_id=str(update.update_id))
+    orch_res = SimpleNamespace(reply_text=result['reply'], proposal_id=result['proposal_id'],
+                                choices=result['choices'])
 
     markup = MENU
     if orch_res.proposal_id:

@@ -445,6 +445,10 @@ class Database:
                 client_message_id TEXT,
                 correlation_id TEXT,
                 created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS conversation_threads (
+                id TEXT PRIMARY KEY, owner_id INTEGER NOT NULL, title TEXT,
+                status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL, archived_at TEXT);
             CREATE TABLE IF NOT EXISTS assistant_memory_summaries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 owner_id INTEGER NOT NULL,
@@ -802,6 +806,10 @@ class Database:
         pass
 
     def _seed_v17_defaults(self, connection):
+        connection.execute('''CREATE TABLE IF NOT EXISTS conversation_threads (
+            id TEXT PRIMARY KEY, owner_id INTEGER NOT NULL, title TEXT,
+            status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL, archived_at TEXT)''')
         connection.execute('CREATE INDEX IF NOT EXISTS conversation_turns_thread_idx ON conversation_turns(owner_id, thread_id, created_at)')
         connection.execute('CREATE UNIQUE INDEX IF NOT EXISTS conversation_turns_web_idempotency_idx ON conversation_turns(owner_id, client_message_id, role) WHERE client_message_id IS NOT NULL')
 
@@ -3629,14 +3637,40 @@ class Database:
                  case_id, task_id, test_session_id, source_update_id, thread_id,
                  source_channel, source_message_id, client_message_id, correlation_id, stamp)).lastrowid
 
+    def get_active_conversation_thread(self, owner_id: int) -> str:
+        key = f'conversation_thread:{owner_id}'
+        thread_id = self.get_setting(key) or 'primary'
+        stamp = now_iso()
+        with self.connect() as connection:
+            connection.execute('''INSERT OR IGNORE INTO conversation_threads
+                (id, owner_id, title, status, created_at, updated_at) VALUES (?,?,?, 'active', ?, ?)''',
+                (thread_id, owner_id, 'Primary conversation', stamp, stamp))
+        return thread_id
+
+    def start_new_conversation_thread(self, owner_id: int) -> str:
+        previous = self.get_active_conversation_thread(owner_id)
+        thread_id = f'thread:{uuid.uuid4().hex}'
+        stamp = now_iso()
+        with self.connect() as connection:
+            connection.execute("UPDATE conversation_threads SET status='archived', archived_at=?, updated_at=? WHERE id=? AND owner_id=?",
+                               (stamp, stamp, previous, owner_id))
+            connection.execute('''INSERT INTO conversation_threads
+                (id, owner_id, title, status, created_at, updated_at) VALUES (?,?,?, 'active', ?, ?)''',
+                (thread_id, owner_id, 'New conversation', stamp, stamp))
+        self.set_setting(f'conversation_thread:{owner_id}', thread_id)
+        return thread_id
+
     def get_recent_turns(self, owner_id: int, limit: int = 20,
-                         shift_id: int | None = None) -> list[dict]:
+                         shift_id: int | None = None, thread_id: str | None = None) -> list[dict]:
         """Retrieve recent conversation turns in chronological order (oldest to newest)."""
         query = 'SELECT * FROM conversation_turns WHERE owner_id=?'
         params: list = [owner_id]
         if shift_id is not None:
             query += ' AND shift_id=?'
             params.append(shift_id)
+        if thread_id is not None:
+            query += ' AND thread_id=?'
+            params.append(thread_id)
         query += ' ORDER BY id DESC LIMIT ?'
         params.append(limit)
         with self.connect() as connection:

@@ -249,7 +249,8 @@ class GeminiChatService:
     def get_conversation_history(self, owner_id: int = 1, limit: int = 50) -> List[Dict[str, Any]]:
         """Retrieve recent conversation turns from SQLite database."""
         try:
-            turns = self.db.get_recent_turns(owner_id=owner_id, limit=limit)
+            turns = self.db.get_recent_turns(owner_id=owner_id, limit=limit,
+                                             thread_id=self.db.get_active_conversation_thread(owner_id))
             results = []
             for t in turns:
                 meta = {}
@@ -265,6 +266,7 @@ class GeminiChatService:
                     "intent": t.get("intent"),
                     "created_at": t.get("created_at"),
                     "metadata": meta,
+                    "source_channel": t.get("source_channel", "system"),
                 })
             return results
         except Exception as e:
@@ -274,7 +276,7 @@ class GeminiChatService:
     def clear_conversation_history(self, owner_id: int = 1) -> bool:
         """Start a fresh UI thread without destroying durable shared history."""
         try:
-            self.db.set_setting(f'conversation_thread:{owner_id}', 'primary')
+            self.db.start_new_conversation_thread(owner_id)
             return True
         except Exception as e:
             logger.error("Failed to clear conversation history: %s", e)

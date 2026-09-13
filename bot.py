@@ -60,6 +60,21 @@ async def startup(application):
         except Exception as exc:
             logging.getLogger(__name__).warning('Gemini tool model unavailable: %s', type(exc).__name__)
 
+    # One configured assistant runtime is shared by Telegram and the dashboard.
+    from application.message_service import AssistantMessageService
+    ai_client = None
+    if config.AI_KEY and config.AI_MODEL:
+        from nlp import GeminiNLParser
+        ai_client = GeminiNLParser(config.AI_KEY, config.AI_MODEL, config.AI_FALLBACK_MODEL)
+    shared_messages = AssistantMessageService(application.bot_data['db'],
+        mcp_manager=application.bot_data.get('mcp_manager'), ai_client=ai_client,
+        tool_model=application.bot_data.get('gemini_tool_model'))
+    application.bot_data['assistant_message_service'] = shared_messages
+    dashboard = application.bot_data.get('dashboard')
+    if dashboard:
+        dashboard.message_service = shared_messages
+        dashboard.workspace_service.mcp_manager = application.bot_data.get('mcp_manager')
+
     await application.bot.set_my_commands([
         BotCommand('shift','Start a flexible shift'), BotCommand('task','Plan a rich task'),
         BotCommand('briefing','Morning work briefing'), BotCommand('integrations','MCP tool status'),

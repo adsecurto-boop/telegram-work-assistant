@@ -75,7 +75,7 @@ async function ensurePythonDashboard() {
   if (open) {
     console.log(`[server] Port ${PYTHON_PORT} is already open, reusing existing service`);
     isPythonReady = true;
-    if (!dashboardToken) {
+    if (AI_STUDIO_PREVIEW && !dashboardToken) {
       dashboardToken = getDbToken();
     }
     return;
@@ -92,7 +92,7 @@ async function ensurePythonDashboard() {
     process.stdout.write(`[python] ${text}`);
     const match = text.match(/DASHBOARD_TOKEN=([^\s]+)/);
     if (match) {
-      dashboardToken = match[1];
+      if (AI_STUDIO_PREVIEW) dashboardToken = match[1];
       isPythonReady = true;
     }
     if (text.includes('Dashboard running on')) {
@@ -115,7 +115,7 @@ async function ensurePythonDashboard() {
     await new Promise((r) => setTimeout(r, 200));
     if (await checkPortOpen(PYTHON_PORT, PYTHON_HOST)) {
       isPythonReady = true;
-      if (!dashboardToken) {
+      if (AI_STUDIO_PREVIEW && !dashboardToken) {
         dashboardToken = getDbToken();
       }
       break;
@@ -164,7 +164,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (!dashboardToken) {
+  if (AI_STUDIO_PREVIEW && !dashboardToken) {
     dashboardToken = getDbToken();
   }
 
@@ -174,7 +174,7 @@ const server = http.createServer(async (req, res) => {
       const open = await checkPortOpen(PYTHON_PORT, PYTHON_HOST);
       if (open) {
         isPythonReady = true;
-        if (!dashboardToken) {
+        if (AI_STUDIO_PREVIEW && !dashboardToken) {
           dashboardToken = getDbToken();
         }
         break;
@@ -207,7 +207,7 @@ const server = http.createServer(async (req, res) => {
   proxyHeaders.host = `${PYTHON_HOST}:${PYTHON_PORT}`;
 
   const cookies = req.headers.cookie || '';
-  if (dashboardToken) {
+  if (AI_STUDIO_PREVIEW && dashboardToken) {
     proxyHeaders['x-dashboard-token'] = dashboardToken;
   }
 

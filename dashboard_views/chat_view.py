@@ -133,6 +133,7 @@ def render_chat_view(
             meta = t.get("metadata", {})
             model_tag = meta.get("model") or meta.get("model_used") or ""
             role_tag = meta.get("role_key") or ""
+            channel_tag = t.get("source_channel", "system").title()
             
             is_user = role == "user"
             bubble_class = "user-bubble" if is_user else "assistant-bubble"
@@ -148,6 +149,8 @@ def render_chat_view(
             if role_tag:
                 r_title = ROLE_DEFINITIONS.get(role_tag, {}).get("title", role_tag)
                 meta_chips.append(f'<span class="role-badge">{h(r_title)}</span>')
+            if channel_tag != 'System':
+                meta_chips.append(f'<span class="role-badge">{h(channel_tag)}</span>')
 
             formatted_body = format_message_text(text)
 
@@ -774,7 +777,7 @@ async function submitChatMessage() {{
   // Show typing indicator
   sendBtn.disabled = true;
   typingIndicator.style.display = 'flex';
-  document.getElementById('typing-status-text').innerText = 'Gemini (' + (MODELS_INFO[taskMode] || 'AI') + ') is reasoning...';
+  document.getElementById('typing-status-text').innerText = 'Assistant is processing your request...';
 
   try {{
     const response = await fetch('/api/chat', {{
@@ -823,6 +826,10 @@ async function submitChatMessage() {{
         </div>
       `;
       container.insertAdjacentHTML('beforeend', botRowHtml);
+      if (data.proposal_id) {{
+        const proposalHtml = `<div class="chat-message-row assistant-row"><div class="message-bubble-wrapper"><div class="chat-message-bubble assistant-bubble"><strong>Confirmation required</strong><br><button onclick="resolveChatProposal('${{escapeHtml(data.proposal_id)}}','confirm')">Confirm</button> <button onclick="resolveChatProposal('${{escapeHtml(data.proposal_id)}}','cancel')">Cancel</button></div></div></div>`;
+        container.insertAdjacentHTML('beforeend', proposalHtml);
+      }}
       scrollToBottom();
     }} else {{
       alert('Chat error: ' + (data.error || 'Failed to process message'));
@@ -832,6 +839,13 @@ async function submitChatMessage() {{
     sendBtn.disabled = false;
     alert('Network or server error: ' + err.message);
   }}
+}}
+
+async function resolveChatProposal(proposalId, action) {{
+  const response = await fetch('/api/chat/proposal', {{method:'POST', headers:{{'Content-Type':'application/json','X-CSRF-Token':CSRF_TOKEN}}, body:JSON.stringify({{proposal_id:proposalId, action:action, csrf_token:CSRF_TOKEN}})}});
+  const data = await response.json();
+  if (!data.success) alert(data.error || 'Proposal could not be completed.');
+  else window.location.reload();
 }}
 
 async function clearChatHistory() {{

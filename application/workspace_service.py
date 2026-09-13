@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from mcp_registry import RiskLevel
+import config
 
 logger = logging.getLogger("workspace_service")
 
@@ -27,23 +28,15 @@ class WorkspaceActionError(Exception):
 
 
 class WorkspaceActionService:
-    def __init__(self, db, mcp_manager=None):
+    def __init__(self, db, mcp_manager=None, credential_provider=None):
         self.db = db
         self.mcp_manager = mcp_manager
-        self._proposals: Dict[str, Dict[str, Any]] = {}
-
-    def _cleanup_expired_proposals(self):
-        now = time.time()
-        expired = [pid for pid, p in self._proposals.items() if now - p['timestamp'] > PROPOSAL_TTL_SECONDS]
-        for pid in expired:
-            self._proposals.pop(pid, None)
+        self.credential_provider = credential_provider
 
     def propose_action(self, actor: str, action: str, args: Dict[str, Any]) -> Dict[str, Any]:
         """
         Validate, classify risk, compute argument hash, and return an actionable proposal.
         """
-        self._cleanup_expired_proposals()
-
         allowed_actions = {
             'sheets_export',
             'tasks_create',
@@ -111,19 +104,18 @@ class WorkspaceActionService:
             description = f"Execute {action} with {len(args)} parameters."
 
         proposal_id = str(uuid.uuid4())
-        self._proposals[proposal_id] = {
+        payload = {
             'proposal_id': proposal_id,
             'actor': actor,
             'action': action,
             'args': args,
             'args_hash': args_hash,
-            'risk_level': risk,
+            'risk_level': risk.name,
             'required_capabilities': req_caps,
             'title': title,
             'description': description,
-            'timestamp': time.time(),
-            'consumed': False,
         }
+        self.db.create_proposal(proposal_id, config.OWNER_ID or 1, 'workspace_external_write', payload)
 
         return {
             'proposal_id': proposal_id,
@@ -139,7 +131,7 @@ class WorkspaceActionService:
     def execute_action(
         self,
         proposal_id: str,
-        google_access_token: str,
+        google_access_token: Optional[str] = None,
         actor: str = 'owner',
         owner_id: Optional[int] = None
     ) -> Dict[str, Any]:
@@ -147,25 +139,23 @@ class WorkspaceActionService:
         Execute an approved proposal via server-side Google REST APIs,
         protecting against replay and argument tampering, and logging audit without tokens.
         """
-        self._cleanup_expired_proposals()
+        try:
+            claimed = self.db.claim_nl_proposal(proposal_id, owner_id or (config.OWNER_ID or 1))
+        except ValueError as exc:
+            raise WorkspaceActionError(str(exc)) from exc
+        if claimed['action_type'] != 'workspace_external_write':
+            raise WorkspaceActionError('Proposal is not a Workspace action.')
+        proposal = claimed['proposal']
 
-        proposal = self._proposals.get(proposal_id)
-        if not proposal:
-            raise WorkspaceActionError("Proposal not found or expired. Please initiate the action again.")
-
-        if proposal['consumed']:
-            raise WorkspaceActionError("Proposal has already been executed. Replay rejected.")
-
+        if google_access_token is None and self.credential_provider:
+            google_access_token = self.credential_provider()
         if not google_access_token or not isinstance(google_access_token, str) or len(google_access_token) < 10:
-            raise WorkspaceActionError("Valid Google OAuth access token is required for external execution.")
-
-        # Mark consumed immediately to prevent replay
-        proposal['consumed'] = True
+            raise WorkspaceActionError("A connector-managed Google credential is required for external execution.")
 
         action = proposal['action']
         args = proposal['args']
         args_hash = proposal['args_hash']
-        risk_level = proposal['risk_level']
+        risk_level = RiskLevel[proposal['risk_level']]
         req_caps = proposal['required_capabilities']
 
         audit_meta = {
@@ -182,6 +172,7 @@ class WorkspaceActionService:
             result_data = self._dispatch_google_api(action, args, google_access_token)
             audit_meta['status'] = 'success'
             self.db.record_external_write_audit(proposal_id, owner_id or 0, audit_meta)
+            self.db.finish_nl_proposal(proposal_id, 'executed')
             return {
                 'success': True,
                 'action': action,
@@ -191,6 +182,7 @@ class WorkspaceActionService:
             logger.error("Workspace action %s failed: %s", action, exc)
             audit_meta['status'] = 'failed'
             self.db.record_external_write_audit(proposal_id, owner_id or 0, audit_meta)
+            self.db.finish_nl_proposal(proposal_id, 'failed')
             raise WorkspaceActionError(f"Google Workspace API execution failed: {exc}") from exc
 
     def _dispatch_google_api(self, action: str, args: Dict[str, Any], token: str) -> Dict[str, Any]:

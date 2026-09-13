@@ -112,7 +112,7 @@ class TestGeminiChatService(unittest.TestCase):
         # Clear history
         ok = self.service.clear_conversation_history(owner_id=1)
         self.assertTrue(ok)
-        self.assertEqual(len(self.service.get_conversation_history(owner_id=1)), 4)
+        self.assertEqual(len(self.service.get_conversation_history(owner_id=1)), 0)
 
     @patch.object(GeminiChatService, "_get_client")
     def test_send_message_with_mocked_gemini(self, mock_client_getter):
