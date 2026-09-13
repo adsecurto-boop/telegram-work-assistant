@@ -1992,6 +1992,10 @@ document.addEventListener('click', function(e) {{
                     # 10. FOLLOW-UPS & TESTS
                     elif parsed.path == '/followup/complete':
                         service.database.complete_followup(int(form['id'][0]))
+                    elif parsed.path == '/followup/snooze':
+                        f_id = int(form['id'][0])
+                        days = int((form.get('days') or ['1'])[0])
+                        service.work_item_service.snooze_followup(f_id, days=days)
                     elif parsed.path == '/test/update':
                         session_id = int(form['id'][0])
                         service.database.update_test_session(session_id, 'result', form['result'][0])
@@ -2053,14 +2057,88 @@ document.addEventListener('click', function(e) {{
                             priority=int((form.get('priority') or ['2'])[0])
                         )
 
-                    # 14. MEMBERS CREATE
-                    elif parsed.path == '/members/create':
+                    # 14. MEMBERS & ROLES CREATE
+                    elif parsed.path in ('/team/members/create', '/members/create'):
                         name = form['name'][0]
                         email = (form.get('email') or [''])[0] or None
                         tg = (form.get('telegram_handle') or [''])[0] or None
-                        role = (form.get('role') or [''])[0]
-                        roles = [role] if role else []
+                        roles_raw = form.get('roles') or form.get('role') or []
+                        roles = [r for r in roles_raw if r]
                         service.member_service.add_member(name=name, email=email, telegram_handle=tg, roles=roles)
+
+                    elif parsed.path in ('/team/roles/create', '/roles/create'):
+                        name = form['name'][0]
+                        description = (form.get('description') or [''])[0] or None
+                        service.member_service.add_role(name=name, description=description)
+
+                    # 14B. WORKFLOWS & STAGES
+                    elif parsed.path == '/workflows/create':
+                        name = form['name'][0]
+                        work_type = (form.get('work_type') or ['requirement'])[0]
+                        is_default = (form.get('is_default') or ['0'])[0] == '1'
+                        description = (form.get('description') or [''])[0] or None
+                        service.workflow_service.create_template(
+                            name=name, description=description, work_type=work_type, is_default=is_default
+                        )
+
+                    elif parsed.path == '/workflows/stages/create':
+                        t_id = int(form['template_id'][0])
+                        name = form['name'][0]
+                        order = int((form.get('stage_order') or ['1'])[0])
+                        role = (form.get('expected_role') or [''])[0] or ''
+                        dur = float((form.get('expected_duration_hours') or ['0'])[0])
+                        is_w = (form.get('is_waiting') or ['0'])[0] == '1'
+                        desc = (form.get('description') or [''])[0] or ''
+                        service.workflow_service.add_stage(
+                            template_id=t_id, name=name, stage_order=order,
+                            description=desc, expected_role=role,
+                            expected_duration_hours=dur, is_waiting=is_w
+                        )
+
+                    elif parsed.path == '/workflow/stage/transition':
+                        e_type = form['entity_type'][0]
+                        raw_id = (form.get('entity_id') or form.get('id') or ['0'])[0]
+                        e_id = int(raw_id) if raw_id.isdigit() else 0
+                        raw_st = (form.get('new_stage_id') or form.get('stage_id') or ['0'])[0]
+                        st_id = int(raw_st) if raw_st.isdigit() else 0
+                        note = (form.get('note') or [''])[0] or None
+                        service.workflow_service.transition_stage(
+                            entity_type=e_type, entity_id=e_id, new_stage_id=st_id, note=note
+                        )
+
+                    # 14C. TASKS & CASES & WORK ITEMS
+                    elif parsed.path == '/tasks/create':
+                        title = form['title'][0]
+                        client = (form.get('client') or [''])[0] or None
+                        ticket = (form.get('ticket') or [''])[0] or None
+                        due = (form.get('due_date') or [''])[0] or None
+                        prio = int((form.get('priority') or ['2'])[0])
+                        project = (form.get('product') or form.get('project') or [''])[0] or None
+                        service.database.add_task(title=title, priority=prio, client=client, ticket=ticket, due_date=due, project=project)
+
+                    elif parsed.path == '/cases/create':
+                        title = form['title'][0]
+                        client = (form.get('client') or [''])[0] or None
+                        ticket = (form.get('ticket') or [''])[0] or None
+                        channel = (form.get('channel') or [''])[0] or None
+                        prio = int((form.get('priority') or ['1'])[0])
+                        service.database.create_case(title=title, client=client, ticket=ticket, channel=channel, priority=prio)
+
+                    elif parsed.path == '/work/item/update':
+                        e_type = form['entity_type'][0]
+                        e_id = int((form.get('entity_id') or form.get('id') or ['0'])[0])
+                        kwargs = {}
+                        for k, v in form.items():
+                            if k not in ('csrf_token', 'entity_type', 'entity_id', 'id'):
+                                val = v[0] if v else ''
+                                if val != '':
+                                    kwargs[k] = val
+                        service.work_item_service.update_work_item(e_type, e_id, **kwargs)
+
+                    elif parsed.path == '/work/item/delete':
+                        e_type = form['entity_type'][0]
+                        e_id = int((form.get('entity_id') or form.get('id') or ['0'])[0])
+                        service.work_item_service.delete_work_item(e_type, e_id)
 
                     # 15. TEST CASES CREATE
                     elif parsed.path == '/tests/cases/create':
