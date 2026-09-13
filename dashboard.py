@@ -1797,6 +1797,22 @@ document.addEventListener('click', function(e) {{
                             service.database.cancel_nl_proposal(proposal_id, owner_id)
                             self.send_json({'success': True, 'reply': 'Confirmation cancelled.'})
                             return
+                        # Workspace execution owns its atomic claim.  Do not
+                        # pre-claim here: that would convert pending ->
+                        # executing and make the service's replay protection
+                        # reject the same proposal as already in progress.
+                        proposal = service.database.get_nl_proposal(proposal_id)
+                        if proposal and proposal['action_type'] == 'workspace_external_write':
+                            try:
+                                result = service.workspace_service.execute_action(
+                                    proposal_id=proposal_id, actor='chat', owner_id=owner_id)
+                                self.send_json({
+                                    'success': result['success'],
+                                    'reply': f"Executed workspace action '{result.get('action', 'workspace')}': success."
+                                })
+                            except WorkspaceActionError as exc:
+                                self.send_json({'success': False, 'reply': str(exc), 'error': str(exc)})
+                            return
                         claimed = service.database.claim_nl_proposal(proposal_id, owner_id)
                         if claimed['action_type'] == 'compound_plan':
                             from nlp import NaturalLanguagePipeline, ConversationPlan
@@ -1806,21 +1822,6 @@ document.addEventListener('click', function(e) {{
                             service.database.finish_nl_proposal(
                                 proposal_id, 'executed' if result.success else 'failed')
                             self.send_json({'success': result.success, 'reply': result.reply})
-                            return
-
-                        if claimed['action_type'] == 'workspace_external_write':
-                            try:
-                                result = service.workspace_service.execute_action(
-                                    proposal_id=proposal_id,
-                                    actor='chat',
-                                    owner_id=owner_id
-                                )
-                                self.send_json({
-                                    'success': True,
-                                    'reply': f"Executed workspace action '{result.get('action', 'workspace')}': success."
-                                })
-                            except WorkspaceActionError as exc:
-                                self.send_json({'success': False, 'reply': str(exc), 'error': str(exc)})
                             return
 
                         if claimed['action_type'] != 'mcp_external_write':

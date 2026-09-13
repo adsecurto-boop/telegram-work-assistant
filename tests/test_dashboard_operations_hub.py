@@ -176,8 +176,9 @@ class TestDashboardOperationsHub(unittest.TestCase):
         proposal = self.service.workspace_service.propose_action('owner', 'drive_delete_file', {'file_id': 'f1', 'name': 'test.pdf'})
         prop_id = proposal['proposal_id']
 
-        with unittest.mock.patch.object(self.service.workspace_service, 'execute_action') as mock_exec:
-            mock_exec.return_value = {'success': True, 'action': 'drive_delete_file', 'status': 'success'}
+        self.service.workspace_service.credential_provider = lambda: 'mock_access_token_abc'
+        with unittest.mock.patch.object(self.service.workspace_service, '_dispatch_google_api',
+                                        return_value={'fileId': 'f1', 'deleted': True}) as mock_dispatch:
             status, _, body = self._post_json(
                 '/api/chat/proposal',
                 {'proposal_id': prop_id, 'action': 'confirm', 'csrf_token': csrf_token},
@@ -186,7 +187,14 @@ class TestDashboardOperationsHub(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertTrue(body.get('success'))
             self.assertIn('drive_delete_file', body.get('reply', ''))
-            mock_exec.assert_called_once()
+            mock_dispatch.assert_called_once_with('drive_delete_file', {'file_id': 'f1', 'name': 'test.pdf'},
+                                                  'mock_access_token_abc')
+        self.assertEqual(self.db.get_nl_proposal(prop_id)['status'], 'executed')
+        status, _, replay = self._post_json(
+            '/api/chat/proposal',
+            {'proposal_id': prop_id, 'action': 'confirm', 'csrf_token': csrf_token}, cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertFalse(replay.get('success'))
 
 
 if __name__ == '__main__':
