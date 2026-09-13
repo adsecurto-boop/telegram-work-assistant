@@ -190,9 +190,17 @@ class AssistantOrchestrator:
         if needs_plan and has_ai:
             return await self._process_conversation_plan_path(text, owner_id, source_update_id)
 
+        if self._is_general_conversation(text):
+            return await self._process_general_conversation(text, owner_id)
+
         # 4. Standard NLP processing (deterministic or single Gemini fallback)
         shift = await asyncio.to_thread(self.db.active_shift)
         reply_txt, interp = await self.nlp.process(text, shift, source_update_id=source_update_id)
+        if interp and interp.intent == NLIntent.UNKNOWN and not interp.choices:
+            # Ordinary conversation is not an invalid command.  It is a
+            # non-mutating shared-chat route used identically by Telegram and
+            # Web after action/external routing has had first refusal.
+            return await self._process_general_conversation(text, owner_id, fallback_reply=reply_txt)
         
         prop_id = getattr(interp, 'proposal_id', None) if interp else None
         choices = getattr(interp, 'choices', []) if interp else []
@@ -203,6 +211,29 @@ class AssistantOrchestrator:
             choices=choices,
             success=True
         )
+
+    @staticmethod
+    def _is_general_conversation(text: str) -> bool:
+        """Recognize social/status language before domain keyword parsing."""
+        low = text.casefold().strip()
+        if re.match(r'^(?:what\s+am\s+i|what\s+did\s+i|can\s+you\s+(?:summari[sz]e|tell))\b', low):
+            return True
+        # Greetings can prefix valid work commands ("hello, my shift is ...").
+        if re.search(r'\b(?:shift|task|case|remind|create|complete|update|log|report)\b', low):
+            return False
+        return bool(re.match(
+            r'^(?:hello|hi|hey|good\s+(?:morning|afternoon|evening)|thanks|thank you)\b', low))
+
+    async def _process_general_conversation(self, text: str, owner_id: int,
+                                            fallback_reply: str | None = None) -> OrchestrationResult:
+        from gemini_chat_service import GeminiChatService
+        chat = GeminiChatService(self.db)
+        conversational = await chat.send_message(
+            text, owner_id=owner_id, include_workspace_context=True, persist=False)
+        return OrchestrationResult(
+            reply_text=conversational.get('reply') or fallback_reply or 'I could not process that request.',
+            success=not bool(conversational.get('error')),
+            error=conversational.get('error'))
 
     def _detect_external_tool_need(self, text: str, active_refs: Optional[Dict[str, Any]] = None) -> bool:
         low = text.lower()

@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from application.message_service import AssistantMessageService
 from assistant_orchestrator import AssistantOrchestrator
@@ -77,6 +77,18 @@ class SharedMessageServiceTests(unittest.TestCase):
             self.assertTrue(replay['success'])
             self.assertTrue(replay['idempotent_replay'])
 
+    def test_unknown_message_uses_non_mutating_conversation_route(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
+            db = Database(Path(temp) / 'work.sqlite3')
+            orchestrator = AssistantOrchestrator(db)
+            with patch('gemini_chat_service.GeminiChatService.send_message', new=AsyncMock(
+                       return_value={'reply': 'Hello — I can help with parity testing.', 'error': None})) as chat:
+                result = asyncio.run(orchestrator.route_and_process(
+                    'Hello, I am doing parity testing between channels.', owner_id=1))
+            self.assertTrue(result.success)
+            self.assertIn('parity testing', result.reply_text)
+            self.assertTrue(chat.called)
+
     def test_web_retry_preserves_proposal_and_choices(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
             db = Database(Path(temp) / 'work.sqlite3')
@@ -117,4 +129,3 @@ class SharedMessageServiceTests(unittest.TestCase):
             self.assertEqual(retry['choices'], [{'label': 'Confirm', 'value': 'confirm'}, {'label': 'Cancel', 'value': 'cancel'}])
             self.assertEqual(retry['correlation_id'], 'corr_XYZ789')
             self.assertEqual(retry['reply'], 'Confirmation required for deleting file.')
-

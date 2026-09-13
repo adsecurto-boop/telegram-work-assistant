@@ -290,6 +290,7 @@ class GeminiChatService:
         custom_system_instruction: Optional[str] = None,
         owner_id: int = 1,
         include_workspace_context: bool = True,
+        persist: bool = True,
     ) -> Dict[str, Any]:
         """
         Legacy compatibility path. New dashboard and channel requests must use
@@ -338,18 +339,14 @@ class GeminiChatService:
         # 3. Retrieve recent history BEFORE saving current turn
         past_turns = self.get_conversation_history(owner_id=owner_id, limit=20)
         
-        # 4. Save User Turn to Database
-        user_turn_id = self.db.record_conversation_turn(
-            owner_id=owner_id,
-            role="user",
-            text=clean_user_message,
-            intent=f"chat_{role_key}",
-            metadata={
-                "role_key": role_key,
-                "task_mode": task_mode,
-                "model": model_name,
-            }
-        )
+        # AssistantMessageService already persists turns for the shared
+        # channel path, so this legacy helper can be used generation-only.
+        user_turn_id = None
+        if persist:
+            user_turn_id = self.db.record_conversation_turn(
+                owner_id=owner_id, role="user", text=clean_user_message,
+                intent=f"chat_{role_key}", metadata={
+                    "role_key": role_key, "task_mode": task_mode, "model": model_name})
 
         # 5. Build alternating contents array
         formatted_contents: List[Dict[str, Any]] = []
@@ -367,7 +364,9 @@ class GeminiChatService:
                     "parts": [{"text": t}]
                 })
 
-        if formatted_contents and formatted_contents[-1]["role"] == "user":
+        already_in_history = bool(past_turns and past_turns[-1].get('role') == 'user'
+                                  and past_turns[-1].get('text') == clean_user_message)
+        if formatted_contents and formatted_contents[-1]["role"] == "user" and not already_in_history:
             formatted_contents[-1]["parts"][0]["text"] += f"\n\n{clean_user_message}"
         else:
             formatted_contents.append({
@@ -443,19 +442,14 @@ class GeminiChatService:
                 )
 
         # 7. Save Assistant Turn to Database
-        assistant_turn_id = self.db.record_conversation_turn(
-            owner_id=owner_id,
-            role="assistant",
-            text=assistant_reply,
-            intent=f"chat_reply_{role_key}",
-            metadata={
-                "role_key": role_key,
-                "model_used": used_model,
-                "detected_mode": detected_mode,
-                "user_turn_id": user_turn_id,
-                "error": error_msg,
-            }
-        )
+        assistant_turn_id = None
+        if persist:
+            assistant_turn_id = self.db.record_conversation_turn(
+                owner_id=owner_id, role="assistant", text=assistant_reply,
+                intent=f"chat_reply_{role_key}", metadata={
+                    "role_key": role_key, "model_used": used_model,
+                    "detected_mode": detected_mode, "user_turn_id": user_turn_id,
+                    "error": error_msg})
 
         return {
             "success": True,

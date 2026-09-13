@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import html
 import json
+import logging
 import mimetypes
 import os
 import re
@@ -121,6 +122,7 @@ class DashboardService:
         self.workspace_service = WorkspaceActionService(database)
         self.chat_service = GeminiChatService(database)
         self.message_service = AssistantMessageService(database)
+        self.assistant_loop = None
         self.server = None
         self.thread = None
         self._lock = threading.RLock()
@@ -1770,15 +1772,25 @@ document.addEventListener('click', function(e) {{
                         custom_prompt = json_body.get('custom_system_instruction') or (form.get('custom_system_instruction') or [''])[0]
                         owner_id = config.OWNER_ID or 1
 
-                        new_loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(new_loop)
+                        coroutine = service.message_service.process_user_message(
+                            owner_id=owner_id, text=msg, source_channel='web',
+                            client_message_id=json_body.get('client_message_id'),
+                            metadata={'role_key': role_key, 'task_mode': task_mode})
                         try:
-                            result = new_loop.run_until_complete(service.message_service.process_user_message(
-                                owner_id=owner_id, text=msg, source_channel='web',
-                                client_message_id=json_body.get('client_message_id'),
-                                metadata={'role_key': role_key, 'task_mode': task_mode}))
-                        finally:
-                            new_loop.close()
+                            if service.assistant_loop and service.assistant_loop.is_running():
+                                result = asyncio.run_coroutine_threadsafe(
+                                    coroutine, service.assistant_loop).result(timeout=90)
+                            else:
+                                # Standalone dashboard/test mode has no Telegram
+                                # application loop; asyncio.run creates a complete
+                                # one-shot bridge without sharing async clients.
+                                result = asyncio.run(coroutine)
+                        except Exception:
+                            logging.getLogger(__name__).exception('Assistant request failed')
+                            self.send_json({
+                                'success': False, 'reply': 'I could not process that request.',
+                                'error': 'assistant_runtime_error'}, 500)
+                            return
 
                         self.send_json(result if isinstance(result, dict) else {'success': result.success, 'reply': result.reply_text, 'proposal_id': result.proposal_id})
                         return

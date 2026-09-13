@@ -73,6 +73,7 @@ async def startup(application):
     dashboard = application.bot_data.get('dashboard')
     if dashboard:
         dashboard.message_service = shared_messages
+        dashboard.assistant_loop = asyncio.get_running_loop()
         dashboard.workspace_service.mcp_manager = application.bot_data.get('mcp_manager')
         # The dashboard never accepts OAuth material from a browser.  Workspace
         # credentials come from the operator-managed secure credential store.
