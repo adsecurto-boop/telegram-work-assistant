@@ -22,6 +22,23 @@ class AssistantMessageService:
                                    correlation_id: str | None = None,
                                    metadata: dict[str, Any] | None = None):
         thread_id = self.db.get_active_conversation_thread(owner_id)
+
+        # 1. Check conversation_message_requests first
+        if client_message_id:
+            req = self.db.get_conversation_message_request(owner_id, client_message_id)
+            if req:
+                # 2. If status=completed: deserialize response_json, return full original response
+                if req['status'] == 'completed' and req.get('response_json'):
+                    replay = json.loads(req['response_json'])
+                    replay['idempotent_replay'] = True
+                    return replay
+                # 3. If status=processing: return processing/retry response
+                if req['status'] == 'processing':
+                    return {'success': False, 'reply': '', 'reply_text': '',
+                            'error': 'message_processing', 'proposal_id': None, 'choices': [],
+                            'idempotent_replay': True}
+
+        # 5. Legacy assistant-turn fallback (for historical turns without conversation_message_requests)
         existing = None
         if client_message_id:
             with self.db.connect() as conn:
@@ -34,6 +51,8 @@ class AssistantMessageService:
         if existing:
             return {'success': True, 'reply': existing['text'], 'reply_text': existing['text'],
                     'idempotent_replay': True, 'proposal_id': None, 'choices': []}
+
+        # 4. If absent/failed: attempt atomic claim
         request_claimed = False
         if client_message_id:
             claim = self.db.claim_conversation_message_request(

@@ -138,6 +138,34 @@ class WorkspaceActionServiceTests(unittest.TestCase):
         restarted = WorkspaceActionService(self.db)
         self.assertTrue(restarted.execute_action(proposal['proposal_id'], 'mock_access_token_abc')['success'])
 
+    def test_execution_rejects_tampered_arguments_hash(self):
+        proposal = self.service.propose_action('owner', 'drive_delete_file', {'file_id': 'file_123', 'name': 'target.txt'})
+        # Tamper with the persisted arguments directly in SQLite
+        with self.db.connect() as conn:
+            import json
+            row = conn.execute('SELECT proposal_json FROM nl_proposals WHERE id=?', (proposal['proposal_id'],)).fetchone()
+            payload = json.loads(row['proposal_json'])
+            payload['args']['file_id'] = 'file_tampered_999'  # arguments changed without updating args_hash
+            conn.execute('UPDATE nl_proposals SET proposal_json=? WHERE id=?', (json.dumps(payload), proposal['proposal_id']))
+
+        with self.assertRaises(WorkspaceActionError) as ctx:
+            self.service.execute_action(proposal['proposal_id'], 'mock_access_token_abc')
+        self.assertIn('Proposal arguments changed or hash mismatch', str(ctx.exception))
+
+    def test_execution_rejects_tampered_capabilities(self):
+        proposal = self.service.propose_action('owner', 'drive_delete_file', {'file_id': 'file_456', 'name': 'target.txt'})
+        # Tamper with the required capabilities
+        with self.db.connect() as conn:
+            import json
+            row = conn.execute('SELECT proposal_json FROM nl_proposals WHERE id=?', (proposal['proposal_id'],)).fetchone()
+            payload = json.loads(row['proposal_json'])
+            payload['required_capabilities'] = ['drive.tampered']
+            conn.execute('UPDATE nl_proposals SET proposal_json=? WHERE id=?', (json.dumps(payload), proposal['proposal_id']))
+
+        with self.assertRaises(WorkspaceActionError) as ctx:
+            self.service.execute_action(proposal['proposal_id'], 'mock_access_token_abc')
+        self.assertIn('Proposal capability semantics changed', str(ctx.exception))
+
 
 if __name__ == '__main__':
     unittest.main()

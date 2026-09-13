@@ -147,6 +147,47 @@ class TestDashboardOperationsHub(unittest.TestCase):
         tcs_after = self.service.work_item_service.list_test_cases(requirement_id=req['id'])
         self.assertEqual(tcs_after[0]['latest_result'], 'pass')
 
+    def _post_json(self, path, json_data, cookie=None):
+        import json
+        conn = http.client.HTTPConnection("127.0.0.1", self.port)
+        body_encoded = json.dumps(json_data)
+        headers = {
+            "Content-Type": "application/json",
+            "Content-Length": str(len(body_encoded)),
+        }
+        if cookie:
+            headers["Cookie"] = cookie
+        conn.request("POST", path, body=body_encoded, headers=headers)
+        resp = conn.getresponse()
+        body = resp.read().decode('utf-8')
+        return resp.status, resp.headers, json.loads(body) if body else {}
+
+    def test_api_chat_proposal_routes_workspace_external_write(self):
+        import unittest.mock
+        import re
+        status, headers, _ = self._get(f"/?token={self.service.token}")
+        cookie = headers.get("Set-Cookie")
+
+        _, _, page_body = self._get("/work-items", cookie=cookie)
+        m = re.search(r'name="csrf_token" value="([^"]+)"', page_body)
+        self.assertIsNotNone(m)
+        csrf_token = m.group(1)
+
+        proposal = self.service.workspace_service.propose_action('owner', 'drive_delete_file', {'file_id': 'f1', 'name': 'test.pdf'})
+        prop_id = proposal['proposal_id']
+
+        with unittest.mock.patch.object(self.service.workspace_service, 'execute_action') as mock_exec:
+            mock_exec.return_value = {'success': True, 'action': 'drive_delete_file', 'status': 'success'}
+            status, _, body = self._post_json(
+                '/api/chat/proposal',
+                {'proposal_id': prop_id, 'action': 'confirm', 'csrf_token': csrf_token},
+                cookie=cookie
+            )
+            self.assertEqual(status, 200)
+            self.assertTrue(body.get('success'))
+            self.assertIn('drive_delete_file', body.get('reply', ''))
+            mock_exec.assert_called_once()
+
 
 if __name__ == '__main__':
     unittest.main()

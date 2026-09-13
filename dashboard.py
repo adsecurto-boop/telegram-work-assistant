@@ -1807,7 +1807,23 @@ document.addEventListener('click', function(e) {{
                                 proposal_id, 'executed' if result.success else 'failed')
                             self.send_json({'success': result.success, 'reply': result.reply})
                             return
-                        if claimed['action_type'] not in ('mcp_external_write', 'workspace_external_write'):
+
+                        if claimed['action_type'] == 'workspace_external_write':
+                            try:
+                                result = service.workspace_service.execute_action(
+                                    proposal_id=proposal_id,
+                                    actor='chat',
+                                    owner_id=owner_id
+                                )
+                                self.send_json({
+                                    'success': True,
+                                    'reply': f"Executed workspace action '{result.get('action', 'workspace')}': success."
+                                })
+                            except WorkspaceActionError as exc:
+                                self.send_json({'success': False, 'reply': str(exc), 'error': str(exc)})
+                            return
+
+                        if claimed['action_type'] != 'mcp_external_write':
                             # Local NLP proposals and clarifications use the same durable
                             # proposal record as Telegram; choice indices are never trusted
                             # beyond the persisted choice list.

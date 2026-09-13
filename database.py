@@ -3651,6 +3651,14 @@ class Database:
                  case_id, task_id, test_session_id, source_update_id, thread_id,
                  source_channel, source_message_id, client_message_id, correlation_id, stamp)).lastrowid
 
+    def get_conversation_message_request(self, owner_id: int, client_message_id: str) -> dict | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                'SELECT status, response_json FROM conversation_message_requests WHERE owner_id=? AND client_message_id=?',
+                (owner_id, client_message_id)
+            ).fetchone()
+            return dict(row) if row else None
+
     def claim_conversation_message_request(self, owner_id: int, client_message_id: str,
                                            source_channel: str) -> dict:
         """Atomically claim a browser message before any side effect is evaluated."""

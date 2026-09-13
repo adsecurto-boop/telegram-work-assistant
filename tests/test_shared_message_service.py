@@ -76,3 +76,45 @@ class SharedMessageServiceTests(unittest.TestCase):
                 source_channel='web', client_message_id='web:concurrent'))
             self.assertTrue(replay['success'])
             self.assertTrue(replay['idempotent_replay'])
+
+    def test_web_retry_preserves_proposal_and_choices(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
+            db = Database(Path(temp) / 'work.sqlite3')
+            service = AssistantMessageService(db)
+
+            async def mock_route_with_proposal(*_args, **_kwargs):
+                return SimpleNamespace(
+                    reply_text='Confirmation required for deleting file.',
+                    proposal_id='prop_ABC123',
+                    choices=[{'label': 'Confirm', 'value': 'confirm'}, {'label': 'Cancel', 'value': 'cancel'}],
+                    correlation_id='corr_XYZ789',
+                    active_external_refs=None,
+                    success=True,
+                    error=None
+                )
+
+            service.orchestrator.route_and_process = mock_route_with_proposal
+
+            first = asyncio.run(service.process_user_message(
+                owner_id=1, text='Delete that external file.',
+                source_channel='web', client_message_id='web:delete_file'
+            ))
+            self.assertTrue(first['success'])
+            self.assertFalse(first['idempotent_replay'])
+            self.assertEqual(first['proposal_id'], 'prop_ABC123')
+            self.assertEqual(len(first['choices']), 2)
+            self.assertEqual(first['correlation_id'], 'corr_XYZ789')
+            self.assertEqual(first['reply'], 'Confirmation required for deleting file.')
+
+            # Simulate network retry with the same client_message_id
+            retry = asyncio.run(service.process_user_message(
+                owner_id=1, text='Delete that external file.',
+                source_channel='web', client_message_id='web:delete_file'
+            ))
+            self.assertTrue(retry['success'])
+            self.assertTrue(retry['idempotent_replay'])
+            self.assertEqual(retry['proposal_id'], 'prop_ABC123')
+            self.assertEqual(retry['choices'], [{'label': 'Confirm', 'value': 'confirm'}, {'label': 'Cancel', 'value': 'cancel'}])
+            self.assertEqual(retry['correlation_id'], 'corr_XYZ789')
+            self.assertEqual(retry['reply'], 'Confirmation required for deleting file.')
+

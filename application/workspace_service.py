@@ -34,27 +34,8 @@ class WorkspaceActionService:
         self.mcp_manager = mcp_manager
         self.credential_provider = credential_provider
 
-    def propose_action(self, actor: str, action: str, args: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Validate, classify risk, compute argument hash, and return an actionable proposal.
-        """
-        allowed_actions = {
-            'sheets_export',
-            'tasks_create',
-            'tasks_patch',
-            'drive_create_folder',
-            'drive_delete_file',
-            'docs_create_handover',
-            'keep_bridge_tasks',
-            'keep_bridge_docs',
-        }
-
-        if action not in allowed_actions:
-            raise WorkspaceActionError(f"Unsupported workspace action: '{action}'.")
-
-        # Sanitize and hash exact arguments
-
-        # Determine risk level and required capabilities
+    @classmethod
+    def classify_action(cls, action: str, args: Dict[str, Any]) -> tuple[RiskLevel, list[str], str, str]:
         if action == 'drive_delete_file':
             risk = RiskLevel.DESTRUCTIVE
             req_caps = ["drive.file.delete", "external.delete"]
@@ -101,7 +82,27 @@ class WorkspaceActionService:
             req_caps = ["google_workspace.write"]
             title = action.replace('_', ' ').title()
             description = f"Execute {action} with {len(args)} parameters."
+        return risk, req_caps, title, description
 
+    def propose_action(self, actor: str, action: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Validate, classify risk, compute argument hash, and return an actionable proposal.
+        """
+        allowed_actions = {
+            'sheets_export',
+            'tasks_create',
+            'tasks_patch',
+            'drive_create_folder',
+            'drive_delete_file',
+            'docs_create_handover',
+            'keep_bridge_tasks',
+            'keep_bridge_docs',
+        }
+
+        if action not in allowed_actions:
+            raise WorkspaceActionError(f"Unsupported workspace action: '{action}'.")
+
+        risk, req_caps, title, description = self.classify_action(action, args)
         policy = ExternalActionPolicy.evaluate(args, risk, req_caps)
         if policy.decision != PolicyDecision.CONFIRMATION_REQUIRED:
             raise WorkspaceActionError('External Workspace actions require confirmation.')
@@ -156,17 +157,27 @@ class WorkspaceActionService:
 
         action = proposal['action']
         args = proposal['args']
-        args_hash = proposal['args_hash']
-        risk_level = RiskLevel[proposal['risk_level']]
-        req_caps = proposal['required_capabilities']
+        expected_risk, expected_caps, _, _ = self.classify_action(action, args)
+
+        # Execution-time policy revalidation: ensure arguments, capabilities, and decision are intact
+        current = ExternalActionPolicy.evaluate(args, expected_risk, expected_caps)
+        if current.arguments_hash != proposal.get('args_hash'):
+            self.db.finish_nl_proposal(proposal_id, 'failed')
+            raise WorkspaceActionError('Proposal arguments changed or hash mismatch; create a new proposal.')
+        if current.required_capabilities != proposal.get('required_capabilities'):
+            self.db.finish_nl_proposal(proposal_id, 'failed')
+            raise WorkspaceActionError('Proposal capability semantics changed; create a new proposal.')
+        if current.decision != PolicyDecision.CONFIRMATION_REQUIRED:
+            self.db.finish_nl_proposal(proposal_id, 'failed')
+            raise WorkspaceActionError('Proposal policy decision changed; create a new proposal.')
 
         audit_meta = {
             'server': 'google_workspace',
             'canonical_tool_id': f'google_workspace.{action}',
-            'arguments_hash': args_hash,
-            'risk': risk_level.name,
+            'arguments_hash': current.arguments_hash,
+            'risk': current.risk_level.name,
             'authorization_family': 'google_workspace',
-            'required_capabilities': req_caps,
+            'required_capabilities': current.required_capabilities,
             'execution_timestamp': datetime.now(timezone.utc).isoformat(),
         }
 
