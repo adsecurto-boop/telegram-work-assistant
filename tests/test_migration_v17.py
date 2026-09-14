@@ -33,7 +33,7 @@ class MigrationV17Tests(unittest.TestCase):
                 conn.execute('DROP TABLE conversation_turns_v17')
                 conn.execute('PRAGMA user_version=16')
             upgraded = Database(path)
-            self.assertEqual(SCHEMA_VERSION, 18)
+            self.assertEqual(SCHEMA_VERSION, 19)
             self.assertEqual(upgraded.get_recent_turns(1)[0]['text'], 'preserved')
             with sqlite3.connect(path) as conn:
                 columns = {row[1] for row in conn.execute('PRAGMA table_info(conversation_turns)')}

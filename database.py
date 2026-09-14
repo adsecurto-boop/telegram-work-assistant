@@ -13,7 +13,7 @@ from pathlib import Path
 from models import Task, TaskStatus
 import config
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 
 
 _last_iso_time = 0.0
@@ -113,6 +113,8 @@ class Database:
                 self._seed_v17_defaults(cursor)
             if version < 18:
                 self._seed_v18_defaults(cursor)
+            if version < 19:
+                self._seed_v19_defaults(cursor)
             self._create_indexes(cursor)
             self._validate_schema_integrity(cursor)
             cursor.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
@@ -708,7 +710,9 @@ class Database:
                 'planned_shift_id': 'INTEGER', 'due_date': 'TEXT', 'project': 'TEXT',
                 'client': 'TEXT', 'ticket': 'TEXT', 'next_action': 'TEXT',
                 'tags': 'TEXT', 'completion_note': 'TEXT', 'blocked_reason': 'TEXT',
-                'completed_at': 'TEXT'},
+                'completed_at': 'TEXT', 'project_id': 'INTEGER', 'assignee_member_id': 'INTEGER',
+                'description': 'TEXT', 'task_type': "TEXT NOT NULL DEFAULT 'task'", 'start_date': 'TEXT',
+                'estimated_hours': 'REAL', 'actual_hours': 'REAL', 'updated_at': 'TEXT'},
             'activities': {
                 'unplanned': 'INTEGER NOT NULL DEFAULT 0',
                 'source_message_id': 'INTEGER REFERENCES source_messages(id)',
@@ -826,6 +830,28 @@ class Database:
             source_channel TEXT NOT NULL, status TEXT NOT NULL,
             response_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
             PRIMARY KEY (owner_id, client_message_id))''')
+
+    def _seed_v19_defaults(self, connection):
+        connection.execute('''CREATE TABLE IF NOT EXISTS projects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+            description TEXT, owner_member_id INTEGER REFERENCES members(id), status TEXT NOT NULL DEFAULT 'planned',
+            health TEXT NOT NULL DEFAULT 'on_track', start_date TEXT, due_date TEXT,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL)''')
+        connection.execute('''CREATE TABLE IF NOT EXISTS project_members (
+            project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            member_id INTEGER NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+            role TEXT NOT NULL DEFAULT 'member', created_at TEXT NOT NULL,
+            PRIMARY KEY(project_id, member_id))''')
+        connection.execute('''CREATE TABLE IF NOT EXISTS task_subtasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            title TEXT NOT NULL, is_completed INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
+            completed_at TEXT)''')
+        connection.execute('''CREATE TABLE IF NOT EXISTS task_comments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            member_id INTEGER REFERENCES members(id), text TEXT NOT NULL, created_at TEXT NOT NULL, edited_at TEXT)''')
+        connection.execute('CREATE INDEX IF NOT EXISTS projects_status_idx ON projects(status, due_date)')
+        connection.execute('CREATE INDEX IF NOT EXISTS tasks_project_idx ON tasks(project_id, status, due_date)')
+        connection.execute('CREATE INDEX IF NOT EXISTS task_subtasks_task_idx ON task_subtasks(task_id, is_completed)')
 
     def _seed_v13_defaults(self, connection):
         connection.execute('''CREATE TABLE IF NOT EXISTS assistant_memory_summaries (
@@ -1028,7 +1054,8 @@ class Database:
             'workflow_templates', 'workflow_stages', 'members', 'roles',
             'member_roles', 'work_item_meta', 'stage_history',
             'blockers_dependencies', 'requirements', 'test_conditions',
-            'test_cases', 'test_executions', 'artifacts', 'defects'
+            'test_cases', 'test_executions', 'artifacts', 'defects', 'projects',
+            'project_members', 'task_subtasks', 'task_comments'
         }
         rows = cursor.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         existing = {r['name'] if isinstance(r, sqlite3.Row) else r[0] for r in rows}
@@ -1201,13 +1228,16 @@ class Database:
                                (now_iso(), shift_id))
 
     def add_task(self, title, priority=0, shift_id=None, due_date=None, project=None,
-                 client=None, ticket=None, next_action=None, tags=None):
+                 client=None, ticket=None, next_action=None, tags=None, project_id=None,
+                 assignee_member_id=None, description=None, task_type='task', start_date=None):
         with self.connect() as connection:
             task_id = connection.execute('''INSERT INTO tasks
-                (title,status,created_at,priority,planned_shift_id,due_date,project,client,ticket,next_action,tags)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
+                (title,status,created_at,priority,planned_shift_id,due_date,project,client,ticket,next_action,tags,
+                 project_id,assignee_member_id,description,task_type,start_date,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                 (title, 'pending', now_iso(), int(priority), shift_id, due_date, project,
-                 client, ticket, next_action, tags)).lastrowid
+                 client, ticket, next_action, tags, project_id, assignee_member_id, description,
+                 task_type, start_date, now_iso())).lastrowid
             if shift_id:
                 self._activity(connection, shift_id, 'plan', title, client=client, task_id=task_id)
             self._index_source_in_connection(connection, 'task', task_id)

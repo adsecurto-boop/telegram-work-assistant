@@ -26,7 +26,7 @@ class MigrationV18Tests(unittest.TestCase):
 
             # Now trigger the v17 -> v18 migration by instantiating Database
             upgraded = Database(path)
-            self.assertEqual(SCHEMA_VERSION, 18)
+            self.assertEqual(SCHEMA_VERSION, 19)
 
             # Verify old conversation turns preserved
             turns = upgraded.get_recent_turns(1)
@@ -40,7 +40,7 @@ class MigrationV18Tests(unittest.TestCase):
                 columns = {row[1] for row in conn.execute('PRAGMA table_info(conversation_message_requests)')}
                 self.assertTrue({'owner_id', 'client_message_id', 'source_channel', 'status', 'response_json', 'created_at', 'updated_at'} <= columns)
                 version = conn.execute('PRAGMA user_version').fetchone()[0]
-                self.assertEqual(version, 18)
+                self.assertEqual(version, 19)
                 integrity = conn.execute('PRAGMA integrity_check').fetchone()[0]
                 self.assertEqual(integrity, 'ok')
 

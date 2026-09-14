@@ -28,6 +28,7 @@ from application.case_service import CaseService
 from application.message_service import AssistantMessageService
 from application.workflow_service import WorkflowService
 from application.member_service import MemberService
+from application.project_service import ProjectService
 from application.workspace_service import WorkspaceActionService, WorkspaceActionError
 from workspace_view import render_workspace_view
 from dashboard_views.today_view import render_today_view
@@ -37,6 +38,7 @@ from dashboard_views.workflows_view import render_workflows_view
 from dashboard_views.team_view import render_team_view
 from dashboard_views.followups_view import render_followups_view
 from dashboard_views.chat_view import render_chat_view
+from dashboard_views.projects_view import render_projects_view, render_project_detail_view
 from gemini_chat_service import GeminiChatService
 
 STATUSES = (
@@ -119,6 +121,7 @@ class DashboardService:
         self.case_service = CaseService(database)
         self.workflow_service = WorkflowService(database)
         self.member_service = MemberService(database)
+        self.project_service = ProjectService(database)
         self.workspace_service = WorkspaceActionService(database)
         self.chat_service = GeminiChatService(database)
         self.message_service = AssistantMessageService(database)
@@ -269,6 +272,7 @@ class DashboardService:
                 route_path = (route or '/').split('?')[0]
                 pillar_today = route_path in ('/', '/overview', '/today')
                 pillar_work = route_path in ('/work', '/work-items', '/kanban', '/inbox', '/cases', '/case')
+                pillar_work = pillar_work or route_path.startswith('/projects')
                 pillar_testing = route_path in ('/tests', '/testing', '/evidence')
                 pillar_workspace = route_path == '/workspace'
                 pillar_chat = route_path in ('/chat', '/assistant')
@@ -1408,6 +1412,7 @@ tr:hover td {{ background: #fafafa; }}
         <svg class="nav-icon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
         Work
       </a>
+      <a href="/projects" class="nav-segment {'active' if route_path.startswith('/projects') else ''}">Projects</a>
       <a href="/tests" class="nav-segment {'active' if pillar_testing else ''}">
         <svg class="nav-icon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
         Testing
@@ -1586,8 +1591,14 @@ document.addEventListener('click', function(e) {{
                 followups = service.database.list_followups(limit=100)
                 tests = service.database.test_sessions(limit=100)
 
-                # 1. WORK OPERATIONS (Unified Hub, Kanban, Inbox, Cases)
-                if route in ('/work', '/work-items', '/kanban', '/inbox', '/cases'):
+                # 1. PROJECTS
+                if route.startswith('/projects/'):
+                    content = render_project_detail_view(service, csrf_token, int(route.rsplit('/', 1)[1]))
+                elif route == '/projects':
+                    content = render_projects_view(service, csrf_token, params)
+
+                # 2. WORK OPERATIONS (Unified Hub, Kanban, Inbox, Cases)
+                elif route in ('/work', '/work-items', '/kanban', '/inbox', '/cases'):
                     sub_map = {'/kanban': 'kanban', '/inbox': 'inbox', '/cases': 'cases', '/work-items': 'items'}
                     sub_val = sub_map.get(route) or (params.get('sub') or ['items'])[0]
                     content = render_work_view(service, csrf_token, params, sub=sub_val)
@@ -2216,6 +2227,12 @@ document.addEventListener('click', function(e) {{
                         )
 
                     # 14C. TASKS & CASES & WORK ITEMS
+                    elif parsed.path == '/projects/create':
+                        service.project_service.create_project(
+                            form['name'][0], code=(form.get('code') or [''])[0] or None,
+                            due_date=(form.get('due_date') or [''])[0] or None,
+                            status=(form.get('status') or ['planned'])[0], actor='dashboard')
+
                     elif parsed.path == '/tasks/create':
                         title = form['title'][0]
                         client = (form.get('client') or [''])[0] or None
@@ -2223,7 +2240,10 @@ document.addEventListener('click', function(e) {{
                         due = (form.get('due_date') or [''])[0] or None
                         prio = int((form.get('priority') or ['2'])[0])
                         project = (form.get('product') or form.get('project') or [''])[0] or None
-                        service.task_service.create_task(title=title, priority=prio, client=client, ticket=ticket, due_date=due, project=project, actor='dashboard')
+                        project_id_raw = (form.get('project_id') or [''])[0]
+                        project_id = int(project_id_raw) if project_id_raw.isdigit() else None
+                        service.task_service.create_task(title=title, priority=prio, client=client, ticket=ticket, due_date=due, project=project,
+                            project_id=project_id, task_type=(form.get('task_type') or ['task'])[0], actor='dashboard')
 
                     elif parsed.path == '/cases/create':
                         title = form['title'][0]

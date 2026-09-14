@@ -25,11 +25,15 @@ class TaskService:
                     due_date: str | None = None, project: str | None = None,
                     client: str | None = None, ticket: str | None = None,
                     next_action: str | None = None, tags: str | None = None,
+                    project_id: int | None = None, assignee_member_id: int | None = None,
+                    description: str | None = None, task_type: str = 'task', start_date: str | None = None,
                     correlation_id: str | None = None, actor: str = 'system') -> MutationResult:
         task = self.db.add_task(
             title=title, priority=priority, shift_id=shift_id,
             due_date=due_date, project=project, client=client, ticket=ticket,
-            next_action=next_action, tags=tags
+            next_action=next_action, tags=tags, project_id=project_id,
+            assignee_member_id=assignee_member_id, description=description,
+            task_type=task_type, start_date=start_date
         )
         task_id = task.id
         self.db.index_fts_record('task', task_id, title, f"Task: {title}", client=client)
