@@ -1,3 +1,4 @@
+import json
 import os
 from typing import Optional, Callable
 from fastapi import FastAPI, Depends, Request, HTTPException, status
@@ -7,18 +8,65 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.engine import Engine
 
 from .config import Settings, get_settings, ALLOWED_LOOPBACK_HOSTS
+from .schemas import (
+    CaptureRequest,
+    CaptureResponse,
+    CreateKnowledgeArticleRequest,
+    CreateKnowledgeVersionRequest,
+    KnowledgeArticleResponse,
+    KnowledgeVersionResponse,
+    KnowledgeSearchResponse,
+    KnowledgeSearchResultItem,
+    CreateSuggestionRequest,
+    SuggestionResponse,
+    SuggestionSourceItem,
+    SuggestionCandidateItem,
+    SuggestionOutcomeResponse,
+    ConfirmSentRequest,
+    SentResponseModel,
+    ActivityTodayResponse,
+    ActivityEventItem,
+    CreateActivityEventRequest,
+    ReportPreviewRequest,
+    ReportFinalizeRequest,
+    ReportSnapshotResponse,
+    N8nReportExportRequest,
+    N8nReportExportResponse,
+    CreateCaseRequest,
+    UpdateCaseStatusRequest,
+    CaseResponse,
+    CaseListResponse,
+    StartMeetingRequest,
+    MeetingSessionResponse,
+    TranscriptSegmentRequest,
+    TranscriptSegmentResponse,
+    MeetingProposalResponse,
+    MeetingProposalListResponse,
+    ReviewMeetingProposalRequest,
+    RetentionPurgeResponse,
+    MeetingDetailResponse,
+    ScreenAnalysisRequest,
+    ScreenAnalysisResponse,
+    ScreenAnalysisSource,
+    ProposeLearningCandidateRequest,
+    ReviewLearningCandidateRequest,
+    LearningCandidateResponse,
+    LearningCandidateListResponse,
+    DetailedHealthResponse,
+)
 from .logger import logger
-from .schemas import CaptureRequest, CaptureResponse
 from .database import create_db_engine, create_session_factory, verify_schema_readiness
 from .auth import require_capability, AuthenticatedCaller
 from .service import CaptureService, IdempotencyConflictError
 from .ai_provider import AIProvider, GeminiAIProvider, ProviderTimeoutError, ProviderUnavailableError
+from .screen_provider import GeminiScreenAnalysisProvider, ScreenAnalysisProvider
 
 def create_app(
     settings: Optional[Settings] = None,
     engine: Optional[Engine] = None,
     session_factory: Optional[sessionmaker] = None,
     ai_provider: Optional[AIProvider] = None,
+    screen_analysis_provider: Optional[ScreenAnalysisProvider] = None,
     verify_schema: bool = True,
     verify_auth: bool = True,
 ) -> FastAPI:
@@ -54,6 +102,7 @@ def create_app(
     app.state.engine = engine
     app.state.session_factory = session_factory
     app.state.ai_provider = ai_provider
+    app.state.screen_analysis_provider = screen_analysis_provider
 
     def get_db() -> Session:
         db = session_factory()
@@ -133,6 +182,89 @@ def create_app(
             "schema_ready": True,
         }
 
+    @app.get("/v1/health/detailed", response_model=DetailedHealthResponse)
+    async def detailed_health(db: Session = Depends(get_db)):
+        from sqlalchemy import text
+        from pathlib import Path
+
+        db_connected = True
+        integrity_ok = True
+        try:
+            db.execute(text("SELECT 1"))
+            res = db.execute(text("PRAGMA integrity_check;")).scalar()
+            integrity_ok = (res == "ok")
+        except Exception:
+            db_connected = False
+            integrity_ok = False
+
+        # Schema revision
+        schema_revision = "005_phase7"
+        try:
+            row = db.execute(text("SELECT version_num FROM alembic_version;")).first()
+            if row:
+                schema_revision = str(row[0])
+        except Exception:
+            pass
+
+        data_dir = Path(settings.data_dir)
+        writable = os.access(data_dir, os.W_OK) if data_dir.exists() else False
+
+        # Provider mode without revealing keys
+        ai_configured = bool(settings.gemini_api_key)
+        ai_mode = settings.ai_provider
+
+        # Check latest backup
+        backups_dir = data_dir / "backups"
+        last_backup = None
+        if backups_dir.exists():
+            manifests = list(backups_dir.glob("*/manifest.json")) + list(backups_dir.glob("*_manifest.json"))
+            if manifests:
+                manifests.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                try:
+                    m_data = json.loads(manifests[0].read_text(encoding="utf-8"))
+                    last_backup = m_data.get("creation_timestamp") or m_data.get("created_at")
+                except Exception:
+                    pass
+
+        telegram_status = "configured" if getattr(settings, "telegram_bot_token", None) else "not_configured"
+        n8n_configured = bool(settings.n8n_shared_secret)
+
+        # Status calculation
+        if not db_connected or not integrity_ok or not writable:
+            overall = "unhealthy"
+        elif not ai_configured:
+            overall = "degraded"
+        else:
+            overall = "healthy"
+
+        return DetailedHealthResponse(
+            status=overall,
+            api_status="healthy",
+            database={
+                "connected": db_connected,
+                "schema_revision": schema_revision,
+                "schema_ready": True,
+                "integrity_check": "ok" if integrity_ok else "failed",
+                "data_dir_writable": writable,
+            },
+            ai_provider={
+                "configured": ai_configured,
+                "mode": ai_mode,
+            },
+            backup={
+                "last_backup_timestamp": last_backup,
+            },
+            retention={
+                "status": "active",
+            },
+            telegram={
+                "status": telegram_status,
+            },
+            n8n={
+                "configured": n8n_configured,
+            },
+        )
+
     @app.post("/v1/captures/manual-message", response_model=CaptureResponse)
     async def capture_manual_message(
         capture: CaptureRequest,
@@ -149,33 +281,6 @@ def create_app(
     from .suggestion_service import SuggestionService
     from .ai_gateway import AIProviderGateway
     from .models import ResponseSuggestion, SuggestionSource, ActivityEvent
-    from .schemas import (
-        CreateKnowledgeArticleRequest,
-        CreateKnowledgeVersionRequest,
-        KnowledgeArticleResponse,
-        KnowledgeVersionResponse,
-        KnowledgeSearchResponse,
-        KnowledgeSearchResultItem,
-        CreateSuggestionRequest,
-        SuggestionResponse,
-        SuggestionSourceItem,
-        SuggestionCandidateItem,
-        SuggestionOutcomeResponse,
-        ConfirmSentRequest,
-        SentResponseModel,
-        ActivityTodayResponse,
-        ActivityEventItem,
-        CreateActivityEventRequest,
-        ReportPreviewRequest,
-        ReportFinalizeRequest,
-        ReportSnapshotResponse,
-        N8nReportExportRequest,
-        N8nReportExportResponse,
-        CreateCaseRequest,
-        UpdateCaseStatusRequest,
-        CaseResponse,
-        CaseListResponse,
-    )
 
     @app.post("/v1/knowledge/articles", response_model=KnowledgeArticleResponse)
     async def create_knowledge_article(
@@ -800,6 +905,369 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc))
 
+    def meeting_session_response(session) -> MeetingSessionResponse:
+        return MeetingSessionResponse(
+            id=session.id,
+            title=session.title,
+            lifecycle_status=session.lifecycle_status,
+            consent_acknowledged=bool(session.consent_acknowledged),
+            consent_note=session.consent_note,
+            retention_until=session.retention_until,
+            started_at=session.started_at,
+            stopped_at=session.stopped_at,
+        )
+
+    def transcript_response(segment) -> TranscriptSegmentResponse:
+        return TranscriptSegmentResponse(
+            id=segment.id,
+            meeting_session_id=segment.meeting_session_id,
+            speaker_label=segment.speaker_label,
+            transcript_text=segment.transcript_text,
+            confidence=segment.confidence,
+            uncertainty_visible=segment.confidence < 0.75,
+            occurred_at=segment.occurred_at,
+        )
+
+    def meeting_proposal_response(proposal) -> MeetingProposalResponse:
+        import json
+        return MeetingProposalResponse(
+            id=proposal.id,
+            meeting_session_id=proposal.meeting_session_id,
+            proposal_type=proposal.proposal_type,
+            proposal_text=proposal.proposal_text,
+            evidence_segment_ids=json.loads(proposal.evidence_segment_ids_json),
+            lifecycle_status=proposal.lifecycle_status,
+            created_at=proposal.created_at,
+            reviewed_at=proposal.reviewed_at,
+        )
+
+    @app.post("/v1/meetings/start", response_model=MeetingSessionResponse)
+    async def start_meeting(
+        payload: StartMeetingRequest,
+        db: Session = Depends(get_db),
+        caller: AuthenticatedCaller = Depends(require_capability("meeting:write")),
+    ):
+        from .meeting_service import MeetingService
+        try:
+            return meeting_session_response(
+                MeetingService.start_session(
+                    db,
+                    payload.title,
+                    payload.consent_note,
+                    payload.transcript_retention_days,
+                    caller.token_name,
+                )
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.get("/v1/meetings/active/current", response_model=Optional[MeetingSessionResponse])
+    async def get_active_meeting(
+        db: Session = Depends(get_db),
+        caller: AuthenticatedCaller = Depends(require_capability("meeting:read")),
+    ):
+        from .models import MeetingSession
+        session = (
+            db.query(MeetingSession)
+            .filter_by(lifecycle_status="active")
+            .order_by(MeetingSession.started_at.desc())
+            .first()
+        )
+        return meeting_session_response(session) if session else None
+
+    @app.post("/v1/meetings/{session_id}/stop", response_model=MeetingSessionResponse)
+    async def stop_meeting(
+        session_id: str,
+        db: Session = Depends(get_db),
+        caller: AuthenticatedCaller = Depends(require_capability("meeting:write")),
+    ):
+        from .meeting_service import MeetingService
+        try:
+            return meeting_session_response(MeetingService.stop_session(db, session_id, caller.token_name))
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+    @app.post("/v1/meetings/{session_id}/transcript-segments", response_model=TranscriptSegmentResponse)
+    async def add_meeting_transcript_segment(
+        session_id: str,
+        payload: TranscriptSegmentRequest,
+        db: Session = Depends(get_db),
+        caller: AuthenticatedCaller = Depends(require_capability("meeting:write")),
+    ):
+        from .meeting_service import MeetingService
+        try:
+            return transcript_response(
+                MeetingService.add_segment(
+                    db,
+                    session_id,
+                    payload.speaker_label,
+                    payload.transcript_text,
+                    payload.confidence,
+                    payload.occurred_at,
+                )
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.post("/v1/meetings/{session_id}/proposals", response_model=MeetingProposalListResponse)
+    async def generate_meeting_proposals(
+        session_id: str,
+        db: Session = Depends(get_db),
+        caller: AuthenticatedCaller = Depends(require_capability("meeting:write")),
+    ):
+        from .meeting_service import MeetingService
+        try:
+            proposals = MeetingService.generate_proposals(db, session_id)
+            return MeetingProposalListResponse(
+                proposals=[meeting_proposal_response(proposal) for proposal in proposals]
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.post("/v1/meetings/proposals/{proposal_id}/review", response_model=MeetingProposalResponse)
+    async def review_meeting_proposal(
+        proposal_id: str,
+        payload: ReviewMeetingProposalRequest,
+        db: Session = Depends(get_db),
+        caller: AuthenticatedCaller = Depends(require_capability("meeting:approve")),
+    ):
+        from .meeting_service import MeetingService
+        try:
+            return meeting_proposal_response(
+                MeetingService.review_proposal(db, proposal_id, payload.decision, caller.token_name)
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+
+    @app.get("/v1/meetings/{session_id}", response_model=MeetingDetailResponse)
+    async def get_meeting(
+        session_id: str,
+        db: Session = Depends(get_db),
+        caller: AuthenticatedCaller = Depends(require_capability("meeting:read")),
+    ):
+        from .models import MeetingProposal, MeetingSession, MeetingTranscriptSegment
+        session = db.query(MeetingSession).filter_by(id=session_id).first()
+        if session is None:
+            raise HTTPException(status_code=404, detail="Meeting session not found.")
+        segments = db.query(MeetingTranscriptSegment).filter_by(meeting_session_id=session_id).order_by(MeetingTranscriptSegment.occurred_at).all()
+        proposals = db.query(MeetingProposal).filter_by(meeting_session_id=session_id).order_by(MeetingProposal.created_at).all()
+        return MeetingDetailResponse(
+            session=meeting_session_response(session),
+            transcript_segments=[transcript_response(segment) for segment in segments],
+            proposals=[meeting_proposal_response(proposal) for proposal in proposals],
+        )
+
+    @app.post("/v1/meetings/retention/purge", response_model=RetentionPurgeResponse)
+    async def purge_meeting_transcripts(
+        db: Session = Depends(get_db),
+        caller: AuthenticatedCaller = Depends(require_capability("meeting:write")),
+    ):
+        from .meeting_service import MeetingService
+        return RetentionPurgeResponse(
+            purged_transcript_segments=MeetingService.purge_expired_transcripts(db)
+        )
+
+    @app.post("/v1/screen/analyze", response_model=ScreenAnalysisResponse)
+    async def analyze_screen(
+        payload: ScreenAnalysisRequest,
+        db: Session = Depends(get_db),
+        caller: AuthenticatedCaller = Depends(require_capability("screen:analyze")),
+    ):
+        import hashlib
+        import json
+        import uuid
+        from datetime import datetime, timezone
+        from .models import AuditEvent
+        from .screen_provider import SENSITIVE_SCREEN_TEXT, extract_png_base64
+        from .ai_provider import InvalidProviderOutputError, ProviderTimeoutError, ProviderUnavailableError
+
+        if SENSITIVE_SCREEN_TEXT.search(payload.ocr_text):
+            raise HTTPException(status_code=400, detail="Sensitive screen content is blocked from visual analysis.")
+        try:
+            encoded_png = extract_png_base64(payload.image_data_url)
+        except (ValueError, IndexError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        results = KnowledgeService.search_approved_knowledge(
+            db,
+            query_text=payload.ocr_text or "screen troubleshooting",
+            product_scope=payload.product_scope,
+            issue_type=payload.issue_type,
+            limit=5,
+        )
+        if not results:
+            return ScreenAnalysisResponse(
+                status="knowledge_unavailable",
+                uncertainty="No approved knowledge matched the visible screen.",
+                message="Visual-model analysis was skipped because no approved evidence was available.",
+            )
+        provider = app.state.screen_analysis_provider
+        if provider is None:
+            return ScreenAnalysisResponse(
+                status="provider_unavailable",
+                uncertainty="The visual provider is disabled.",
+                message="Approved sources remain available for manual troubleshooting.",
+                sources=[
+                    ScreenAnalysisSource(
+                        article_id=item.article_id,
+                        article_version_id=item.version_id,
+                        version_number=item.version_number,
+                        title=item.title,
+                    )
+                    for item in results
+                ],
+            )
+        knowledge_context = "\n\n".join(
+            f"[article_id={item.article_id}, version={item.version_number}, title={item.title}]\n{item.full_content}"
+            for item in results
+        )
+        try:
+            analysis = await provider.analyze(
+                encoded_png,
+                payload.ocr_text,
+                knowledge_context,
+                [item.article_id for item in results],
+                settings.ai_timeout_seconds,
+            )
+        except ProviderTimeoutError:
+            return ScreenAnalysisResponse(
+                status="provider_timeout",
+                uncertainty="Visual analysis timed out.",
+                message="No action was taken. Review the approved sources manually.",
+                sources=[
+                    ScreenAnalysisSource(
+                        article_id=item.article_id,
+                        article_version_id=item.version_id,
+                        version_number=item.version_number,
+                        title=item.title,
+                    )
+                    for item in results
+                ],
+            )
+        except (ProviderUnavailableError, InvalidProviderOutputError):
+            return ScreenAnalysisResponse(
+                status="provider_unavailable",
+                uncertainty="Visual analysis is temporarily unavailable.",
+                message="No action was taken. Review the approved sources manually.",
+                sources=[
+                    ScreenAnalysisSource(
+                        article_id=item.article_id,
+                        article_version_id=item.version_id,
+                        version_number=item.version_number,
+                        title=item.title,
+                    )
+                    for item in results
+                ],
+            )
+        selected = [item for item in results if item.article_id in set(analysis.source_article_ids)]
+        if not selected:
+            selected = results[:1]
+        screenshot_hash = hashlib.sha256(encoded_png.encode("ascii")).hexdigest()
+        db.add(
+            AuditEvent(
+                actor=caller.token_name,
+                action="screen.analyzed",
+                resource=f"screen_analysis/{uuid.uuid4()}",
+                correlation_id=str(uuid.uuid4()),
+                timestamp=datetime.now(timezone.utc),
+                details_json=json.dumps(
+                    {
+                        "redacted_screenshot_hash": screenshot_hash,
+                        "ocr_confidence": payload.ocr_confidence,
+                        "source_count": len(selected),
+                    }
+                ),
+            )
+        )
+        db.commit()
+        return ScreenAnalysisResponse(
+            status="analyzed",
+            observations=analysis.observations,
+            recommended_steps=analysis.recommended_steps,
+            uncertainty=analysis.uncertainty,
+            sources=[
+                ScreenAnalysisSource(
+                    article_id=item.article_id,
+                    article_version_id=item.version_id,
+                    version_number=item.version_number,
+                    title=item.title,
+                )
+                for item in selected
+            ],
+        )
+
+    def learning_candidate_response(c) -> LearningCandidateResponse:
+        return LearningCandidateResponse(
+            id=c.id,
+            suggestion_id=c.suggestion_id,
+            sent_response_id=c.sent_response_id,
+            candidate_title=c.candidate_title,
+            candidate_content=c.candidate_content,
+            product_scope=c.product_scope,
+            issue_type=c.issue_type,
+            client_scope=c.client_scope,
+            target_stable_key=c.target_stable_key,
+            target_article_id=c.target_article_id,
+            lifecycle_status=c.lifecycle_status,
+            created_by=c.created_by,
+            created_at=c.created_at,
+            reviewed_by=c.reviewed_by,
+            reviewed_at=c.reviewed_at,
+            resulting_article_version_id=c.resulting_article_version_id,
+        )
+
+    @app.post("/v1/suggestions/{suggestion_id}/learning-candidate", response_model=LearningCandidateResponse)
+    async def propose_learning_candidate(
+        suggestion_id: str,
+        payload: ProposeLearningCandidateRequest,
+        db: Session = Depends(get_db),
+        caller: AuthenticatedCaller = Depends(require_capability("knowledge:write")),
+    ):
+        from .learning_service import LearningService
+        try:
+            candidate = LearningService.propose_candidate(
+                db=db,
+                suggestion_id=suggestion_id,
+                candidate_title=payload.candidate_title,
+                actor=caller.token_name,
+                target_stable_key=payload.target_stable_key,
+                target_article_id=payload.target_article_id,
+                notes=payload.notes,
+            )
+            return learning_candidate_response(candidate)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.post("/v1/learning/candidates/{candidate_id}/review", response_model=LearningCandidateResponse)
+    async def review_learning_candidate(
+        candidate_id: str,
+        payload: ReviewLearningCandidateRequest,
+        db: Session = Depends(get_db),
+        caller: AuthenticatedCaller = Depends(require_capability("knowledge:approve")),
+    ):
+        from .learning_service import LearningService
+        try:
+            candidate = LearningService.review_candidate(
+                db=db,
+                candidate_id=candidate_id,
+                decision=payload.decision,
+                actor=caller.token_name,
+            )
+            return learning_candidate_response(candidate)
+        except ValueError as exc:
+            raise HTTPException(status_code=409 if "already been reviewed" in str(exc) else 400, detail=str(exc))
+
+    @app.get("/v1/learning/candidates", response_model=LearningCandidateListResponse)
+    async def list_learning_candidates(
+        status_filter: Optional[str] = None,
+        db: Session = Depends(get_db),
+        caller: AuthenticatedCaller = Depends(require_capability("knowledge:read")),
+    ):
+        from .learning_service import LearningService
+        candidates = LearningService.list_candidates(db=db, status=status_filter)
+        return LearningCandidateListResponse(
+            candidates=[learning_candidate_response(c) for c in candidates]
+        )
+
     app.dependency_overrides[get_settings] = get_app_settings
 
     return app
@@ -817,8 +1285,13 @@ def create_production_app() -> FastAPI:
         raise RuntimeError(f"Database directory '{db_dir}' is not writable.")
 
     provider: Optional[AIProvider] = None
+    screen_provider: Optional[ScreenAnalysisProvider] = None
     if settings.ai_provider == "gemini":
         provider = GeminiAIProvider(
+            api_key=settings.gemini_api_key.get_secret_value(),  # type: ignore[union-attr]
+            model=settings.gemini_model,
+        )
+        screen_provider = GeminiScreenAnalysisProvider(
             api_key=settings.gemini_api_key.get_secret_value(),  # type: ignore[union-attr]
             model=settings.gemini_model,
         )
@@ -826,6 +1299,7 @@ def create_production_app() -> FastAPI:
     return create_app(
         settings=settings,
         ai_provider=provider,
+        screen_analysis_provider=screen_provider,
         verify_schema=True,
         verify_auth=True,
     )

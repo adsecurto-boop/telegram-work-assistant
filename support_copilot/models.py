@@ -275,3 +275,67 @@ class ReportSnapshot(Base):
     created_by = Column(String(128), nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
     finalized_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class MeetingSession(Base):
+    __tablename__ = "meeting_sessions"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    title = Column(String(256), nullable=False)
+    lifecycle_status = Column(String(16), nullable=False, default="active", index=True)
+    consent_acknowledged = Column(Integer, nullable=False, default=0)
+    consent_note = Column(Text, nullable=False)
+    retention_until = Column(DateTime(timezone=True), nullable=False, index=True)
+    started_at = Column(DateTime(timezone=True), nullable=False)
+    stopped_at = Column(DateTime(timezone=True), nullable=True)
+    created_by = Column(String(128), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+
+
+class MeetingTranscriptSegment(Base):
+    __tablename__ = "meeting_transcript_segments"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    meeting_session_id = Column(String(36), ForeignKey("meeting_sessions.id"), nullable=False, index=True)
+    speaker_label = Column(String(128), nullable=True)
+    transcript_text = Column(Text, nullable=False)
+    confidence = Column(Float, nullable=False)
+    occurred_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+
+
+class MeetingProposal(Base):
+    __tablename__ = "meeting_proposals"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    meeting_session_id = Column(String(36), ForeignKey("meeting_sessions.id"), nullable=False, index=True)
+    proposal_type = Column(String(32), nullable=False, index=True)
+    proposal_text = Column(Text, nullable=False)
+    evidence_segment_ids_json = Column(Text, nullable=False, default="[]")
+    lifecycle_status = Column(String(16), nullable=False, default="proposed", index=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+    reviewed_at = Column(DateTime(timezone=True), nullable=True)
+    reviewed_by = Column(String(128), nullable=True)
+
+
+class ResponseLearningCandidate(Base):
+    __tablename__ = "response_learning_candidates"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    suggestion_id = Column(String(36), ForeignKey("response_suggestions.id"), nullable=False, index=True)
+    sent_response_id = Column(String(36), ForeignKey("sent_responses.id"), nullable=False, index=True)
+    candidate_title = Column(String(256), nullable=False)
+    candidate_content = Column(Text, nullable=False)
+    product_scope = Column(String(64), nullable=False, index=True)
+    issue_type = Column(String(64), nullable=False, index=True)
+    client_scope = Column(String(64), nullable=True, index=True)
+    target_stable_key = Column(String(128), nullable=True, index=True)
+    target_article_id = Column(String(36), ForeignKey("knowledge_articles.id"), nullable=True, index=True)
+    source_versions_json = Column(Text, nullable=False, default="[]")
+    metadata_json = Column(Text, nullable=False, default="{}")
+    lifecycle_status = Column(String(32), nullable=False, default="proposed", index=True)  # proposed, approved, rejected
+    created_by = Column(String(128), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+    reviewed_by = Column(String(128), nullable=True)
+    reviewed_at = Column(DateTime(timezone=True), nullable=True)
+    resulting_article_version_id = Column(String(36), ForeignKey("knowledge_article_versions.id"), nullable=True)

@@ -16,6 +16,23 @@ describe('Desktop Overlay App Component', () => {
     createKnowledge: vi.fn(),
     createCase: vi.fn(),
     listCases: vi.fn(),
+    getActiveMeeting: vi.fn(),
+    getMeeting: vi.fn(),
+    startMeeting: vi.fn(),
+    addTranscriptSegment: vi.fn(),
+    stopMeeting: vi.fn(),
+    generateMeetingProposals: vi.fn(),
+    reviewMeetingProposal: vi.fn(),
+    listWindowSources: vi.fn(),
+    selectWindowSource: vi.fn(),
+    captureScreenOnce: vi.fn(),
+    pauseScreenCapture: vi.fn(),
+    onScreenPaused: vi.fn(),
+    analyzeScreen: vi.fn(),
+    proposeLearningCandidate: vi.fn(),
+    reviewLearningCandidate: vi.fn(),
+    listLearningCandidates: vi.fn(),
+    getHealthDetailed: vi.fn(),
   };
 
   beforeEach(() => {
@@ -23,6 +40,17 @@ describe('Desktop Overlay App Component', () => {
     window.copilotAPI = mockCopilotAPI;
     mockCopilotAPI.getActivityToday.mockResolvedValue({ events: [] });
     mockCopilotAPI.listCases.mockResolvedValue({ cases: [] });
+    mockCopilotAPI.getActiveMeeting.mockResolvedValue(null);
+    mockCopilotAPI.onScreenPaused.mockReturnValue(vi.fn());
+    mockCopilotAPI.listLearningCandidates.mockResolvedValue({ candidates: [] });
+    mockCopilotAPI.getHealthDetailed.mockResolvedValue({
+      status: 'healthy',
+      api_status: 'healthy',
+      database: { connected: true, schema_revision: '005_phase7', integrity_check: 'ok' },
+      ai_provider: { mode: 'gemini', configured: true },
+      backup: { last_backup_timestamp: '2026-09-21T01:00:00Z' },
+      n8n: { configured: true },
+    });
     // Mock clipboard
     Object.assign(navigator, {
       clipboard: {
@@ -279,5 +307,103 @@ describe('Desktop Overlay App Component', () => {
     await waitFor(() => expect(screen.getByText(/EOD Report/i)).toBeInTheDocument());
     expect(screen.getByText(/Resolved login issue/i)).toBeInTheDocument();
     expect(screen.getByText(/Draft\/copied events excluded:/i)).toBeInTheDocument();
+  });
+
+  it('requires consent and shows visible active meeting state', async () => {
+    mockCopilotAPI.startMeeting.mockResolvedValue({
+      id: 'meeting-1',
+      title: 'Client support meeting',
+      lifecycle_status: 'active',
+      retention_until: '2026-09-28T00:00:00Z',
+      started_at: '2026-09-21T00:00:00Z',
+    });
+    render(<App />);
+    const startButton = screen.getByRole('button', { name: /Start Meeting Transcript/i });
+    expect(startButton).toBeDisabled();
+    fireEvent.click(screen.getByLabelText(/Participants consented/i));
+    fireEvent.click(startButton);
+    await waitFor(() => expect(screen.getByText(/TRANSCRIPT CAPTURE ACTIVE/i)).toBeInTheDocument());
+    expect(mockCopilotAPI.startMeeting).toHaveBeenCalledWith(expect.objectContaining({ consent_acknowledged: true }));
+  });
+
+  it('shows transcript uncertainty returned by the adapter', async () => {
+    mockCopilotAPI.getActiveMeeting.mockResolvedValue({
+      id: 'meeting-active',
+      title: 'Incident call',
+      lifecycle_status: 'active',
+      retention_until: '2026-09-28T00:00:00Z',
+      started_at: '2026-09-21T00:00:00Z',
+    });
+    mockCopilotAPI.getMeeting.mockResolvedValue({
+      transcript_segments: [{
+        id: 'segment-1', speaker_label: 'Client', transcript_text: 'Maybe it is fixed',
+        confidence: 0.55, uncertainty_visible: true,
+      }],
+      proposals: [],
+    });
+    render(<App />);
+    await waitFor(() => expect(screen.getByText(/55% — uncertain/i)).toBeInTheDocument());
+  });
+
+  it('requires explicit window selection before on-demand screen capture', async () => {
+    mockCopilotAPI.listWindowSources.mockResolvedValue([{ id: 'window-1', name: 'Support Portal' }]);
+    mockCopilotAPI.selectWindowSource.mockResolvedValue({ id: 'window-1', name: 'Support Portal' });
+    render(<App />);
+    fireEvent.click(screen.getByRole('button', { name: /List Windows/i }));
+    await waitFor(() => expect(screen.getByText('Support Portal')).toBeInTheDocument());
+    expect(screen.queryByRole('button', { name: /Capture One Screenshot/i })).not.toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText(/Window to Approve/i), { target: { value: 'window-1' } });
+    fireEvent.click(screen.getByRole('button', { name: /Approve Selected Window/i }));
+    await waitFor(() => expect(screen.getByRole('button', { name: /Capture One Screenshot/i })).toBeInTheDocument());
+    expect(mockCopilotAPI.captureScreenOnce).not.toHaveBeenCalled();
+  });
+
+  it('renders learning candidate and operational health sections', async () => {
+    mockCopilotAPI.listLearningCandidates.mockResolvedValue({
+      candidates: [
+        {
+          id: 'cand-1',
+          candidate_title: 'Attendance Policy Note',
+          candidate_content: 'Check date range and logs.',
+          product_scope: 'core',
+          issue_type: 'missing_logs',
+          created_by: 'agent-1',
+          lifecycle_status: 'proposed',
+        },
+      ],
+    });
+    render(<App />);
+    await waitFor(() => expect(screen.getByText('Response Learning Candidates')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText('Attendance Policy Note')).toBeInTheDocument());
+    expect(screen.getByText('Operational Health & Operations')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText(/HEALTHY/i)).toBeInTheDocument());
+  });
+
+  it('allows approving and rejecting learning candidates', async () => {
+    mockCopilotAPI.listLearningCandidates.mockResolvedValue({
+      candidates: [
+        {
+          id: 'cand-1',
+          candidate_title: 'Attendance Policy Note',
+          candidate_content: 'Check date range and logs.',
+          product_scope: 'core',
+          issue_type: 'missing_logs',
+          created_by: 'agent-1',
+          lifecycle_status: 'proposed',
+        },
+      ],
+    });
+    mockCopilotAPI.reviewLearningCandidate.mockResolvedValue({
+      id: 'cand-1',
+      lifecycle_status: 'approved',
+    });
+    render(<App />);
+    await waitFor(() => expect(screen.getByText('Attendance Policy Note')).toBeInTheDocument());
+    const approveBtn = screen.getByRole('button', { name: /^Approve$/i });
+    fireEvent.click(approveBtn);
+    expect(mockCopilotAPI.reviewLearningCandidate).toHaveBeenCalledWith({
+      candidateId: 'cand-1',
+      decision: 'approve',
+    });
   });
 });

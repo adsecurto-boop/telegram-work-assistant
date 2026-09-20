@@ -33,12 +33,22 @@ REQUIRED_TABLES_PHASE1 = REQUIRED_TABLES_PHASE0 | {
     "activity_events",
 }
 REQUIRED_TABLES_PHASE2 = REQUIRED_TABLES_PHASE1 | {"report_snapshots"}
+REQUIRED_TABLES_PHASE5 = REQUIRED_TABLES_PHASE2 | {
+    "meeting_sessions",
+    "meeting_transcript_segments",
+    "meeting_proposals",
+}
+REQUIRED_TABLES_PHASE7 = REQUIRED_TABLES_PHASE5 | {"response_learning_candidates"}
 
 def verify_schema_readiness(engine: Engine, required_tables: set = None) -> None:
     inspector = inspect(engine)
     existing_tables = set(inspector.get_table_names())
     if required_tables is None:
-        if "report_snapshots" in existing_tables:
+        if "response_learning_candidates" in existing_tables:
+            required_tables = REQUIRED_TABLES_PHASE7
+        elif "meeting_sessions" in existing_tables:
+            required_tables = REQUIRED_TABLES_PHASE5
+        elif "report_snapshots" in existing_tables:
             required_tables = REQUIRED_TABLES_PHASE2
         elif "knowledge_articles" in existing_tables:
             required_tables = REQUIRED_TABLES_PHASE1

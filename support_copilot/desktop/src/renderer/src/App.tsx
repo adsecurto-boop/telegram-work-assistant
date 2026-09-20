@@ -21,6 +21,29 @@ declare global {
       createKnowledge: (payload: any) => Promise<any>;
       createCase: (payload: any) => Promise<any>;
       listCases: () => Promise<any>;
+      getActiveMeeting: () => Promise<any>;
+      getMeeting: (sessionId: string) => Promise<any>;
+      startMeeting: (payload: any) => Promise<any>;
+      addTranscriptSegment: (payload: any) => Promise<any>;
+      stopMeeting: (sessionId: string) => Promise<any>;
+      generateMeetingProposals: (sessionId: string) => Promise<any>;
+      reviewMeetingProposal: (payload: { proposalId: string; decision: 'approve' | 'reject' }) => Promise<any>;
+      listWindowSources: () => Promise<Array<{ id: string; name: string }>>;
+      selectWindowSource: (sourceId: string) => Promise<{ id: string; name: string }>;
+      captureScreenOnce: () => Promise<any>;
+      pauseScreenCapture: () => Promise<{ paused: boolean }>;
+      onScreenPaused: (callback: () => void) => () => void;
+      analyzeScreen: (payload: any) => Promise<any>;
+      proposeLearningCandidate?: (payload: {
+        suggestionId: string;
+        candidate_title: string;
+        target_stable_key?: string;
+        target_article_id?: string;
+        notes?: string;
+      }) => Promise<any>;
+      reviewLearningCandidate?: (payload: { candidateId: string; decision: 'approve' | 'reject' }) => Promise<any>;
+      listLearningCandidates?: (status?: string) => Promise<any>;
+      getHealthDetailed?: () => Promise<any>;
     };
   }
 }
@@ -78,6 +101,40 @@ interface ReportSnapshot {
   };
 }
 
+interface MeetingSession {
+  id: string;
+  title: string;
+  lifecycle_status: 'active' | 'stopped';
+  retention_until: string;
+  started_at: string;
+  stopped_at?: string;
+}
+
+interface TranscriptSegment {
+  id: string;
+  speaker_label?: string;
+  transcript_text: string;
+  confidence: number;
+  uncertainty_visible: boolean;
+}
+
+interface MeetingProposal {
+  id: string;
+  proposal_type: 'summary' | 'action' | 'promise' | 'resolution';
+  proposal_text: string;
+  lifecycle_status: 'proposed' | 'approved' | 'rejected';
+}
+
+interface ScreenCaptureResult {
+  blocked: boolean;
+  reason?: string;
+  source_name: string;
+  image_data_url?: string;
+  ocr_text?: string;
+  ocr_confidence?: number;
+  redaction_count?: number;
+}
+
 export const App: React.FC = () => {
   const [clientMessage, setClientMessage] = useState('');
   const [clientId, setClientId] = useState('client-1');
@@ -101,8 +158,80 @@ export const App: React.FC = () => {
   const [caseNumber, setCaseNumber] = useState('');
   const [caseTitle, setCaseTitle] = useState('');
   const [openCases, setOpenCases] = useState<CaseCandidate[]>([]);
+  const [meetingTitle, setMeetingTitle] = useState('Client support meeting');
+  const [meetingConsent, setMeetingConsent] = useState(false);
+  const [meeting, setMeeting] = useState<MeetingSession | null>(null);
+  const [speakerLabel, setSpeakerLabel] = useState('');
+  const [transcriptText, setTranscriptText] = useState('');
+  const [transcriptConfidence, setTranscriptConfidence] = useState(0.9);
+  const [transcriptSegments, setTranscriptSegments] = useState<TranscriptSegment[]>([]);
+  const [meetingProposals, setMeetingProposals] = useState<MeetingProposal[]>([]);
+  const [windowSources, setWindowSources] = useState<Array<{ id: string; name: string }>>([]);
+  const [selectedWindowSource, setSelectedWindowSource] = useState('');
+  const [approvedWindowName, setApprovedWindowName] = useState('');
+  const [screenCapture, setScreenCapture] = useState<ScreenCaptureResult | null>(null);
+  const [screenAnalysis, setScreenAnalysis] = useState<any>(null);
+  const [screenBusy, setScreenBusy] = useState(false);
+
+  const [learningCandidates, setLearningCandidates] = useState<any[]>([]);
+  const [learningTitle, setLearningTitle] = useState('');
+  const [learningNotes, setLearningNotes] = useState('');
+  const [healthData, setHealthData] = useState<any | null>(null);
+  const [healthLoading, setHealthLoading] = useState(false);
 
   const api = window.copilotAPI;
+
+  const handleLoadLearningCandidates = async () => {
+    if (!api?.listLearningCandidates) return;
+    try {
+      const res = await api.listLearningCandidates();
+      setLearningCandidates(res?.candidates || []);
+    } catch (err: any) {
+      setError(err.message || 'Failed to load learning candidates');
+    }
+  };
+
+  const handleProposeLearningCandidate = async () => {
+    if (!suggestion || !api?.proposeLearningCandidate || !learningTitle.trim()) return;
+    try {
+      await api.proposeLearningCandidate({
+        suggestionId: suggestion.id,
+        candidate_title: learningTitle.trim(),
+        notes: learningNotes.trim(),
+      });
+      setStatusMessage('Learning candidate proposed successfully for human review.');
+      setLearningTitle('');
+      setLearningNotes('');
+      handleLoadLearningCandidates();
+    } catch (err: any) {
+      setError(err.message || 'Failed to propose learning candidate');
+    }
+  };
+
+  const handleReviewLearningCandidate = async (candidateId: string, decision: 'approve' | 'reject') => {
+    if (!api?.reviewLearningCandidate) return;
+    try {
+      await api.reviewLearningCandidate({ candidateId, decision });
+      setStatusMessage(`Learning candidate ${decision === 'approve' ? 'approved' : 'rejected'}.`);
+      handleLoadLearningCandidates();
+    } catch (err: any) {
+      setError(err.message || `Failed to ${decision} learning candidate`);
+    }
+  };
+
+  const handleFetchHealth = async () => {
+    if (!api?.getHealthDetailed) return;
+    setHealthLoading(true);
+    try {
+      const res = await api.getHealthDetailed();
+      setHealthData(res);
+      setStatusMessage('Operational health status refreshed.');
+    } catch (err: any) {
+      setError(err.message || 'Failed to fetch operational health');
+    } finally {
+      setHealthLoading(false);
+    }
+  };
 
   const loadActivities = async () => {
     if (!api?.getActivityToday) return;
@@ -118,7 +247,24 @@ export const App: React.FC = () => {
 
   useEffect(() => {
     loadActivities();
+    handleLoadLearningCandidates();
+    handleFetchHealth();
     api?.listCases?.().then((res) => setOpenCases(res?.cases || [])).catch(() => undefined);
+    api?.getActiveMeeting?.().then(async (active) => {
+      if (!active) return;
+      setMeeting(active);
+      const detail = await api.getMeeting(active.id);
+      setTranscriptSegments(detail?.transcript_segments || []);
+      setMeetingProposals(detail?.proposals || []);
+    }).catch(() => undefined);
+    const removePauseListener = api?.onScreenPaused?.(() => {
+      setApprovedWindowName('');
+      setSelectedWindowSource('');
+      setScreenCapture(null);
+      setScreenAnalysis(null);
+      setStatusMessage('Screen assistance paused with Ctrl/Cmd+Shift+P.');
+    });
+    return () => removePauseListener?.();
   }, []);
 
   const handleGenerateSuggestion = async (overrideCaseId?: string) => {
@@ -326,6 +472,146 @@ export const App: React.FC = () => {
       setStatusMessage('Case created and selected for the next suggestion.');
     } catch (err: any) {
       setError(err.message || 'Failed to create case.');
+    }
+  };
+
+  const handleStartMeeting = async () => {
+    if (!api?.startMeeting || !meetingConsent) {
+      setError('Confirm participant consent before starting transcript capture.');
+      return;
+    }
+    try {
+      const started = await api.startMeeting({
+        title: meetingTitle.trim(),
+        consent_acknowledged: true,
+        consent_note: 'Operator confirmed that participants consented to transcription.',
+        transcript_retention_days: 7,
+      });
+      setMeeting(started);
+      setTranscriptSegments([]);
+      setMeetingProposals([]);
+      setStatusMessage('Meeting transcript capture is visibly active.');
+    } catch (err: any) {
+      setError(err.message || 'Failed to start meeting session.');
+    }
+  };
+
+  const handleAddTranscript = async () => {
+    if (!api?.addTranscriptSegment || !meeting || !transcriptText.trim()) return;
+    try {
+      const segment = await api.addTranscriptSegment({
+        sessionId: meeting.id,
+        speaker_label: speakerLabel.trim() || undefined,
+        transcript_text: transcriptText.trim(),
+        confidence: transcriptConfidence,
+        occurred_at: new Date().toISOString(),
+      });
+      setTranscriptSegments((items) => [...items, segment]);
+      setTranscriptText('');
+    } catch (err: any) {
+      setError(err.message || 'Failed to add transcript segment.');
+    }
+  };
+
+  const handleStopMeeting = async () => {
+    if (!api?.stopMeeting || !meeting) return;
+    try {
+      setMeeting(await api.stopMeeting(meeting.id));
+      setStatusMessage('Meeting stopped. Transcript capture is off.');
+    } catch (err: any) {
+      setError(err.message || 'Failed to stop meeting.');
+    }
+  };
+
+  const handleGenerateMeetingProposals = async () => {
+    if (!api?.generateMeetingProposals || !meeting) return;
+    try {
+      const result = await api.generateMeetingProposals(meeting.id);
+      setMeetingProposals(result?.proposals || []);
+      setStatusMessage('Meeting summary and actions are proposals until you approve them.');
+    } catch (err: any) {
+      setError(err.message || 'Failed to generate meeting proposals.');
+    }
+  };
+
+  const handleReviewMeetingProposal = async (proposalId: string, decision: 'approve' | 'reject') => {
+    if (!api?.reviewMeetingProposal) return;
+    try {
+      const reviewed = await api.reviewMeetingProposal({ proposalId, decision });
+      setMeetingProposals((items) => items.map((item) => item.id === proposalId ? reviewed : item));
+      await loadActivities();
+    } catch (err: any) {
+      setError(err.message || 'Failed to review meeting proposal.');
+    }
+  };
+
+  const handleListWindows = async () => {
+    if (!api?.listWindowSources) return;
+    try {
+      setWindowSources(await api.listWindowSources());
+      setStatusMessage('Select exactly one window. No screenshot has been captured.');
+    } catch (err: any) {
+      setError(err.message || 'Failed to enumerate windows.');
+    }
+  };
+
+  const handleApproveWindow = async () => {
+    if (!api?.selectWindowSource || !selectedWindowSource) return;
+    try {
+      const selected = await api.selectWindowSource(selectedWindowSource);
+      setApprovedWindowName(selected.name);
+      setScreenCapture(null);
+      setScreenAnalysis(null);
+      setStatusMessage('Window approved. Capture remains on-demand only.');
+    } catch (err: any) {
+      setError(err.message || 'Window approval failed.');
+    }
+  };
+
+  const handleCaptureScreen = async () => {
+    if (!api?.captureScreenOnce) return;
+    setScreenBusy(true);
+    try {
+      const captured = await api.captureScreenOnce();
+      setScreenCapture(captured);
+      setScreenAnalysis(null);
+      if (captured.blocked) {
+        setStatusMessage(captured.reason);
+      } else {
+        setStatusMessage(`Local OCR complete. ${captured.redaction_count} sensitive text region(s) redacted.`);
+      }
+    } catch (err: any) {
+      setError(err.message || 'Screen capture failed.');
+    } finally {
+      setScreenBusy(false);
+    }
+  };
+
+  const handlePauseScreen = async () => {
+    await api?.pauseScreenCapture?.();
+    setApprovedWindowName('');
+    setSelectedWindowSource('');
+    setScreenCapture(null);
+    setScreenAnalysis(null);
+    setStatusMessage('Screen assistance paused and preview cleared.');
+  };
+
+  const handleAnalyzeScreen = async () => {
+    if (!api?.analyzeScreen || !screenCapture?.image_data_url) return;
+    setScreenBusy(true);
+    try {
+      const analysis = await api.analyzeScreen({
+        image_data_url: screenCapture.image_data_url,
+        ocr_text: screenCapture.ocr_text || '',
+        ocr_confidence: screenCapture.ocr_confidence || 0,
+        product_scope: productScope.trim() || undefined,
+        issue_type: issueType.trim() || undefined,
+      });
+      setScreenAnalysis(analysis);
+    } catch (err: any) {
+      setError(err.message || 'Screen analysis failed.');
+    } finally {
+      setScreenBusy(false);
     }
   };
 
@@ -537,6 +823,38 @@ export const App: React.FC = () => {
               ✓ I Sent This Exact Response
             </button>
           </div>
+
+          {suggestion.lifecycle_status === 'sent' && (
+            <div className="form-group" style={{ marginTop: '16px', padding: '12px', background: 'var(--bg-secondary)', borderRadius: '6px' }}>
+              <label htmlFor="learning-title-input"><strong>Propose for Knowledge Learning</strong></label>
+              <p style={{ fontSize: '12px', color: 'var(--text-secondary)', marginBottom: '8px' }}>
+                This confirmed sent response can be proposed as a learning candidate. It requires authorized human approval before entering retrieval.
+              </p>
+              <input
+                id="learning-title-input"
+                type="text"
+                placeholder="Candidate Title (e.g. Attendance Policy Resolution)"
+                value={learningTitle}
+                onChange={(e) => setLearningTitle(e.target.value)}
+                style={{ marginBottom: '8px' }}
+              />
+              <textarea
+                placeholder="Notes or rationale (optional)"
+                value={learningNotes}
+                onChange={(e) => setLearningNotes(e.target.value)}
+                rows={2}
+                style={{ marginBottom: '8px' }}
+              />
+              <button
+                id="propose-learning-btn"
+                className="btn btn-secondary"
+                onClick={handleProposeLearningCandidate}
+                disabled={!learningTitle.trim()}
+              >
+                Propose Learning Candidate
+              </button>
+            </div>
+          )}
         </section>
       )}
 
@@ -619,6 +937,140 @@ export const App: React.FC = () => {
         </section>
       )}
 
+      <section className="card" aria-labelledby="meeting-heading">
+        <h2 id="meeting-heading">Meeting Copilot</h2>
+        <div className="alert alert-info" role="status" style={{ marginBottom: '12px' }}>
+          Transcript entry is manual or adapter-supplied. No raw audio or microphone recording is performed.
+        </div>
+        {!meeting ? (
+          <>
+            <div className="form-group">
+              <label htmlFor="meeting-title">Meeting Title</label>
+              <input id="meeting-title" value={meetingTitle} onChange={(e) => setMeetingTitle(e.target.value)} />
+            </div>
+            <label style={{ display: 'flex', gap: '8px', alignItems: 'flex-start', marginBottom: '12px' }}>
+              <input
+                aria-label="Participants consented"
+                type="checkbox"
+                checked={meetingConsent}
+                onChange={(e) => setMeetingConsent(e.target.checked)}
+              />
+              I confirm all participants consented to transcription. Transcript retention: 7 days.
+            </label>
+            <button className="btn" onClick={handleStartMeeting} disabled={!meetingConsent || !meetingTitle.trim()}>
+              Start Meeting Transcript
+            </button>
+          </>
+        ) : (
+          <>
+            <div className={`alert ${meeting.lifecycle_status === 'active' ? 'alert-warning' : 'alert-info'}`} role="status">
+              {meeting.lifecycle_status === 'active' ? '🔴 TRANSCRIPT CAPTURE ACTIVE' : '⏹ TRANSCRIPT CAPTURE STOPPED'} — {meeting.title}
+            </div>
+            {meeting.lifecycle_status === 'active' && (
+              <>
+                <div className="action-row">
+                  <div className="form-group" style={{ flex: 1 }}>
+                    <label htmlFor="speaker-label">Speaker</label>
+                    <input id="speaker-label" value={speakerLabel} onChange={(e) => setSpeakerLabel(e.target.value)} />
+                  </div>
+                  <div className="form-group" style={{ flex: 1 }}>
+                    <label htmlFor="transcript-confidence">Confidence</label>
+                    <input
+                      id="transcript-confidence"
+                      type="number"
+                      min="0"
+                      max="1"
+                      step="0.05"
+                      value={transcriptConfidence}
+                      onChange={(e) => setTranscriptConfidence(Number(e.target.value))}
+                    />
+                  </div>
+                </div>
+                <div className="form-group">
+                  <label htmlFor="transcript-text">Transcript Segment</label>
+                  <textarea id="transcript-text" value={transcriptText} onChange={(e) => setTranscriptText(e.target.value)} />
+                </div>
+                <div className="action-row">
+                  <button className="btn btn-secondary" onClick={handleAddTranscript}>Add Transcript Segment</button>
+                  <button className="btn btn-danger" onClick={handleStopMeeting}>Stop Meeting</button>
+                </div>
+              </>
+            )}
+            <ul className="activity-list">
+              {transcriptSegments.map((segment) => (
+                <li key={segment.id} className="activity-item">
+                  <span><strong>{segment.speaker_label || 'Unknown speaker'}:</strong> {segment.transcript_text}</span>
+                  <span className={segment.uncertainty_visible ? 'tag tag-warning' : 'tag tag-info'}>
+                    {Math.round(segment.confidence * 100)}%{segment.uncertainty_visible ? ' — uncertain' : ''}
+                  </span>
+                </li>
+              ))}
+            </ul>
+            {meeting.lifecycle_status === 'stopped' && meetingProposals.length === 0 && (
+              <button className="btn" onClick={handleGenerateMeetingProposals}>Generate Meeting Proposals</button>
+            )}
+            {meetingProposals.map((proposal) => (
+              <div key={proposal.id} className="form-group">
+                <label>{proposal.proposal_type.toUpperCase()} — {proposal.lifecycle_status}</label>
+                <div style={{ whiteSpace: 'pre-wrap', fontSize: '13px' }}>{proposal.proposal_text}</div>
+                {proposal.lifecycle_status === 'proposed' && (
+                  <div className="action-row" style={{ marginTop: '8px' }}>
+                    <button className="btn btn-success" onClick={() => handleReviewMeetingProposal(proposal.id, 'approve')}>Approve</button>
+                    <button className="btn btn-danger" onClick={() => handleReviewMeetingProposal(proposal.id, 'reject')}>Reject</button>
+                  </div>
+                )}
+              </div>
+            ))}
+          </>
+        )}
+      </section>
+
+      <section className="card" aria-labelledby="screen-heading">
+        <h2 id="screen-heading">On-Demand Screen Assistance</h2>
+        <div className="alert alert-info" role="status">
+          Capture is off by default. Select one window; pause anytime with Ctrl/Cmd+Shift+P. No mouse or keyboard control is available.
+        </div>
+        <div className="action-row">
+          <button className="btn btn-secondary" onClick={handleListWindows}>List Windows</button>
+          <button className="btn btn-danger" onClick={handlePauseScreen}>Pause & Clear</button>
+        </div>
+        {windowSources.length > 0 && (
+          <div className="form-group">
+            <label htmlFor="window-source">Window to Approve</label>
+            <select id="window-source" value={selectedWindowSource} onChange={(e) => setSelectedWindowSource(e.target.value)}>
+              <option value="">Choose a window</option>
+              {windowSources.map((source) => <option key={source.id} value={source.id}>{source.name}</option>)}
+            </select>
+            <button className="btn btn-secondary" onClick={handleApproveWindow} disabled={!selectedWindowSource}>Approve Selected Window</button>
+          </div>
+        )}
+        {approvedWindowName && (
+          <>
+            <p><strong>Approved window:</strong> {approvedWindowName}</p>
+            <button className="btn" onClick={handleCaptureScreen} disabled={screenBusy}>
+              {screenBusy ? 'Processing Locally...' : 'Capture One Screenshot & Run Local OCR'}
+            </button>
+          </>
+        )}
+        {screenCapture?.blocked && <div className="alert alert-warning">{screenCapture.reason}</div>}
+        {screenCapture?.image_data_url && (
+          <>
+            <img src={screenCapture.image_data_url} alt={`Redacted capture of ${screenCapture.source_name}`} style={{ width: '100%', marginTop: '12px', borderRadius: '6px' }} />
+            <p><strong>OCR confidence:</strong> {Math.round((screenCapture.ocr_confidence || 0) * 100)}%</p>
+            <pre style={{ whiteSpace: 'pre-wrap', fontSize: '11px' }}>{screenCapture.ocr_text}</pre>
+            <button className="btn" onClick={handleAnalyzeScreen} disabled={screenBusy}>Analyze Redacted Screenshot</button>
+          </>
+        )}
+        {screenAnalysis && (
+          <div className="form-group">
+            <label>Proposed Troubleshooting — {screenAnalysis.status}</label>
+            <ul>{(screenAnalysis.recommended_steps || []).map((step: string, index: number) => <li key={index}>{step}</li>)}</ul>
+            <p><strong>Uncertainty:</strong> {screenAnalysis.uncertainty}</p>
+            <p><strong>Evidence:</strong> {(screenAnalysis.sources || []).map((source: any) => `${source.title} v${source.version_number}`).join(', ') || 'None'}</p>
+          </div>
+        )}
+      </section>
+
       {/* 4. Recent Local Activity */}
       <section className="card" aria-labelledby="activity-heading">
         <h2 id="activity-heading">Today's Local Activity</h2>
@@ -637,6 +1089,67 @@ export const App: React.FC = () => {
               </li>
             ))}
           </ul>
+        )}
+      </section>
+
+      {/* 5. Response Learning Candidates */}
+      <section className="card" aria-labelledby="learning-heading">
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <h2 id="learning-heading">Response Learning Candidates</h2>
+          <button className="btn btn-secondary" onClick={handleLoadLearningCandidates}>Refresh Candidates</button>
+        </div>
+        {learningCandidates.length === 0 ? (
+          <p style={{ fontSize: '12px', color: 'var(--text-secondary)', marginTop: '8px' }}>No learning candidates found.</p>
+        ) : (
+          <div style={{ marginTop: '12px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
+            {learningCandidates.map((cand) => (
+              <div key={cand.id} className="form-group" style={{ borderBottom: '1px solid var(--border-color)', paddingBottom: '10px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <strong>{cand.candidate_title}</strong>
+                  <span className={`tag ${cand.lifecycle_status === 'approved' ? 'tag-success' : cand.lifecycle_status === 'rejected' ? 'tag-danger' : 'tag-warning'}`}>
+                    {cand.lifecycle_status}
+                  </span>
+                </div>
+                <div style={{ whiteSpace: 'pre-wrap', fontSize: '12px', margin: '6px 0' }}>{cand.candidate_content}</div>
+                <small style={{ color: 'var(--text-secondary)' }}>
+                  Scope: {cand.product_scope} / {cand.issue_type} | Proposed by: {cand.created_by}
+                </small>
+                {cand.lifecycle_status === 'proposed' && (
+                  <div className="action-row" style={{ marginTop: '8px' }}>
+                    <button className="btn btn-success" onClick={() => handleReviewLearningCandidate(cand.id, 'approve')}>Approve</button>
+                    <button className="btn btn-danger" onClick={() => handleReviewLearningCandidate(cand.id, 'reject')}>Reject</button>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+
+      {/* 6. Operational Health & Operations */}
+      <section className="card" aria-labelledby="health-heading">
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <h2 id="health-heading">Operational Health & Operations</h2>
+          <button className="btn btn-secondary" onClick={handleFetchHealth} disabled={healthLoading}>
+            {healthLoading ? 'Checking...' : 'Check Health'}
+          </button>
+        </div>
+        {healthData && (
+          <div style={{ marginTop: '12px', fontSize: '13px' }}>
+            <p>
+              <strong>Overall Status:</strong>{' '}
+              <span className={`tag ${healthData.status === 'healthy' ? 'tag-success' : healthData.status === 'degraded' ? 'tag-warning' : 'tag-danger'}`}>
+                {healthData.status.toUpperCase()}
+              </span>
+            </p>
+            <p><strong>Database:</strong> {healthData.database?.connected ? 'Connected' : 'Disconnected'} (Revision: {healthData.database?.schema_revision || 'unknown'}, Integrity: {healthData.database?.integrity_check})</p>
+            <p><strong>AI Provider:</strong> Mode: {healthData.ai_provider?.mode} ({healthData.ai_provider?.configured ? 'Configured' : 'Not configured'})</p>
+            <p><strong>Last Backup:</strong> {healthData.backup?.last_backup_timestamp || 'No recorded backups'}</p>
+            <p><strong>n8n Integration:</strong> {healthData.n8n?.configured ? 'Configured' : 'Not configured'}</p>
+            <p style={{ fontSize: '11px', color: 'var(--text-secondary)', marginTop: '8px' }}>
+              Operations: Run <code>python -m support_copilot.operations backup</code> to create an online backup. See <code>docs/support-copilot/DISASTER_RECOVERY.md</code> for full recovery procedures.
+            </p>
+          </div>
         )}
       </section>
     </div>

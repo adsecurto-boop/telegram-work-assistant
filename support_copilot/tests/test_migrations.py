@@ -12,6 +12,8 @@ from support_copilot.database import (
     REQUIRED_TABLES_PHASE0,
     REQUIRED_TABLES_PHASE1,
     REQUIRED_TABLES_PHASE2,
+    REQUIRED_TABLES_PHASE5,
+    REQUIRED_TABLES_PHASE7,
 )
 from support_copilot.migration_runner import MigrationRunner, MigrationError
 from support_copilot.models import CapturedEvent
@@ -24,14 +26,16 @@ def test_phase1_migration_upgrade_and_schema_readiness(tmp_path):
     settings = Settings(data_dir=str(data_dir), db_path=f"sqlite:///{db_file}")
     runner = MigrationRunner(settings)
 
-    # 1. Upgrade to head (which includes 001 and 002)
+    # 1. Upgrade to head (which includes 001 through 005)
     runner.run_upgrade("head")
 
     engine = create_db_engine(f"sqlite:///{db_file}")
     try:
-        # Verifies all Phase 0 + Phase 1 tables exist
+        # Verifies all Phase 0 + Phase 1 + Phase 2 + Phase 5 + Phase 7 tables exist
         verify_schema_readiness(engine, required_tables=REQUIRED_TABLES_PHASE1)
         verify_schema_readiness(engine, required_tables=REQUIRED_TABLES_PHASE2)
+        verify_schema_readiness(engine, required_tables=REQUIRED_TABLES_PHASE5)
+        verify_schema_readiness(engine, required_tables=REQUIRED_TABLES_PHASE7)
 
         # Verify FTS5 virtual table exists
         conn = sqlite3.connect(str(db_file))
@@ -160,3 +164,39 @@ def test_downgrade_to_phase0_preserves_phase0_data_and_drops_phase1_tables(tmp_p
             db2.close()
     finally:
         engine2.dispose()
+
+
+def test_phase7_migration_upgrade_and_downgrade(tmp_path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    db_file = data_dir / "mig_phase7.sqlite3"
+    settings = Settings(data_dir=str(data_dir), db_path=f"sqlite:///{db_file}")
+    runner = MigrationRunner(settings)
+
+    # 1. Upgrade to head
+    runner.run_upgrade("head")
+
+    engine = create_db_engine(f"sqlite:///{db_file}")
+    try:
+        verify_schema_readiness(engine, required_tables=REQUIRED_TABLES_PHASE7)
+    finally:
+        engine.dispose()
+
+    # 2. Downgrade to 004_phase5
+    runner.run_downgrade("004_phase5", allow_downgrade=True)
+    engine2 = create_db_engine(f"sqlite:///{db_file}")
+    try:
+        inspector = inspect(engine2)
+        tables = set(inspector.get_table_names())
+        assert "response_learning_candidates" not in tables
+        assert "meeting_sessions" in tables
+    finally:
+        engine2.dispose()
+
+    # 3. Re-upgrade to head
+    runner.run_upgrade("head")
+    engine3 = create_db_engine(f"sqlite:///{db_file}")
+    try:
+        verify_schema_readiness(engine3, required_tables=REQUIRED_TABLES_PHASE7)
+    finally:
+        engine3.dispose()

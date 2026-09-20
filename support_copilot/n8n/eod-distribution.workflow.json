@@ -6,7 +6,16 @@
       "type": "n8n-nodes-base.scheduleTrigger",
       "typeVersion": 1.2,
       "position": [0, 0],
-      "parameters": {"rule": {"interval": [{"field": "days", "triggerAtHour": 18}]}}
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "triggerAtHour": 18
+            }
+          ]
+        }
+      }
     },
     {
       "name": "Build Signed Export Request",
@@ -14,7 +23,7 @@
       "typeVersion": 2,
       "position": [240, 0],
       "parameters": {
-        "jsCode": "// Read COPILOT_N8N_SHARED_SECRET from n8n credentials/environment.\n// Produce X-Copilot-Timestamp, unique X-Copilot-Event-ID, report:export capability,\n// and HMAC-SHA256 over timestamp.eventId.capability.canonicalJsonBody.\nreturn items;"
+        "jsCode": "const crypto = require('crypto');\n\nconst secret = $env.COPILOT_N8N_SHARED_SECRET || '';\nconst timestamp = Math.floor(Date.now() / 1000).toString();\nconst eventId = 'n8n-eod-' + Date.now() + '-' + Math.random().toString(36).substring(2, 10);\nconst capability = 'report:export';\n\nconst payloadObj = {\n  report_date: null,\n  report_type: 'eod'\n};\nconst canonicalBody = JSON.stringify(payloadObj, Object.keys(payloadObj).sort());\nconst message = `${timestamp}.${eventId}.${capability}.${canonicalBody}`;\nconst signature = crypto.createHmac('sha256', secret).update(message, 'utf8').digest('hex');\n\nreturn [\n  {\n    json: {\n      headers: {\n        'X-Copilot-Timestamp': timestamp,\n        'X-Copilot-Event-ID': eventId,\n        'X-Copilot-Capability': capability,\n        'X-Copilot-Signature': signature,\n        'Content-Type': 'application/json'\n      },\n      body: canonicalBody\n    }\n  }\n];"
       }
     },
     {
@@ -26,11 +35,42 @@
         "method": "POST",
         "url": "http://127.0.0.1:8000/v1/integrations/n8n/report-export",
         "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Copilot-Timestamp",
+              "value": "={{ $json.headers['X-Copilot-Timestamp'] }}"
+            },
+            {
+              "name": "X-Copilot-Event-ID",
+              "value": "={{ $json.headers['X-Copilot-Event-ID'] }}"
+            },
+            {
+              "name": "X-Copilot-Capability",
+              "value": "={{ $json.headers['X-Copilot-Capability'] }}"
+            },
+            {
+              "name": "X-Copilot-Signature",
+              "value": "={{ $json.headers['X-Copilot-Signature'] }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "={{ $json.headers['Content-Type'] }}"
+            }
+          ]
+        },
         "sendBody": true,
         "contentType": "raw",
         "rawContentType": "application/json",
-        "body": "={\"report_type\":\"eod\",\"report_date\":null}",
-        "options": {"timeout": 10000, "redirect": {"redirect": {"followRedirects": false}}}
+        "body": "={{ $json.body }}",
+        "options": {
+          "timeout": 10000,
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          }
+        }
       },
       "retryOnFail": true,
       "maxTries": 3,
@@ -45,10 +85,42 @@
     }
   ],
   "connections": {
-    "Daily Schedule": {"main": [[{"node": "Build Signed Export Request", "type": "main", "index": 0}]]},
-    "Build Signed Export Request": {"main": [[{"node": "Fetch Finalized EOD", "type": "main", "index": 0}]]},
-    "Fetch Finalized EOD": {"main": [[{"node": "Approved Distribution Target", "type": "main", "index": 0}]]}
+    "Daily Schedule": {
+      "main": [
+        [
+          {
+            "node": "Build Signed Export Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Signed Export Request": {
+      "main": [
+        [
+          {
+            "node": "Fetch Finalized EOD",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Finalized EOD": {
+      "main": [
+        [
+          {
+            "node": "Approved Distribution Target",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
   },
   "active": false,
-  "settings": {"executionOrder": "v1"}
+  "settings": {
+    "executionOrder": "v1"
+  }
 }

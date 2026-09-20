@@ -108,13 +108,24 @@ Exit gate:
 
 ## Phase 7 — Reliability and controlled expansion
 
-Deliver only after usage evidence:
+Delivered:
 
-- Additional support channels.
-- Approved response-learning workflow.
-- Retrieval evaluation dataset and measured ranking improvements.
-- Backup/restore drills, health dashboard, and disaster recovery runbook.
-- Optional carefully scoped external actions with human confirmation.
+- Human-approved response-learning workflow originating only from confirmed sent responses.
+- Version-controlled synthetic retrieval evaluation dataset (`retrieval_cases.json`) and CLI runner.
+- Online SQLite backup API, manifest generation, integrity check, and safe atomic restore with pre-flight verification.
+- Operational health dashboard endpoint (`/v1/health/detailed`) with secret redaction.
+- Disaster recovery runbook (`DISASTER_RECOVERY.md`) with tested recovery procedures.
+
+Exit gate:
+
+- All learning candidate proposal, approval, rejection, and idempotency tests pass.
+- Online backup, manifest verification, corrupt file detection, and isolated restore drill pass.
+- Detailed health status exposes no tokens, keys, secrets, or file paths.
+
+Explicitly deferred (awaiting real usage evidence):
+
+- Additional support channels (Slack, Teams, WhatsApp, email) remain deferred.
+- Autonomous outbound actions remain prohibited.
 
 ## Per-phase review workflow across AI tools
 

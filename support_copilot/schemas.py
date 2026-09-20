@@ -278,3 +278,143 @@ class CaseResponse(StrictBaseModel):
 
 class CaseListResponse(StrictBaseModel):
     cases: List[CaseResponse]
+
+
+class StartMeetingRequest(StrictBaseModel):
+    title: str = Field(..., min_length=1, max_length=256)
+    consent_acknowledged: Literal[True]
+    consent_note: str = Field(..., min_length=3, max_length=1000)
+    transcript_retention_days: int = Field(default=7, ge=1, le=365)
+
+
+class MeetingSessionResponse(StrictBaseModel):
+    id: str
+    title: str
+    lifecycle_status: Literal["active", "stopped"]
+    consent_acknowledged: bool
+    consent_note: str
+    retention_until: datetime
+    started_at: datetime
+    stopped_at: Optional[datetime] = None
+
+
+class TranscriptSegmentRequest(StrictBaseModel):
+    speaker_label: Optional[str] = Field(default=None, max_length=128)
+    transcript_text: str = Field(..., min_length=1, max_length=10000)
+    confidence: float = Field(..., ge=0.0, le=1.0)
+    occurred_at: Optional[datetime] = None
+
+    @field_validator("transcript_text")
+    @classmethod
+    def transcript_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Transcript text cannot be blank.")
+        return value.strip()
+
+
+class TranscriptSegmentResponse(StrictBaseModel):
+    id: str
+    meeting_session_id: str
+    speaker_label: Optional[str] = None
+    transcript_text: str
+    confidence: float
+    uncertainty_visible: bool
+    occurred_at: datetime
+
+
+class MeetingProposalResponse(StrictBaseModel):
+    id: str
+    meeting_session_id: str
+    proposal_type: Literal["summary", "action", "promise", "resolution"]
+    proposal_text: str
+    evidence_segment_ids: List[str]
+    lifecycle_status: Literal["proposed", "approved", "rejected"]
+    created_at: datetime
+    reviewed_at: Optional[datetime] = None
+
+
+class MeetingProposalListResponse(StrictBaseModel):
+    proposals: List[MeetingProposalResponse]
+
+
+class ReviewMeetingProposalRequest(StrictBaseModel):
+    decision: Literal["approve", "reject"]
+
+
+class RetentionPurgeResponse(StrictBaseModel):
+    purged_transcript_segments: int
+
+
+class MeetingDetailResponse(StrictBaseModel):
+    session: MeetingSessionResponse
+    transcript_segments: List[TranscriptSegmentResponse]
+    proposals: List[MeetingProposalResponse]
+
+
+class ScreenAnalysisRequest(StrictBaseModel):
+    image_data_url: str = Field(..., max_length=12_000_000)
+    ocr_text: str = Field(..., max_length=50_000)
+    ocr_confidence: float = Field(..., ge=0.0, le=1.0)
+    product_scope: Optional[str] = Field(default=None, max_length=64)
+    issue_type: Optional[str] = Field(default=None, max_length=64)
+
+
+class ScreenAnalysisSource(StrictBaseModel):
+    article_id: str
+    article_version_id: str
+    version_number: int
+    title: str
+
+
+class ScreenAnalysisResponse(StrictBaseModel):
+    status: Literal["analyzed", "knowledge_unavailable", "provider_unavailable", "provider_timeout"]
+    observations: List[str] = Field(default_factory=list)
+    recommended_steps: List[str] = Field(default_factory=list)
+    uncertainty: str
+    sources: List[ScreenAnalysisSource] = Field(default_factory=list)
+    message: Optional[str] = None
+
+
+class ProposeLearningCandidateRequest(StrictBaseModel):
+    candidate_title: str = Field(..., min_length=1, max_length=256)
+    target_stable_key: Optional[str] = Field(default=None, max_length=128)
+    target_article_id: Optional[str] = Field(default=None, max_length=36)
+    notes: Optional[str] = Field(default=None, max_length=2000)
+
+
+class ReviewLearningCandidateRequest(StrictBaseModel):
+    decision: Literal["approve", "reject"]
+
+
+class LearningCandidateResponse(StrictBaseModel):
+    id: str
+    suggestion_id: str
+    sent_response_id: str
+    candidate_title: str
+    candidate_content: str
+    product_scope: str
+    issue_type: str
+    client_scope: Optional[str] = None
+    target_stable_key: Optional[str] = None
+    target_article_id: Optional[str] = None
+    lifecycle_status: Literal["proposed", "approved", "rejected"]
+    created_by: str
+    created_at: datetime
+    reviewed_by: Optional[str] = None
+    reviewed_at: Optional[datetime] = None
+    resulting_article_version_id: Optional[str] = None
+
+
+class LearningCandidateListResponse(StrictBaseModel):
+    candidates: List[LearningCandidateResponse]
+
+
+class DetailedHealthResponse(StrictBaseModel):
+    status: Literal["healthy", "degraded", "unhealthy"]
+    api_status: str
+    database: Dict[str, Any]
+    ai_provider: Dict[str, Any]
+    backup: Dict[str, Any]
+    retention: Dict[str, Any]
+    telegram: Dict[str, Any]
+    n8n: Dict[str, Any]

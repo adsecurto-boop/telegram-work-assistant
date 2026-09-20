@@ -1,0 +1,47 @@
+[
+  {
+    "case_id": "eval-001",
+    "query": "client cannot view attendance logs for selected date range",
+    "product_scope": "core",
+    "issue_type": "missing_logs",
+    "expected_stable_key": "art-attendance-policy",
+    "negative_keys": ["art-unrelated-billing"],
+    "rationale": "Queries regarding missing attendance logs must retrieve the attendance policy article as top result."
+  },
+  {
+    "case_id": "eval-002",
+    "query": "how to reset two-factor authentication for corporate user",
+    "product_scope": "core",
+    "issue_type": "auth",
+    "expected_stable_key": "art-2fa-reset",
+    "negative_keys": ["art-attendance-policy"],
+    "rationale": "2FA reset inquiries must ground in identity verification and authenticator reset procedure."
+  },
+  {
+    "case_id": "eval-003",
+    "query": "webhook signature mismatch error 401 on n8n export",
+    "product_scope": "integrations",
+    "issue_type": "webhook_failure",
+    "expected_stable_key": "art-n8n-export-troubleshooting",
+    "negative_keys": ["art-2fa-reset"],
+    "rationale": "Webhook authentication failures should retrieve the n8n signature and secret verification guide."
+  },
+  {
+    "case_id": "eval-004",
+    "query": "attendance ingestion job timed out during nightly sync",
+    "product_scope": "core",
+    "issue_type": "missing_logs",
+    "expected_stable_key": "art-attendance-policy",
+    "negative_keys": ["art-2fa-reset"],
+    "rationale": "Ingestion job timeouts affect attendance logs and must surface the attendance data policy."
+  },
+  {
+    "case_id": "eval-005",
+    "query": "corporate sso login failure with saml assertion error",
+    "product_scope": "core",
+    "issue_type": "auth",
+    "expected_stable_key": "art-2fa-reset",
+    "negative_keys": ["art-n8n-export-troubleshooting"],
+    "rationale": "SSO and authentication errors belong to the auth domain."
+  }
+]

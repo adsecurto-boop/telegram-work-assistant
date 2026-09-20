@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { SECURITY_PREFERENCES, ALLOWED_IPC_CHANNELS } from '../src/main/main';
+import { SECURITY_PREFERENCES, ALLOWED_IPC_CHANNELS } from '../src/main/security';
+import { isSensitiveWindowTitle, redactOcrText, shouldBlockOcrText } from '../src/main/screen_security';
 
 describe('Desktop Electron Security Configuration', () => {
   it('enforces context isolation, disables node integration, and enables sandbox', () => {
@@ -23,7 +24,30 @@ describe('Desktop Electron Security Configuration', () => {
       'copilot:create-knowledge',
       'copilot:create-case',
       'copilot:list-cases',
+      'copilot:get-active-meeting',
+      'copilot:get-meeting',
+      'copilot:start-meeting',
+      'copilot:add-transcript-segment',
+      'copilot:stop-meeting',
+      'copilot:generate-meeting-proposals',
+      'copilot:review-meeting-proposal',
+      'copilot:list-window-sources',
+      'copilot:select-window-source',
+      'copilot:capture-screen-once',
+      'copilot:pause-screen-capture',
+      'copilot:analyze-screen',
+      'copilot:propose-learning-candidate',
+      'copilot:review-learning-candidate',
+      'copilot:list-learning-candidates',
+      'copilot:get-health-detailed',
     ]);
+  });
+
+  it('blocks sensitive windows and locally redacts personal identifiers', () => {
+    expect(isSensitiveWindowTitle('Online Banking Login')).toBe(true);
+    expect(shouldBlockOcrText('Enter OTP and CVV')).toBe(true);
+    expect(redactOcrText('Email person@example.com or call +919876543210')).toContain('[REDACTED]');
+    expect(redactOcrText('Email person@example.com or call +919876543210')).not.toContain('person@example.com');
   });
 
   it('prohibits arbitrary IPC channels', () => {
