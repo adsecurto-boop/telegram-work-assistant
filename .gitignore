@@ -38,3 +38,7 @@ storage/exports/
 !.env.example
 storage/*.lock
 script-update/
+node_modules/
+**/node_modules/
+support_copilot/desktop/dist/
+dist/

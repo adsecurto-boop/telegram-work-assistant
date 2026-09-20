@@ -1,0 +1,32 @@
+{
+  "name": "Support Copilot - Operational Error Notification",
+  "nodes": [
+    {
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [0, 0],
+      "parameters": {}
+    },
+    {
+      "name": "Redact Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [240, 0],
+      "parameters": {"jsCode": "return items.map(i => ({json: {workflow: i.json.workflow?.name, executionId: i.json.execution?.id, message: 'Support Copilot workflow failed; inspect n8n execution logs.'}}));"}
+    },
+    {
+      "name": "Approved Notification Target",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [480, 0],
+      "parameters": {}
+    }
+  ],
+  "connections": {
+    "Error Trigger": {"main": [[{"node": "Redact Error", "type": "main", "index": 0}]]},
+    "Redact Error": {"main": [[{"node": "Approved Notification Target", "type": "main", "index": 0}]]}
+  },
+  "active": false,
+  "settings": {"executionOrder": "v1"}
+}

@@ -1,0 +1,54 @@
+{
+  "name": "Support Copilot - Signed EOD Distribution",
+  "nodes": [
+    {
+      "name": "Daily Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 0],
+      "parameters": {"rule": {"interval": [{"field": "days", "triggerAtHour": 18}]}}
+    },
+    {
+      "name": "Build Signed Export Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [240, 0],
+      "parameters": {
+        "jsCode": "// Read COPILOT_N8N_SHARED_SECRET from n8n credentials/environment.\n// Produce X-Copilot-Timestamp, unique X-Copilot-Event-ID, report:export capability,\n// and HMAC-SHA256 over timestamp.eventId.capability.canonicalJsonBody.\nreturn items;"
+      }
+    },
+    {
+      "name": "Fetch Finalized EOD",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [480, 0],
+      "parameters": {
+        "method": "POST",
+        "url": "http://127.0.0.1:8000/v1/integrations/n8n/report-export",
+        "sendHeaders": true,
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={\"report_type\":\"eod\",\"report_date\":null}",
+        "options": {"timeout": 10000, "redirect": {"redirect": {"followRedirects": false}}}
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "name": "Approved Distribution Target",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [720, 0],
+      "parameters": {}
+    }
+  ],
+  "connections": {
+    "Daily Schedule": {"main": [[{"node": "Build Signed Export Request", "type": "main", "index": 0}]]},
+    "Build Signed Export Request": {"main": [[{"node": "Fetch Finalized EOD", "type": "main", "index": 0}]]},
+    "Fetch Finalized EOD": {"main": [[{"node": "Approved Distribution Target", "type": "main", "index": 0}]]}
+  },
+  "active": false,
+  "settings": {"executionOrder": "v1"}
+}
