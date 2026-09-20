@@ -1,5 +1,6 @@
 """Unit tests verifying Dashboard routes and handlers for Tester + Support Work Operations Hub."""
 import http.client
+import re
 import tempfile
 import time
 import unittest
@@ -86,6 +87,34 @@ class TestDashboardOperationsHub(unittest.TestCase):
         self.assertIn("Today Operations Overview", body)
         self.assertIn("Work Items Hub", body)
         self.assertIn("Testing Posture", body)
+
+    def test_case_detail_route_renders_cleanly(self):
+        """A case drawer must not turn a missing optional owner into a dropped HTTP response."""
+        case_id = self.db.create_case("Dashboard case detail regression", client="Acme")
+        status, headers, _ = self._get(f"/?token={self.service.token}")
+        self.assertEqual(status, 303)
+        cookie = headers.get("Set-Cookie")
+
+        status, _, body = self._get(
+            f"/work?item_type=case&item_id={case_id}", cookie=cookie)
+
+        self.assertEqual(status, 200)
+        self.assertIn("Dashboard case detail regression", body)
+        self.assertIn(f"CASE-{case_id}", body)
+        self.assertIn(f'name="entity_id" value="{case_id}"', body)
+
+        csrf_token = re.search(r'name="csrf_token" value="([^"]+)"', body).group(1)
+        status, _, _ = self._post('/work/item/update', {
+            'csrf_token': csrf_token,
+            'entity_type': 'case',
+            'entity_id': str(case_id),
+            'title': 'Updated dashboard case detail regression',
+            'priority': '2',
+            'operational_status': 'active',
+        }, cookie=cookie)
+        self.assertEqual(status, 303)
+        updated = next(case for case in self.db.list_cases() if case['id'] == case_id)
+        self.assertEqual(updated['title'], 'Updated dashboard case detail regression')
 
     def test_post_creation_and_execution(self):
         # 1. Establish session

@@ -5722,10 +5722,13 @@ class Database:
                     base_data['display_id'] = f"REQ-{entity_id}"
                     base_data['type_name'] = 'Requirement'
             elif entity_type == 'case':
-                row = conn.execute('''SELECT c.*, cl.name AS client_name, m.name AS owner_name, m.id AS owner_member_id
+                # `work_cases` has no owner column.  Preserve the unified-detail
+                # shape with NULL owner fields rather than joining a non-existent
+                # column (which previously dropped the entire dashboard response).
+                row = conn.execute('''SELECT c.*, cl.name AS client_name,
+                        NULL AS owner_name, NULL AS owner_member_id
                     FROM work_cases c
                     LEFT JOIN clients cl ON cl.id=c.client_id
-                    LEFT JOIN members m ON m.id=c.owner_user_id
                     WHERE c.id=?''', (entity_id,)).fetchone()
                 if row:
                     base_data = dict(row)
@@ -5745,6 +5748,12 @@ class Database:
 
             if not base_data:
                 return None
+
+            # Base tables use `id`, while the unified work-item UI and its POST
+            # handlers use `entity_id`.  Always expose the latter so detail forms
+            # never submit the string "None" for their record identifier.
+            base_data['entity_type'] = entity_type
+            base_data['entity_id'] = entity_id
 
             # Get metadata
             meta = self.get_work_item_meta(entity_type, entity_id)
@@ -5830,6 +5839,13 @@ class Database:
     def update_work_item(self, entity_type: str, entity_id: int, **kwargs) -> bool:
         """Updates work item fields on base table and meta table."""
         now = now_iso()
+        meta_fields = {
+            key: kwargs[key]
+            for key in ('workflow_template_id', 'current_stage_id', 'operational_status',
+                        'owner_member_id', 'target_role', 'estimated_hours', 'actual_hours',
+                        'due_date', 'next_action', 'completion_note')
+            if key in kwargs
+        }
         with self.connect() as conn:
             if entity_type == 'requirement':
                 req_fields = ['title', 'description', 'requirement_text', 'user_story',
@@ -5875,15 +5891,11 @@ class Database:
                     params.append(entity_id)
                     conn.execute(f"UPDATE tasks SET {', '.join(updates)} WHERE id=?", params)
 
-            # Also update metadata
-            meta_fields = {}
-            for k in ('workflow_template_id', 'current_stage_id', 'operational_status',
-                      'owner_member_id', 'target_role', 'estimated_hours', 'actual_hours',
-                      'due_date', 'next_action', 'completion_note'):
-                if k in kwargs:
-                    meta_fields[k] = kwargs[k]
-            if meta_fields:
-                self.upsert_work_item_meta(entity_type, entity_id, **meta_fields)
+        # `upsert_work_item_meta` uses its own transaction.  It must run after
+        # the base-item connection is closed; nesting a second SQLite writer here
+        # caused valid dashboard saves to fail with "database is locked".
+        if meta_fields:
+            self.upsert_work_item_meta(entity_type, entity_id, **meta_fields)
 
         return True
 
