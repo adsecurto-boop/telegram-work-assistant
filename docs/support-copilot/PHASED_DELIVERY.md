@@ -111,7 +111,7 @@ Exit gate:
 Delivered:
 
 - Human-approved response-learning workflow originating only from confirmed sent responses.
-- Version-controlled synthetic retrieval evaluation dataset (`retrieval_cases.json`) and CLI runner.
+- Version-controlled synthetic retrieval evaluation dataset and knowledge corpus with an isolated CLI runner.
 - Online SQLite backup API, manifest generation, integrity check, and safe atomic restore with pre-flight verification.
 - Operational health dashboard endpoint (`/v1/health/detailed`) with secret redaction.
 - Disaster recovery runbook (`DISASTER_RECOVERY.md`) with tested recovery procedures.
@@ -121,6 +121,7 @@ Exit gate:
 - All learning candidate proposal, approval, rejection, and idempotency tests pass.
 - Online backup, manifest verification, corrupt file detection, and isolated restore drill pass.
 - Detailed health status exposes no tokens, keys, secrets, or file paths.
+- Learning candidates require explicitly reviewed, generalized content and reject obvious client identifiers.
 
 Explicitly deferred (awaiting real usage evidence):
 

@@ -28,6 +28,9 @@ class InternalProviderError(AIProviderError):
     pass
 
 class AIProvider(ABC):
+    provider_identifier: str = "unknown"
+    model_identifier: Optional[str] = None
+
     @abstractmethod
     async def generate_suggestion(
         self, prompt: str, context: Dict[str, Any], timeout: float = 5.0
@@ -49,6 +52,8 @@ class GeminiAIProvider(AIProvider):
             raise ValueError("Gemini API key cannot be empty.")
         self._api_key = api_key
         self.model = model
+        self.provider_identifier = "gemini"
+        self.model_identifier = model
         self._client = client
 
     @staticmethod

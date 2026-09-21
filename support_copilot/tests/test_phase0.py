@@ -720,10 +720,14 @@ def test_runtime_factory_smoke_test_succeeds_after_migration(tmp_path, monkeypat
 
     from support_copilot.main import create_production_app
     app = create_production_app()
-    client = TestClient(app)
-    res = client.get("/v1/health")
-    assert res.status_code == 200
-    assert res.json() == {"status": "ok", "schema_ready": True}
+    with TestClient(app) as client:
+        res = client.get("/v1/health")
+        assert res.status_code == 200
+        assert res.json() == {"status": "ok", "schema_ready": True}
+    # Production shutdown must release SQLite handles (especially on Windows).
+    moved_db = data_dir / "released-after-shutdown.sqlite3"
+    os.replace(test_db, moved_db)
+    os.replace(moved_db, test_db)
 
 # 38. Runtime startup rejects an unmigrated database
 def test_runtime_startup_rejects_unmigrated_database(tmp_path, monkeypatch):

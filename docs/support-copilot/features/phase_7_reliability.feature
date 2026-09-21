@@ -12,6 +12,12 @@ Feature: Reliability, response learning, and controlled expansion
     And no candidate can be created from an unconfirmed suggestion
     And the candidate lifecycle status is "proposed"
 
+  Scenario: Require generalized knowledge content before learning
+    Given a human-confirmed sent response contains client-specific information
+    When I propose it for learning without reviewing and generalizing the content
+    Then the candidate is rejected
+    And no client email, phone or account number enters approved knowledge
+
   Scenario: Rejecting a learning candidate has no knowledge effect
     Given a proposed learning candidate
     When an operator rejects the candidate
@@ -34,6 +40,7 @@ Feature: Reliability, response learning, and controlled expansion
     Then it reports recall@1, recall@3, and mean reciprocal rank
     And it reports the number of evaluated cases and failed case IDs
     And it rejects an empty or missing evaluation dataset
+    And a version-controlled synthetic knowledge corpus can reproduce the benchmark without modifying operational data
 
   Scenario: Online database backup with integrity verification
     Given an active operational database
@@ -62,6 +69,7 @@ Feature: Reliability, response learning, and controlled expansion
     Then the status reports API health, database connectivity, schema revision, integrity check, and provider configuration
     And no API keys, tokens, shared secrets, raw database paths, or customer data are exposed
     And the overall state is reported as healthy, degraded, or unhealthy
+    And detailed health requires the operations read capability
 
   Scenario: Additional channels and outbound actions remain deferred
     Given no new usage evidence has been established for external chat channels

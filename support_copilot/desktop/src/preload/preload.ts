@@ -31,7 +31,7 @@ export interface CopilotAPI {
   pauseScreenCapture: () => Promise<{ paused: boolean }>;
   onScreenPaused: (callback: () => void) => () => void;
   analyzeScreen: (payload: any) => Promise<any>;
-  proposeLearningCandidate: (payload: { suggestionId: string; candidate_title: string; target_stable_key?: string; target_article_id?: string; notes?: string }) => Promise<any>;
+  proposeLearningCandidate: (payload: { suggestionId: string; candidate_title: string; candidate_content: string; content_reviewed_for_sensitive_data: true; target_stable_key?: string; target_article_id?: string; notes?: string }) => Promise<any>;
   reviewLearningCandidate: (payload: { candidateId: string; decision: 'approve' | 'reject' }) => Promise<any>;
   listLearningCandidates: (status?: string) => Promise<any>;
   getHealthDetailed: () => Promise<any>;

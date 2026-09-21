@@ -223,6 +223,42 @@ describe('Desktop Overlay App Component', () => {
     });
   });
 
+  it('requires reviewed generalized content before proposing response learning', async () => {
+    mockCopilotAPI.captureMessage.mockResolvedValue({ status: 'accepted', captured_event_id: 144 });
+    mockCopilotAPI.requestSuggestion.mockResolvedValue({
+      status: 'suggested',
+      suggestion: {
+        id: 'sugg-learning', captured_event_id: 144, resolved_case_id: null,
+        lifecycle_status: 'suggested', draft: 'Check the requested date range.',
+        missing_facts: [], assumptions: [], confidence: 0.9,
+        recommended_action: 'reply', sources: [], correlation_id: 'corr-learning',
+      },
+    });
+    mockCopilotAPI.confirmSent.mockResolvedValue({ id: 'sent-learning' });
+    mockCopilotAPI.proposeLearningCandidate.mockResolvedValue({ id: 'candidate-learning' });
+
+    render(<App />);
+    fireEvent.change(screen.getByLabelText(/Received Client Text/i), { target: { value: 'Missing logs' } });
+    fireEvent.click(screen.getByRole('button', { name: /Generate Suggestion/i }));
+    await waitFor(() => expect(screen.getByLabelText(/Editable Final Response/i)).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: /I Sent This Exact Response/i }));
+
+    await waitFor(() => expect(screen.getByLabelText(/Generalized Knowledge Content/i)).toHaveValue('Check the requested date range.'));
+    fireEvent.change(screen.getByLabelText(/Propose for Knowledge Learning/i), { target: { value: 'Attendance troubleshooting' } });
+    const propose = screen.getByRole('button', { name: /Propose Learning Candidate/i });
+    expect(propose).toBeDisabled();
+    fireEvent.click(screen.getByLabelText(/removed client-specific or sensitive information/i));
+    expect(propose).toBeEnabled();
+    fireEvent.click(propose);
+    await waitFor(() => expect(mockCopilotAPI.proposeLearningCandidate).toHaveBeenCalledWith({
+      suggestionId: 'sugg-learning',
+      candidate_title: 'Attendance troubleshooting',
+      candidate_content: 'Check the requested date range.',
+      content_reviewed_for_sensitive_data: true,
+      notes: '',
+    }));
+  });
+
   it('renders ambiguous case state when case reference is ambiguous', async () => {
     mockCopilotAPI.captureMessage.mockResolvedValue({ status: 'accepted', captured_event_id: 45 });
     mockCopilotAPI.requestSuggestion.mockResolvedValue({

@@ -25,7 +25,7 @@ Symptoms:
 Verification Command:
 ```powershell
 # Run SQLite integrity check directly
-python -c "import sqlite3; conn = sqlite3.connect('data/support_copilot.sqlite3'); print(conn.cursor().execute('PRAGMA integrity_check;').fetchall())"
+uv run python -c "import sqlite3; conn = sqlite3.connect('storage/support_copilot/copilot.sqlite3'); print(conn.cursor().execute('PRAGMA integrity_check;').fetchall()); conn.close()"
 ```
 
 If the output is anything other than `[('ok',)]`, corruption is present.
@@ -38,7 +38,7 @@ To prevent writing corrupted state or compounding data loss:
 
 ```powershell
 # Stop the desktop overlay process and background Python API service
-Get-Process -Name "electron", "python" | Where-Object { $_.Path -like "*telegram-work-assistant*" } | Stop-Process -Force
+Get-Process -Name "electron", "python" | Where-Object { $_.Path -like "*telegram-work-assistant*" } | Stop-Process
 ```
 
 ---
@@ -48,12 +48,12 @@ Get-Process -Name "electron", "python" | Where-Object { $_.Path -like "*telegram
 Before modifying or replacing any files, take an emergency snapshot:
 
 ```powershell
-python -m support_copilot.operations backup --db data/support_copilot.sqlite3 --out data/backups/emergency
+uv run python -m support_copilot.operations backup --db storage/support_copilot/copilot.sqlite3 --out storage/support_copilot/backups/emergency
 ```
 
 If the online backup fails due to disk corruption, make a raw file copy:
 ```powershell
-Copy-Item "data/support_copilot.sqlite3" "data/backups/emergency_corrupt_raw_$(Get-Date -Format 'yyyyMMdd_HHmmss').sqlite3"
+Copy-Item "storage/support_copilot/copilot.sqlite3" "storage/support_copilot/backups/emergency_corrupt_raw_$(Get-Date -Format 'yyyyMMdd_HHmmss').sqlite3"
 ```
 
 ---
@@ -62,12 +62,12 @@ Copy-Item "data/support_copilot.sqlite3" "data/backups/emergency_corrupt_raw_$(G
 
 List available backups:
 ```powershell
-Get-ChildItem -Path "data/backups" -Filter "*.sqlite3" -Recurse | Sort-Object LastWriteTime -Descending
+Get-ChildItem -Path "storage/support_copilot/backups" -Filter "*.sqlite3" -Recurse | Sort-Object LastWriteTime -Descending
 ```
 
 Verify backup checksum, SQLite integrity, and schema readiness:
 ```powershell
-python -m support_copilot.operations verify-backup "data/backups/backup_20260921_120000.sqlite3"
+uv run python -m support_copilot.operations verify-backup "storage/support_copilot/backups/<backup-file>.sqlite3"
 ```
 
 A valid backup produces:
@@ -86,7 +86,7 @@ Backup verification PASSED:
 Restoring requires the mandatory `--confirm-restore` flag. The tool automatically verifies the backup in an isolated environment, creates a pre-restore backup of the current database, and replaces the database atomically.
 
 ```powershell
-python -m support_copilot.operations restore "data/backups/backup_20260921_120000.sqlite3" --db data/support_copilot.sqlite3 --confirm-restore
+uv run python -m support_copilot.operations restore "storage/support_copilot/backups/<backup-file>.sqlite3" --db storage/support_copilot/copilot.sqlite3 --confirm-restore
 ```
 
 Output:
@@ -104,18 +104,18 @@ If an Alembic migration fails during deployment or update:
 
 1. Identify the target revision (e.g., `004_phase5`):
 ```powershell
-python -m support_copilot.migration_runner current
+uv run python -m support_copilot.migration_runner current
 ```
 
 2. Downgrade with explicit authorization:
 ```powershell
-python -m support_copilot.migration_runner downgrade 004_phase5 --allow-downgrade
+uv run python -m support_copilot.migration_runner downgrade 004_phase5 --allow-downgrade
 ```
 *Note: A safety backup is automatically created prior to downgrade.*
 
 3. Verify schema readiness:
 ```powershell
-python -m support_copilot.migration_runner check
+uv run python -m support_copilot.migration_runner current
 ```
 
 ---
@@ -125,7 +125,7 @@ python -m support_copilot.migration_runner check
 If knowledge search returns unexpected results or FTS5 indices are out of sync:
 
 ```powershell
-python -c "from support_copilot.database import create_db_engine, create_session_factory; from support_copilot.knowledge_service import KnowledgeService; engine = create_db_engine('sqlite:///data/support_copilot.sqlite3'); db = create_session_factory(engine)(); count = KnowledgeService.rebuild_fts_index(db); print(f'Rebuilt FTS index with {count} versions'); db.close(); engine.dispose()"
+uv run python -c "from support_copilot.database import create_db_engine, create_session_factory; from support_copilot.knowledge_service import KnowledgeService; engine = create_db_engine('sqlite:///storage/support_copilot/copilot.sqlite3'); db = create_session_factory(engine)(); count = KnowledgeService.rebuild_fts_index(db); print(f'Rebuilt FTS index with {count} versions'); db.close(); engine.dispose()"
 ```
 
 ---
@@ -136,7 +136,8 @@ If Gemini / external AI API is unreachable or rate-limited:
 
 1. Check detailed health:
 ```powershell
-Invoke-RestMethod -Uri "http://127.0.0.1:8000/v1/health/detailed"
+$healthHeaders = @{ Authorization = "Bearer $env:COPILOT_DESKTOP_API_TOKEN" }
+Invoke-RestMethod -Uri "http://127.0.0.1:8000/v1/health/detailed" -Headers $healthHeaders
 ```
 Status will show `"status": "degraded"` with `"ai_provider": {"configured": true, "mode": "gemini"}`.
 
@@ -146,9 +147,9 @@ Status will show `"status": "degraded"` with `"ai_provider": {"configured": true
    - Screen analysis returns approved knowledge sources without hallucinated steps.
    - Operators can manually compose and send replies.
 
-3. To switch to local/offline deterministic testing provider:
+3. To continue in local manual-only mode without model generation:
 ```powershell
-$env:COPILOT_AI_PROVIDER = "fake"
+$env:COPILOT_AI_PROVIDER = "disabled"
 ```
 
 ---
@@ -171,7 +172,8 @@ After completing any recovery procedure, verify system health:
 Invoke-RestMethod -Uri "http://127.0.0.1:8000/v1/health"
 
 # Detailed component check
-Invoke-RestMethod -Uri "http://127.0.0.1:8000/v1/health/detailed"
+$healthHeaders = @{ Authorization = "Bearer $env:COPILOT_DESKTOP_API_TOKEN" }
+Invoke-RestMethod -Uri "http://127.0.0.1:8000/v1/health/detailed" -Headers $healthHeaders
 ```
 
 Expected response:
@@ -194,10 +196,10 @@ Expected response:
     "last_backup_timestamp": "2026-09-21T12:00:00Z"
   },
   "retention": {
-    "status": "active"
+    "status": "manual_cleanup_available"
   },
   "telegram": {
-    "status": "configured"
+    "status": "external_adapter_unreported"
   },
   "n8n": {
     "configured": true

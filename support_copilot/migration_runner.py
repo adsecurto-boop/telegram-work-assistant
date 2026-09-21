@@ -8,7 +8,16 @@ from typing import Optional
 from alembic.config import Config
 from alembic import command
 from .config import Settings, get_settings
-from .database import create_db_engine, verify_schema_readiness
+from .database import (
+    REQUIRED_TABLES_PHASE0,
+    REQUIRED_TABLES_PHASE1,
+    REQUIRED_TABLES_PHASE2,
+    REQUIRED_TABLES_PHASE5,
+    REQUIRED_TABLES_PHASE7,
+    REQUIRED_TABLES_CURRENT,
+    create_db_engine,
+    verify_schema_readiness,
+)
 from .logger import logger
 
 class MigrationError(Exception):
@@ -139,9 +148,20 @@ class MigrationRunner:
                 raise RuntimeError("Simulated failure inside migration runner after backup creation.")
             command.upgrade(alembic_cfg, target_revision)
 
+            requirements_by_revision = {
+                "001_initial": REQUIRED_TABLES_PHASE0,
+                "002_phase1": REQUIRED_TABLES_PHASE1,
+                "003_phase2": REQUIRED_TABLES_PHASE2,
+                "004_phase5": REQUIRED_TABLES_PHASE5,
+                "005_phase7": REQUIRED_TABLES_PHASE7,
+                "head": REQUIRED_TABLES_CURRENT,
+            }
             engine = create_db_engine(f"sqlite:///{db_file}")
             try:
-                verify_schema_readiness(engine)
+                verify_schema_readiness(
+                    engine,
+                    required_tables=requirements_by_revision.get(target_revision, REQUIRED_TABLES_PHASE7),
+                )
             finally:
                 engine.dispose()
 

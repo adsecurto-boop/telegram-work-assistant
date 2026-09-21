@@ -8,6 +8,7 @@ from support_copilot.database import create_db_engine, create_session_factory
 from support_copilot.migration_runner import MigrationRunner
 from support_copilot.models import Base, CapturedEvent
 from support_copilot.operations import backup_database, verify_backup, restore_database
+import support_copilot.operations as operations_module
 
 
 @pytest.fixture
@@ -61,6 +62,9 @@ def test_online_backup_and_manifest_generation(populated_db):
     assert verification["valid"] is True
     assert verification["integrity"] == "ok"
 
+    second = backup_database(populated_db["db_file"], populated_db["backup_dir"])
+    assert second["backup_file"] != result["backup_file"]
+
 
 def test_verify_backup_detects_checksum_mismatch(populated_db):
     result = backup_database(populated_db["db_file"], populated_db["backup_dir"])
@@ -91,7 +95,14 @@ def test_verify_backup_detects_corrupt_database(populated_db, tmp_path):
     import hashlib
     h = hashlib.sha256(b"not a real sqlite database header").hexdigest()
     manifest_file.write_text(
-        json.dumps({"backup_file": "corrupt.sqlite3", "sha256_checksum": h, "schema_revision": "005_phase7"})
+        json.dumps({
+            "manifest_format_version": 1,
+            "backup_file": "corrupt.sqlite3",
+            "sha256_checksum": h,
+            "schema_revision": "005_phase7",
+            "creation_timestamp": "2026-09-21T00:00:00+00:00",
+            "source_app_version": "1.0.0",
+        })
     )
 
     with pytest.raises(ValueError) as exc:
@@ -112,16 +123,30 @@ def test_verify_backup_detects_incompatible_schema(tmp_path):
     manifest_file = tmp_path / "incompatible_manifest.json"
     manifest_file.write_text(
         json.dumps({
+            "manifest_format_version": 1,
             "backup_file": "incompatible.sqlite3",
             "sha256_checksum": h,
             "schema_revision": "unknown",
+            "creation_timestamp": "2026-09-21T00:00:00+00:00",
+            "source_app_version": "1.0.0",
         }),
         encoding="utf-8",
     )
 
     with pytest.raises(ValueError) as exc:
         verify_backup(str(incomp_db), str(manifest_file))
-    assert "schema readiness check failed" in str(exc.value).lower()
+    assert "incompatible schema revision" in str(exc.value).lower()
+
+
+def test_verify_backup_rejects_manifest_revision_mismatch(populated_db):
+    result = backup_database(populated_db["db_file"], populated_db["backup_dir"])
+    manifest = result["manifest"]
+    manifest["schema_revision"] = "004_phase5"
+    with open(result["manifest_file"], "w", encoding="utf-8") as manifest_file:
+        json.dump(manifest, manifest_file)
+    with pytest.raises(ValueError) as exc:
+        verify_backup(result["backup_file"], result["manifest_file"])
+    assert "manifest schema revision" in str(exc.value).lower()
 
 
 def test_restore_refused_without_confirmation(populated_db, tmp_path):
@@ -151,6 +176,7 @@ def test_successful_isolated_restore_and_data_preservation(populated_db, tmp_pat
     assert restore_result["status"] == "restored"
     assert restore_result["pre_restore_backup"] is not None
     assert os.path.exists(restore_result["pre_restore_backup"])
+    assert os.path.exists(restore_result["pre_restore_manifest"])
 
     # Verify restored data
     engine_restored = create_db_engine(f"sqlite:///{target_db}")
@@ -163,3 +189,46 @@ def test_successful_isolated_restore_and_data_preservation(populated_db, tmp_pat
     finally:
         db.close()
         engine_restored.dispose()
+
+
+def test_post_restore_verification_failure_rolls_back_original_database(populated_db, tmp_path, monkeypatch):
+    source_backup = backup_database(populated_db["db_file"], populated_db["backup_dir"])
+    target_dir = tmp_path / "rollback-target"
+    target_dir.mkdir()
+    target_db = target_dir / "active.sqlite3"
+    settings = Settings(data_dir=str(target_dir), db_path=f"sqlite:///{target_db}")
+    MigrationRunner(settings).run_upgrade("head")
+    engine = create_db_engine(settings.db_path)
+    db = create_session_factory(engine)()
+    from datetime import datetime, timezone
+    db.add(CapturedEvent(
+        provider="manual", event_id="original-target-event", event_type="message.received",
+        occurred_at=datetime.now(timezone.utc), actor_id="tester", actor_role="client",
+        conversation_id="rollback", payload_text="Original target state",
+        schema_version=1, correlation_id="rollback-original",
+    ))
+    db.commit()
+    db.close()
+    engine.dispose()
+
+    real_verify = operations_module._verify_sqlite_file
+    calls = {"count": 0}
+
+    def fail_post_replace(db_file, require_current_schema=True):
+        calls["count"] += 1
+        if calls["count"] == 4:
+            raise ValueError("simulated post-restore verification failure")
+        return real_verify(db_file, require_current_schema)
+
+    monkeypatch.setattr(operations_module, "_verify_sqlite_file", fail_post_replace)
+    with pytest.raises(RuntimeError, match="automatically restored"):
+        restore_database(source_backup["backup_file"], str(target_db), confirm_restore=True)
+
+    restored_engine = create_db_engine(f"sqlite:///{target_db}")
+    restored_db = create_session_factory(restored_engine)()
+    try:
+        assert restored_db.query(CapturedEvent).filter_by(event_id="original-target-event").one()
+        assert restored_db.query(CapturedEvent).filter_by(event_id="evt-ops-1").first() is None
+    finally:
+        restored_db.close()
+        restored_engine.dispose()

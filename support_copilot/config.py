@@ -26,6 +26,7 @@ RECOGNIZED_CAPABILITIES = {
     "meeting:write",
     "meeting:approve",
     "screen:analyze",
+    "operations:read",
 }
 DISALLOWED_PLACEHOLDERS = {
     "<generate-a-private-random-token>",

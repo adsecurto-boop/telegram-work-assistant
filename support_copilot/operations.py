@@ -5,12 +5,22 @@ import os
 import shutil
 import sqlite3
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from .config import get_settings
-from .database import create_db_engine, verify_schema_readiness
+from .database import (
+    CURRENT_SCHEMA_REVISION,
+    REQUIRED_TABLES_CURRENT,
+    create_db_engine,
+    verify_schema_readiness,
+)
+
+
+MANIFEST_FORMAT_VERSION = 1
+APPLICATION_VERSION = "1.0.0"
 
 
 def compute_file_sha256(filepath: str) -> str:
@@ -22,8 +32,55 @@ def compute_file_sha256(filepath: str) -> str:
 
 
 def _resolve_db_file(db_path: str) -> str:
-    cleaned = db_path.replace("sqlite:///", "")
+    if "://" in db_path and not db_path.startswith("sqlite:///"):
+        raise ValueError("Only a SQLite file path or sqlite:/// URL is supported.")
+    cleaned = db_path[len("sqlite:///"):] if db_path.startswith("sqlite:///") else db_path
+    if not cleaned.strip():
+        raise ValueError("Database path cannot be empty.")
     return os.path.abspath(cleaned)
+
+
+def _unique_stamp() -> str:
+    return f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}_{uuid.uuid4().hex[:8]}"
+
+
+def _read_schema_revision(db_file: str) -> str:
+    conn = sqlite3.connect(f"file:{Path(db_file).as_posix()}?mode=ro", uri=True)
+    try:
+        row = conn.execute("SELECT version_num FROM alembic_version;").fetchone()
+        return str(row[0]) if row else "unknown"
+    except sqlite3.OperationalError:
+        return "unmigrated"
+    finally:
+        conn.close()
+
+
+def _verify_sqlite_file(db_file: str, require_current_schema: bool = True) -> str:
+    try:
+        conn = sqlite3.connect(f"file:{Path(db_file).as_posix()}?mode=ro", uri=True)
+        try:
+            result = conn.execute("PRAGMA integrity_check;").fetchone()
+        finally:
+            conn.close()
+    except sqlite3.DatabaseError as exc:
+        raise ValueError(f"Corrupt or invalid SQLite database: {exc}") from exc
+    if not result or result[0] != "ok":
+        raise ValueError(f"SQLite PRAGMA integrity_check failed: {result}")
+
+    revision = _read_schema_revision(db_file)
+    if require_current_schema and revision != CURRENT_SCHEMA_REVISION:
+        raise ValueError(
+            f"Incompatible schema revision '{revision}'; expected '{CURRENT_SCHEMA_REVISION}'."
+        )
+    if require_current_schema:
+        engine = create_db_engine(f"sqlite:///{db_file}")
+        try:
+            verify_schema_readiness(engine, required_tables=REQUIRED_TABLES_CURRENT)
+        except Exception as exc:
+            raise ValueError(f"Schema readiness check failed: {exc}") from exc
+        finally:
+            engine.dispose()
+    return revision
 
 
 def backup_database(db_path: str, backup_dir: str) -> Dict[str, Any]:
@@ -32,41 +89,33 @@ def backup_database(db_path: str, backup_dir: str) -> Dict[str, Any]:
         raise FileNotFoundError(f"Database file not found: {src_file}")
 
     os.makedirs(backup_dir, exist_ok=True)
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    backup_file = os.path.join(backup_dir, f"backup_{timestamp}.sqlite3")
-    manifest_file = os.path.join(backup_dir, f"backup_{timestamp}_manifest.json")
+    stamp = _unique_stamp()
+    backup_file = os.path.join(backup_dir, f"backup_{stamp}.sqlite3")
+    manifest_file = os.path.join(backup_dir, f"backup_{stamp}_manifest.json")
 
     # Online SQLite backup API
-    src_conn = sqlite3.connect(src_file)
-    dst_conn = sqlite3.connect(backup_file)
     try:
-        src_conn.backup(dst_conn)
-    finally:
-        dst_conn.close()
-        src_conn.close()
-
-    # Verify integrity of backup file
-    chk_conn = sqlite3.connect(backup_file)
-    try:
-        cur = chk_conn.cursor()
-        res = cur.execute("PRAGMA integrity_check;").fetchone()
-        if not res or res[0] != "ok":
-            raise RuntimeError(f"Backup integrity check failed: {res}")
+        src_conn = sqlite3.connect(src_file)
+        dst_conn = sqlite3.connect(backup_file)
         try:
-            rev_row = cur.execute("SELECT version_num FROM alembic_version;").fetchone()
-            schema_revision = rev_row[0] if rev_row else "unknown"
-        except sqlite3.OperationalError:
-            schema_revision = "unmigrated"
-    finally:
-        chk_conn.close()
+            src_conn.backup(dst_conn)
+        finally:
+            dst_conn.close()
+            src_conn.close()
+        schema_revision = _verify_sqlite_file(backup_file, require_current_schema=False)
+    except Exception:
+        if os.path.exists(backup_file):
+            os.remove(backup_file)
+        raise
 
     checksum = compute_file_sha256(backup_file)
     manifest = {
+        "manifest_format_version": MANIFEST_FORMAT_VERSION,
         "backup_file": os.path.basename(backup_file),
         "schema_revision": schema_revision,
         "creation_timestamp": datetime.now(timezone.utc).isoformat(),
         "sha256_checksum": checksum,
-        "source_app_version": "1.0.0",
+        "source_app_version": APPLICATION_VERSION,
         "source_db_file": os.path.basename(src_file),
     }
 
@@ -105,9 +154,25 @@ def verify_backup(backup_file: str, manifest_file: Optional[str] = None) -> Dict
         except json.JSONDecodeError as exc:
             raise ValueError(f"Corrupt manifest JSON: {exc}") from exc
 
-    expected_checksum = manifest.get("sha256_checksum")
-    if not expected_checksum:
-        raise ValueError("Manifest missing required 'sha256_checksum' field.")
+    if not isinstance(manifest, dict):
+        raise ValueError("Backup manifest must contain a JSON object.")
+    required_fields = {
+        "manifest_format_version",
+        "backup_file",
+        "schema_revision",
+        "creation_timestamp",
+        "sha256_checksum",
+        "source_app_version",
+    }
+    missing_fields = sorted(required_fields - set(manifest))
+    if missing_fields:
+        raise ValueError(f"Manifest missing required fields: {', '.join(missing_fields)}")
+    if manifest["manifest_format_version"] != MANIFEST_FORMAT_VERSION:
+        raise ValueError("Unsupported backup manifest format version.")
+    if manifest["backup_file"] != os.path.basename(backup_file):
+        raise ValueError("Manifest backup filename does not match the selected backup file.")
+
+    expected_checksum = manifest["sha256_checksum"]
 
     actual_checksum = compute_file_sha256(backup_file)
     if actual_checksum != expected_checksum:
@@ -115,28 +180,9 @@ def verify_backup(backup_file: str, manifest_file: Optional[str] = None) -> Dict
             f"Checksum verification failed! Expected: {expected_checksum}, Actual: {actual_checksum}"
         )
 
-    # Verify SQLite integrity check
-    conn = None
-    try:
-        conn = sqlite3.connect(backup_file)
-        cur = conn.cursor()
-        res = cur.execute("PRAGMA integrity_check;").fetchone()
-        if not res or res[0] != "ok":
-            raise ValueError(f"SQLite PRAGMA integrity_check failed: {res}")
-    except sqlite3.DatabaseError as exc:
-        raise ValueError(f"Corrupt or invalid SQLite database: {exc}") from exc
-    finally:
-        if conn:
-            conn.close()
-
-    # Verify schema readiness
-    engine = create_db_engine(f"sqlite:///{backup_file}")
-    try:
-        verify_schema_readiness(engine)
-    except Exception as exc:
-        raise ValueError(f"Schema readiness check failed: {exc}") from exc
-    finally:
-        engine.dispose()
+    actual_revision = _verify_sqlite_file(backup_file, require_current_schema=True)
+    if manifest["schema_revision"] != actual_revision:
+        raise ValueError("Manifest schema revision does not match the backup database.")
 
     return {
         "valid": True,
@@ -163,18 +209,42 @@ def restore_database(
     target_dir = os.path.dirname(target_file) or "."
     os.makedirs(target_dir, exist_ok=True)
 
-    pre_restore_backup: Optional[str] = None
-    if os.path.exists(target_file):
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        pre_restore_backup = f"{target_file}.pre_restore_{timestamp}.bak"
-        shutil.copy2(target_file, pre_restore_backup)
-
-    # Perform atomic replacement
-    temp_target = f"{target_file}.tmp_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+    # Stage and verify a separate copy before touching the active database.
+    temp_target = f"{target_file}.restore_stage_{_unique_stamp()}"
+    shutil.copy2(backup_file, temp_target)
     try:
-        shutil.copy2(backup_file, temp_target)
-        # Atomic file replacement
+        _verify_sqlite_file(temp_target, require_current_schema=True)
+    except Exception:
+        if os.path.exists(temp_target):
+            os.remove(temp_target)
+        raise
+
+    pre_restore_backup: Optional[str] = None
+    pre_restore_manifest: Optional[str] = None
+    try:
+        if os.path.exists(target_file):
+            # Checkpoint committed WAL data before taking the online recovery copy.
+            checkpoint_conn = sqlite3.connect(target_file, timeout=1.0)
+            try:
+                checkpoint = checkpoint_conn.execute("PRAGMA wal_checkpoint(TRUNCATE);").fetchone()
+                if checkpoint and checkpoint[0] != 0:
+                    raise RuntimeError(
+                        "Restore refused because the active database is busy. Stop the API and desktop application, then retry."
+                    )
+            finally:
+                checkpoint_conn.close()
+            recovery = backup_database(target_file, os.path.join(target_dir, "backups", "pre_restore"))
+            pre_restore_backup = recovery["backup_file"]
+            pre_restore_manifest = recovery["manifest_file"]
+    except Exception:
+        if os.path.exists(temp_target):
+            os.remove(temp_target)
+        raise
+
+    replaced = False
+    try:
         os.replace(temp_target, target_file)
+        replaced = True
         # Clean up stale WAL / SHM files if present
         for aux in (f"{target_file}-wal", f"{target_file}-shm"):
             if os.path.exists(aux):
@@ -182,29 +252,32 @@ def restore_database(
                     os.remove(aux)
                 except OSError:
                     pass
+        _verify_sqlite_file(target_file, require_current_schema=True)
     except Exception as exc:
+        if os.path.exists(temp_target):
+            os.remove(temp_target)
+        rollback_note = ""
+        if replaced and pre_restore_backup and os.path.exists(pre_restore_backup):
+            rollback_stage = f"{target_file}.rollback_{_unique_stamp()}"
+            shutil.copy2(pre_restore_backup, rollback_stage)
+            os.replace(rollback_stage, target_file)
+            rollback_note = " The verified pre-restore backup was automatically restored."
+        elif replaced and not pre_restore_backup:
+            quarantine = f"{target_file}.failed_restore_{_unique_stamp()}"
+            os.replace(target_file, quarantine)
+            rollback_note = f" The failed new database was quarantined as '{quarantine}'."
         recovery_msg = (
-            f"Atomic replacement failed: {exc}. "
-            + (f"Original database preserved at '{pre_restore_backup}'." if pre_restore_backup else "")
+            f"Restore failed: {exc}. "
+            + (f"Recovery backup is preserved at '{pre_restore_backup}'." if pre_restore_backup else "")
+            + rollback_note
         )
         raise RuntimeError(recovery_msg) from exc
-
-    # Post-restore verification
-    engine = create_db_engine(f"sqlite:///{target_file}")
-    try:
-        conn = sqlite3.connect(target_file)
-        res = conn.cursor().execute("PRAGMA integrity_check;").fetchone()
-        conn.close()
-        if not res or res[0] != "ok":
-            raise RuntimeError(f"Restored database failed integrity check: {res}")
-        verify_schema_readiness(engine)
-    finally:
-        engine.dispose()
 
     return {
         "status": "restored",
         "target_db": target_file,
         "pre_restore_backup": pre_restore_backup,
+        "pre_restore_manifest": pre_restore_manifest,
     }
 
 

@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional
 
@@ -9,6 +10,8 @@ from sqlalchemy.orm import Session
 
 from .database import create_db_engine, create_session_factory
 from .knowledge_service import KnowledgeService
+from .config import Settings
+from .migration_runner import MigrationRunner
 from .models import KnowledgeArticle
 
 
@@ -49,13 +52,21 @@ def evaluate_retrieval(dataset_path: str, db: Session) -> EvaluationReport:
     failed_ids: List[str] = []
     details: List[Dict[str, Any]] = []
 
+    seen_case_ids = set()
     for case in cases:
+        if not isinstance(case, dict):
+            raise ValueError("Every evaluation case must be a JSON object.")
         case_id = case.get("case_id", "unknown")
         query = case.get("query", "")
         product_scope = case.get("product_scope")
         issue_type = case.get("issue_type")
         expected_key = case.get("expected_stable_key", "")
         negative_keys = set(case.get("negative_keys", []))
+        if not all(isinstance(item, str) and item.strip() for item in (case_id, query, expected_key)):
+            raise ValueError("Each evaluation case requires non-empty case_id, query, and expected_stable_key values.")
+        if case_id in seen_case_ids:
+            raise ValueError(f"Duplicate evaluation case_id: '{case_id}'.")
+        seen_case_ids.add(case_id)
 
         results = KnowledgeService.search_approved_knowledge(
             db=db,
@@ -83,11 +94,10 @@ def evaluate_retrieval(dataset_path: str, db: Session) -> EvaluationReport:
             hits_at_1 += 1
         if hit_3:
             hits_at_3 += 1
-        else:
-            failed_ids.append(case_id)
-
         # Check negative expectations
         negative_hits = [k for k in retrieved_keys[:3] if k in negative_keys]
+        if not hit_3 or negative_hits:
+            failed_ids.append(case_id)
 
         details.append(
             {
@@ -113,22 +123,77 @@ def evaluate_retrieval(dataset_path: str, db: Session) -> EvaluationReport:
     return report
 
 
+def evaluate_synthetic_fixture(dataset_path: str, corpus_path: str) -> EvaluationReport:
+    if not os.path.exists(corpus_path):
+        raise ValueError(f"Synthetic corpus file not found: '{corpus_path}'")
+    with open(corpus_path, "r", encoding="utf-8") as corpus_file:
+        try:
+            corpus = json.load(corpus_file)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Failed to parse synthetic corpus JSON: {exc}") from exc
+    if not isinstance(corpus, list) or not corpus:
+        raise ValueError("Synthetic retrieval corpus is empty.")
+
+    with tempfile.TemporaryDirectory(prefix="support-copilot-retrieval-eval-") as temp_dir:
+        database_file = os.path.join(temp_dir, "evaluation.sqlite3")
+        settings = Settings(data_dir=temp_dir, db_path=f"sqlite:///{database_file}")
+        MigrationRunner(settings).run_upgrade("head")
+        engine = create_db_engine(settings.db_path)
+        session_factory = create_session_factory(engine)
+        db = session_factory()
+        try:
+            for entry in corpus:
+                required = ("stable_key", "title", "product_scope", "issue_type", "content")
+                if not isinstance(entry, dict) or any(not str(entry.get(field, "")).strip() for field in required):
+                    raise ValueError("Each synthetic corpus article requires stable_key, title, product_scope, issue_type, and content.")
+                article = KnowledgeService.create_article(
+                    db=db,
+                    stable_key=entry["stable_key"],
+                    title=entry["title"],
+                    product_scope=entry["product_scope"],
+                    issue_type=entry["issue_type"],
+                    client_scope=entry.get("client_scope"),
+                    initial_content=entry["content"],
+                    created_by="retrieval-evaluation-fixture",
+                    required_facts=entry.get("required_facts", []),
+                    prohibited_claims=entry.get("prohibited_claims", []),
+                )
+                KnowledgeService.approve_version(db, article.id, 1, "retrieval-evaluation-fixture")
+            return evaluate_retrieval(dataset_path, db)
+        finally:
+            db.close()
+            engine.dispose()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Support Copilot Knowledge Retrieval Evaluator")
     parser.add_argument("--dataset", required=True, help="Path to retrieval evaluation JSON dataset")
-    parser.add_argument("--database", required=True, help="Database path or connection URL (sqlite:///...)")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--database", help="Existing database path or connection URL (sqlite:///...)")
+    source.add_argument(
+        "--fixture-corpus",
+        help="Synthetic knowledge corpus used to build and evaluate a temporary migrated database",
+    )
     parser.add_argument("--threshold", type=float, default=0.7, help="Minimum Recall@3 quality threshold (default: 0.7)")
     args = parser.parse_args()
 
-    db_path = args.database
-    if not db_path.startswith("sqlite:///"):
-        db_path = f"sqlite:///{os.path.abspath(db_path)}"
-
-    engine = create_db_engine(db_path)
-    session_factory = create_session_factory(engine)
-    db = session_factory()
     try:
-        report = evaluate_retrieval(args.dataset, db)
+        if args.fixture_corpus:
+            report = evaluate_synthetic_fixture(args.dataset, args.fixture_corpus)
+        else:
+            raw_database = args.database
+            database_file = raw_database[len("sqlite:///"):] if raw_database.startswith("sqlite:///") else raw_database
+            if not os.path.isfile(database_file):
+                raise ValueError(f"Evaluation database file not found: '{database_file}'")
+            db_path = raw_database if raw_database.startswith("sqlite:///") else f"sqlite:///{os.path.abspath(raw_database)}"
+            engine = create_db_engine(db_path)
+            session_factory = create_session_factory(engine)
+            db = session_factory()
+            try:
+                report = evaluate_retrieval(args.dataset, db)
+            finally:
+                db.close()
+                engine.dispose()
         print("=" * 60)
         print("RETRIEVAL EVALUATION REPORT")
         print("=" * 60)
@@ -146,9 +211,6 @@ def main() -> None:
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
-    finally:
-        db.close()
-        engine.dispose()
 
 
 if __name__ == "__main__":

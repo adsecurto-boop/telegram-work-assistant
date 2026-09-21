@@ -377,6 +377,8 @@ class ScreenAnalysisResponse(StrictBaseModel):
 
 class ProposeLearningCandidateRequest(StrictBaseModel):
     candidate_title: str = Field(..., min_length=1, max_length=256)
+    candidate_content: str = Field(..., min_length=1, max_length=10_000)
+    content_reviewed_for_sensitive_data: Literal[True]
     target_stable_key: Optional[str] = Field(default=None, max_length=128)
     target_article_id: Optional[str] = Field(default=None, max_length=36)
     notes: Optional[str] = Field(default=None, max_length=2000)

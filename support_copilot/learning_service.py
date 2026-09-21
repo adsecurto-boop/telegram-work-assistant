@@ -1,4 +1,6 @@
 import json
+import hashlib
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -18,11 +20,20 @@ from .models import (
 
 
 class LearningService:
+    SENSITIVE_KNOWLEDGE_PATTERN = re.compile(
+        r"(?:\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b|"
+        r"\b(?:\d[ -]?){10,16}\b|"
+        r"\b(?:bearer|sk|api[_ -]?key|token)[_ :=-]*[A-Z0-9_-]{16,}\b)",
+        re.IGNORECASE,
+    )
+
     @staticmethod
     def propose_candidate(
         db: Session,
         suggestion_id: str,
         candidate_title: str,
+        candidate_content: str,
+        content_reviewed_for_sensitive_data: bool,
         actor: str,
         target_stable_key: Optional[str] = None,
         target_article_id: Optional[str] = None,
@@ -36,6 +47,18 @@ class LearningService:
         sent_response = db.query(SentResponse).filter_by(suggestion_id=suggestion_id).first()
         if sent_response is None:
             raise ValueError("Cannot create a learning candidate from an unconfirmed suggestion. Human must confirm sending first.")
+
+        safe_title = candidate_title.strip()
+        safe_content = candidate_content.strip()
+        if not safe_title or not safe_content:
+            raise ValueError("Candidate title and reviewed knowledge content are required.")
+        if not content_reviewed_for_sensitive_data:
+            raise ValueError("Confirm that the proposed knowledge content was reviewed for client-specific data.")
+        if LearningService.SENSITIVE_KNOWLEDGE_PATTERN.search(safe_content):
+            raise ValueError(
+                "Proposed knowledge appears to contain an email, phone/account number, or credential. "
+                "Generalize or redact client-specific data before proposing it."
+            )
 
         target_article = None
         # If target_article_id is provided, verify it exists
@@ -59,10 +82,26 @@ class LearningService:
 
         metadata = {
             "notes": notes or "",
-            "original_draft": suggestion.draft,
             "confirmed_sent_at": sent_response.confirmed_at.isoformat(),
-            "confirmed_by": sent_response.confirmed_by_actor,
+            "sent_text_hash": sent_response.final_text_hash,
+            "candidate_content_hash": hashlib.sha256(safe_content.encode("utf-8")).hexdigest(),
+            "content_differs_from_sent_response": safe_content != sent_response.exact_sent_text.strip(),
+            "sensitive_data_review_confirmed": True,
         }
+
+        # Repeated submissions of the same reviewed content are idempotent
+        # while the earlier candidate remains proposed or has been approved.
+        existing = (
+            db.query(ResponseLearningCandidate)
+            .filter(
+                ResponseLearningCandidate.sent_response_id == sent_response.id,
+                ResponseLearningCandidate.candidate_content == safe_content,
+                ResponseLearningCandidate.lifecycle_status.in_(["proposed", "approved"]),
+            )
+            .first()
+        )
+        if existing is not None:
+            return existing
 
         # Resolve product_scope and issue_type from target article, sources, or defaults
         product_scope = "core"
@@ -84,8 +123,8 @@ class LearningService:
             id=str(uuid.uuid4()),
             suggestion_id=suggestion_id,
             sent_response_id=sent_response.id,
-            candidate_title=candidate_title.strip(),
-            candidate_content=sent_response.exact_sent_text.strip(),
+            candidate_title=safe_title,
+            candidate_content=safe_content,
             product_scope=product_scope,
             issue_type=issue_type,
             client_scope=client_scope,

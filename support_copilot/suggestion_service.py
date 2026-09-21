@@ -26,6 +26,7 @@ from .ai_provider import (
     InternalProviderError,
 )
 from .logger import logger
+from .privacy import redact_for_remote
 
 
 class ConflictError(Exception):
@@ -196,22 +197,32 @@ class SuggestionService:
 
         # 5. Build prompt with strict prompt-injection containment
         knowledge_excerpts = []
+        remote_redaction_count = 0
         allowed_sources_map: Dict[str, KnowledgeSearchResult] = {}
         for res in search_results:
             allowed_sources_map[res.article_id] = res
+            safe_title, title_redactions = redact_for_remote(res.title)
+            safe_content, content_redactions = redact_for_remote(res.full_content)
+            remote_redaction_count += title_redactions + content_redactions
             knowledge_excerpts.append(
-                f"[Source: article_id={res.article_id}, version={res.version_number}, title={res.title}]\n"
-                f"{res.full_content}\n"
+                f"[Source: article_id={res.article_id}, version={res.version_number}, title={safe_title}]\n"
+                f"{safe_content}\n"
             )
 
         case_info = ""
         if resolved_case:
+            safe_case_number, case_number_redactions = redact_for_remote(resolved_case.case_number)
+            safe_case_title, case_title_redactions = redact_for_remote(resolved_case.title)
+            remote_redaction_count += case_number_redactions + case_title_redactions
             case_info = (
                 f"Resolved Case ID: {resolved_case.id}\n"
-                f"Case Number: {resolved_case.case_number}\n"
-                f"Title: {resolved_case.title}\n"
+                f"Case Number: {safe_case_number}\n"
+                f"Title: {safe_case_title}\n"
                 f"Status: {resolved_case.status}\n"
             )
+
+        safe_client_text, client_redactions = redact_for_remote(event.payload_text)
+        remote_redaction_count += client_redactions
 
         prompt = (
             "You are a helpful and truthful local support copilot.\n"
@@ -225,7 +236,7 @@ class SuggestionService:
             f"VERIFIED CASE FACTS:\n{case_info or 'None'}\n\n"
             f"APPROVED KNOWLEDGE SOURCES:\n{''.join(knowledge_excerpts)}\n\n"
             "<client_message>\n"
-            f"{event.payload_text}\n"
+            f"{safe_client_text}\n"
             "</client_message>\n"
         )
 
@@ -233,6 +244,7 @@ class SuggestionService:
             "event_id": event.event_id,
             "provider": event.provider,
             "correlation_id": corr_id,
+            "remote_redaction_count": remote_redaction_count,
         }
 
         # 6. Invoke AI Provider Gateway
@@ -310,8 +322,8 @@ class SuggestionService:
             prohibited_claim_evaluation=json.dumps({"violations": detected_violations}),
             confidence=ai_response.confidence,
             recommended_action=ai_response.recommended_action,
-            provider_identifier=context.get("provider", "local_ai"),
-            model_identifier="local_deterministic",
+            provider_identifier=getattr(gateway.provider, "provider_identifier", "unknown"),
+            model_identifier=getattr(gateway.provider, "model_identifier", None),
             correlation_id=corr_id,
             created_at=datetime.now(timezone.utc),
         )
@@ -345,6 +357,7 @@ class SuggestionService:
             details_json=json.dumps({
                 "sources_count": len(created_sources),
                 "confidence": ai_response.confidence,
+                "remote_redaction_count": remote_redaction_count,
             }),
             occurred_at=datetime.now(timezone.utc),
             created_at=datetime.now(timezone.utc),

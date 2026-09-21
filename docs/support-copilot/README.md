@@ -32,7 +32,7 @@ This directory is the source of truth for planning the local Support Copilot. Th
 10. n8n can export only finalized reports using capability-scoped signed requests.
 11. Every external event has an idempotency key.
 12. Reports are derived from structured, verified events rather than transcript-only summarization.
-13. Knowledge learning requires human approval; the AI cannot approve its own candidates.
+13. Knowledge learning requires reviewed, generalized content and human approval; the AI cannot approve its own candidates.
 14. Additional channels (Slack, Teams, WhatsApp) and outbound automations remain explicitly deferred until usage evidence exists.
 15. Each phase must pass its acceptance suite before the next phase begins.
 

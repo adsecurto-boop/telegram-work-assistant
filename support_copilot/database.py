@@ -22,6 +22,8 @@ def create_session_factory(engine: Engine) -> sessionmaker:
     return sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 REQUIRED_TABLES_PHASE0 = {"captured_events", "integration_idempotency", "audit_events"}
+CURRENT_SCHEMA_REVISION = "005_phase7"
+
 REQUIRED_TABLES_PHASE1 = REQUIRED_TABLES_PHASE0 | {
     "knowledge_articles",
     "knowledge_article_versions",
@@ -39,6 +41,7 @@ REQUIRED_TABLES_PHASE5 = REQUIRED_TABLES_PHASE2 | {
     "meeting_proposals",
 }
 REQUIRED_TABLES_PHASE7 = REQUIRED_TABLES_PHASE5 | {"response_learning_candidates"}
+REQUIRED_TABLES_CURRENT = REQUIRED_TABLES_PHASE7 | {"knowledge_articles_fts"}
 
 def verify_schema_readiness(engine: Engine, required_tables: set = None) -> None:
     inspector = inspect(engine)

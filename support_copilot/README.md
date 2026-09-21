@@ -11,7 +11,8 @@ Support Copilot is a local desktop assistant for support professionals. It obser
 > - **Screen capture**: One-shot, explicitly selected window capture only. Local OCR and redaction run before any remote visual analysis. Sensitive screens (banking, passwords, credentials) are blocked. Ctrl/Cmd+Shift+P pauses and clears capture immediately.
 > - **No computer control**: The application has no mouse or keyboard control IPC or API.
 > - **n8n boundary**: n8n can only export finalized reports using HMAC-SHA256 signed requests. It has no database access, cannot finalize reports, and cannot send replies.
-> - **Human-approved learning**: Nothing is learned automatically or merely because text was suggested. Learning candidates originate only from confirmed sent responses and require explicit human approval with separate `knowledge:approve` capability.
+> - **Human-approved learning**: Nothing is learned automatically or merely because text was suggested. Learning candidates originate only from confirmed sent responses, require the operator to review and generalize the reusable content, reject obvious client identifiers, and require explicit approval with separate `knowledge:approve` capability.
+> - **Remote-model privacy**: Client text and case/knowledge text are deterministically filtered for common email, phone/account, and credential patterns before leaving the local Core API.
 > - **Controlled expansion**: Additional channels (Slack, Teams, WhatsApp) and outbound automations remain strictly deferred until usage evidence is established.
 
 ---
@@ -46,14 +47,14 @@ $env:COPILOT_DB_PATH = "sqlite:///./storage/support_copilot/copilot.sqlite3"
 $env:COPILOT_API_HOST = "127.0.0.1"
 $env:COPILOT_API_PORT = "8000"
 
-# AI Provider (Optional: set to "disabled" for manual-only mode, or "fake" for deterministic testing)
+# AI Provider (set to "disabled" for manual-only mode or "gemini" for generation)
 $env:COPILOT_AI_PROVIDER = "gemini"
 $env:COPILOT_GEMINI_API_KEY = "<YOUR-PRIVATE-GEMINI-API-KEY>"
 $env:COPILOT_GEMINI_MODEL = "gemini-2.5-flash"
 
 # Core API Tokens (Scoped capabilities)
 $token = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 32 | ForEach-Object {[char]$_})
-$env:COPILOT_API_TOKENS = "{`"$token`": [`"capture:write`", `"knowledge:read`", `"knowledge:write`", `"knowledge:approve`", `"suggestion:read`", `"suggestion:write`", `"response:confirm_sent`", `"activity:read`", `"activity:write`", `"report:read`", `"report:write`", `"case:read`", `"case:write`", `"meeting:read`", `"meeting:write`", `"meeting:approve`", `"screen:analyze`"]}"
+$env:COPILOT_API_TOKENS = "{`"$token`": [`"capture:write`", `"knowledge:read`", `"knowledge:write`", `"knowledge:approve`", `"suggestion:read`", `"suggestion:write`", `"response:confirm_sent`", `"activity:read`", `"activity:write`", `"report:read`", `"report:write`", `"case:read`", `"case:write`", `"meeting:read`", `"meeting:write`", `"meeting:approve`", `"screen:analyze`", `"operations:read`"]}"
 $env:COPILOT_DESKTOP_API_TOKEN = $token
 
 # Optional: n8n HMAC Signing Secret
@@ -110,19 +111,19 @@ Support Copilot provides dedicated operational tools using the SQLite online bac
 
 ### Create an Online Backup
 ```powershell
-python -m support_copilot.operations backup --db data/support_copilot.sqlite3 --out data/backups
+uv run python -m support_copilot.operations backup --db storage/support_copilot/copilot.sqlite3 --out storage/support_copilot/backups
 ```
 Generates a timestamped `.sqlite3` file and a companion `_manifest.json` containing SHA-256 checksum and schema revision.
 
 ### Verify a Backup
 ```powershell
-python -m support_copilot.operations verify-backup data/backups/backup_20260921_120000.sqlite3
+uv run python -m support_copilot.operations verify-backup storage/support_copilot/backups/<backup-file>.sqlite3
 ```
 Verifies checksum, SQLite PRAGMA integrity, and schema readiness.
 
 ### Restore a Backup
 ```powershell
-python -m support_copilot.operations restore data/backups/backup_20260921_120000.sqlite3 --db data/support_copilot.sqlite3 --confirm-restore
+uv run python -m support_copilot.operations restore storage/support_copilot/backups/<backup-file>.sqlite3 --db storage/support_copilot/copilot.sqlite3 --confirm-restore
 ```
 Requires `--confirm-restore`. Verifies backup in isolation, takes a pre-restore backup of the active database, and performs an atomic replacement.
 
@@ -134,7 +135,7 @@ See [DISASTER_RECOVERY.md](../docs/support-copilot/DISASTER_RECOVERY.md) for ful
 
 Run the deterministic retrieval evaluation runner to measure Recall@1, Recall@3, and MRR against synthetic ground-truth cases:
 ```powershell
-python -m support_copilot.retrieval_evaluation --dataset support_copilot/evaluation/retrieval_cases.json --database sqlite:///data/support_copilot.sqlite3 --threshold 0.7
+uv run python -m support_copilot.retrieval_evaluation --dataset support_copilot/evaluation/retrieval_cases.json --fixture-corpus support_copilot/evaluation/retrieval_knowledge.json --threshold 1.0
 ```
 
 ---

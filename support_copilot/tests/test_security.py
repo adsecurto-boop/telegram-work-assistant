@@ -135,6 +135,56 @@ async def test_prompt_injection_containment_adversarial_patterns(security_env):
 
 
 @pytest.mark.anyio
+async def test_personal_and_credential_values_are_redacted_before_remote_provider(security_env):
+    db = security_env["session_factory"]()
+    try:
+        article = KnowledgeService.create_article(
+            db=db,
+            stable_key="art-remote-redaction",
+            title="Attendance support",
+            product_scope="support",
+            issue_type="support",
+            initial_content="Verify the attendance date range before retrying ingestion.",
+            created_by="admin",
+        )
+        KnowledgeService.approve_version(db, article.id, 1, "admin")
+        event = CapturedEvent(
+            provider="manual",
+            event_id="evt-sensitive-remote",
+            event_type="message.received",
+            occurred_at=datetime.now(timezone.utc),
+            actor_id="client",
+            actor_role="client",
+            conversation_id="conv-sensitive-remote",
+            payload_text=(
+                "Attendance logs missing. Email user@example.com, phone +91 98765 43210, "
+                "API key=ABCDEF1234567890."
+            ),
+            schema_version=1,
+            correlation_id="corr-sensitive-remote",
+        )
+        db.add(event)
+        db.commit()
+        provider = AdversarialInspectingProvider()
+        outcome = await SuggestionService.generate_suggestion(
+            db=db,
+            captured_event_id=event.id,
+            actor="agent",
+            product_scope="support",
+            issue_type="support",
+            gateway=AIProviderGateway(provider),
+        )
+        assert outcome.status == "suggested"
+        assert "user@example.com" not in provider.recorded_prompt
+        assert "98765" not in provider.recorded_prompt
+        assert "ABCDEF1234567890" not in provider.recorded_prompt
+        assert "[REDACTED_EMAIL]" in provider.recorded_prompt
+        assert "[REDACTED_CREDENTIAL]" in provider.recorded_prompt
+    finally:
+        db.close()
+
+
+@pytest.mark.anyio
 async def test_audit_logs_contain_no_raw_text_prompt_or_secrets(security_env):
     """
     Verifies that AuditEvent records:

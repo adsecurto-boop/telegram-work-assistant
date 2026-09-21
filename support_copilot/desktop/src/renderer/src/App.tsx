@@ -37,6 +37,8 @@ declare global {
       proposeLearningCandidate?: (payload: {
         suggestionId: string;
         candidate_title: string;
+        candidate_content: string;
+        content_reviewed_for_sensitive_data: true;
         target_stable_key?: string;
         target_article_id?: string;
         notes?: string;
@@ -175,7 +177,9 @@ export const App: React.FC = () => {
 
   const [learningCandidates, setLearningCandidates] = useState<any[]>([]);
   const [learningTitle, setLearningTitle] = useState('');
+  const [learningContent, setLearningContent] = useState('');
   const [learningNotes, setLearningNotes] = useState('');
+  const [learningContentReviewed, setLearningContentReviewed] = useState(false);
   const [healthData, setHealthData] = useState<any | null>(null);
   const [healthLoading, setHealthLoading] = useState(false);
 
@@ -192,16 +196,20 @@ export const App: React.FC = () => {
   };
 
   const handleProposeLearningCandidate = async () => {
-    if (!suggestion || !api?.proposeLearningCandidate || !learningTitle.trim()) return;
+    if (!suggestion || !api?.proposeLearningCandidate || !learningTitle.trim() || !learningContent.trim() || !learningContentReviewed) return;
     try {
       await api.proposeLearningCandidate({
         suggestionId: suggestion.id,
         candidate_title: learningTitle.trim(),
+        candidate_content: learningContent.trim(),
+        content_reviewed_for_sensitive_data: true,
         notes: learningNotes.trim(),
       });
       setStatusMessage('Learning candidate proposed successfully for human review.');
       setLearningTitle('');
+      setLearningContent('');
       setLearningNotes('');
+      setLearningContentReviewed(false);
       handleLoadLearningCandidates();
     } catch (err: any) {
       setError(err.message || 'Failed to propose learning candidate');
@@ -278,6 +286,10 @@ export const App: React.FC = () => {
     setStatusMessage(null);
     setCandidates([]);
     setSuggestion(null);
+    setLearningTitle('');
+    setLearningContent('');
+    setLearningNotes('');
+    setLearningContentReviewed(false);
 
     try {
       if (!api) {
@@ -376,6 +388,7 @@ export const App: React.FC = () => {
         idempotencyKey: idempKey,
       });
       setSuggestion((prev) => (prev ? { ...prev, lifecycle_status: 'sent' } : null));
+      setLearningContent(editableFinalText.trim());
       setStatusMessage('Response successfully confirmed as sent locally.');
       loadActivities();
     } catch (err: any) {
@@ -838,6 +851,17 @@ export const App: React.FC = () => {
                 onChange={(e) => setLearningTitle(e.target.value)}
                 style={{ marginBottom: '8px' }}
               />
+              <label htmlFor="learning-content-input"><strong>Generalized Knowledge Content</strong></label>
+              <p style={{ fontSize: '12px', color: 'var(--text-secondary)', marginBottom: '8px' }}>
+                Review and generalize the sent response. Remove client names, email addresses, account numbers, credentials, and case-specific facts.
+              </p>
+              <textarea
+                id="learning-content-input"
+                value={learningContent}
+                onChange={(e) => setLearningContent(e.target.value)}
+                rows={4}
+                style={{ marginBottom: '8px' }}
+              />
               <textarea
                 placeholder="Notes or rationale (optional)"
                 value={learningNotes}
@@ -845,11 +869,19 @@ export const App: React.FC = () => {
                 rows={2}
                 style={{ marginBottom: '8px' }}
               />
+              <label style={{ display: 'flex', gap: '8px', alignItems: 'flex-start', marginBottom: '8px' }}>
+                <input
+                  type="checkbox"
+                  checked={learningContentReviewed}
+                  onChange={(e) => setLearningContentReviewed(e.target.checked)}
+                />
+                I reviewed this knowledge content and removed client-specific or sensitive information.
+              </label>
               <button
                 id="propose-learning-btn"
                 className="btn btn-secondary"
                 onClick={handleProposeLearningCandidate}
-                disabled={!learningTitle.trim()}
+                disabled={!learningTitle.trim() || !learningContent.trim() || !learningContentReviewed}
               >
                 Propose Learning Candidate
               </button>
@@ -1147,7 +1179,7 @@ export const App: React.FC = () => {
             <p><strong>Last Backup:</strong> {healthData.backup?.last_backup_timestamp || 'No recorded backups'}</p>
             <p><strong>n8n Integration:</strong> {healthData.n8n?.configured ? 'Configured' : 'Not configured'}</p>
             <p style={{ fontSize: '11px', color: 'var(--text-secondary)', marginTop: '8px' }}>
-              Operations: Run <code>python -m support_copilot.operations backup</code> to create an online backup. See <code>docs/support-copilot/DISASTER_RECOVERY.md</code> for full recovery procedures.
+              Operations: Run <code>uv run python -m support_copilot.operations backup</code> to create an online backup. See <code>docs/support-copilot/DISASTER_RECOVERY.md</code> for full recovery procedures.
             </p>
           </div>
         )}

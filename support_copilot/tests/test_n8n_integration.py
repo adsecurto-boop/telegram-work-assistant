@@ -121,6 +121,8 @@ def test_eod_workflow_code_node_and_signing_construction():
     # Code node is not a placeholder
     assert "return items;" not in js
     assert "crypto.createHmac('sha256'" in js
+    assert "if (!secret)" in js
+    assert "crypto.randomUUID()" in js
     assert "X-Copilot-Signature" in js
     assert "X-Copilot-Timestamp" in js
     assert "X-Copilot-Event-ID" in js

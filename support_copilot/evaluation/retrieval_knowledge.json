@@ -1,0 +1,38 @@
+[
+  {
+    "stable_key": "art-attendance-policy",
+    "title": "Attendance logs and ingestion troubleshooting",
+    "product_scope": "core",
+    "issue_type": "missing_logs",
+    "content": "When attendance logs are missing for a date range, verify the requested dates, timezone, and nightly ingestion job status. A timeout does not prove resolution; escalate with the job identifier when ingestion remains incomplete.",
+    "required_facts": ["requested date range", "ingestion status"],
+    "prohibited_claims": ["The missing logs are resolved"]
+  },
+  {
+    "stable_key": "art-2fa-reset",
+    "title": "Corporate authentication, SSO, and two-factor recovery",
+    "product_scope": "core",
+    "issue_type": "auth",
+    "content": "For corporate SSO, SAML assertion, or two-factor authentication failures, verify the user's identity and tenant authentication policy before resetting an authenticator. Never request a password, OTP, recovery code, or private credential.",
+    "required_facts": ["verified user identity", "authentication method"],
+    "prohibited_claims": ["Authentication was reset"]
+  },
+  {
+    "stable_key": "art-n8n-export-troubleshooting",
+    "title": "n8n signed report export troubleshooting",
+    "product_scope": "integrations",
+    "issue_type": "webhook_failure",
+    "content": "For an n8n report-export 401 or signature mismatch, compare the UTC timestamp, unique event ID, report:export capability, canonical JSON body, and HMAC-SHA256 configuration. Do not expose the shared secret in logs.",
+    "required_facts": ["HTTP status", "event ID", "timestamp age"],
+    "prohibited_claims": ["The shared secret is invalid"]
+  },
+  {
+    "stable_key": "art-unrelated-billing",
+    "title": "Billing invoice questions",
+    "product_scope": "billing",
+    "issue_type": "invoice",
+    "content": "For invoice questions, verify the invoice period and billing account before escalating to finance. This article does not apply to attendance, authentication, or webhook failures.",
+    "required_facts": ["invoice period"],
+    "prohibited_claims": []
+  }
+]

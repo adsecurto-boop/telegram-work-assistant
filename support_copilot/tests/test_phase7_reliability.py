@@ -18,7 +18,7 @@ from support_copilot.models import (
     ResponseSuggestion,
     SentResponse,
 )
-from support_copilot.retrieval_evaluation import evaluate_retrieval
+from support_copilot.retrieval_evaluation import evaluate_retrieval, evaluate_synthetic_fixture
 
 
 TOKEN_ALL = "token-admin-all-capabilities"
@@ -35,7 +35,7 @@ def env(tmp_path):
         data_dir=str(data_dir),
         db_path=f"sqlite:///{db_file}",
         api_tokens={
-            TOKEN_ALL: ["knowledge:read", "knowledge:write", "knowledge:approve", "suggestion:review", "capture:write"],
+            TOKEN_ALL: ["knowledge:read", "knowledge:write", "knowledge:approve", "suggestion:review", "capture:write", "operations:read"],
             TOKEN_WRITE_ONLY: ["knowledge:read", "knowledge:write", "suggestion:review", "capture:write"],
             TOKEN_READ_ONLY: ["knowledge:read"],
         },
@@ -61,6 +61,15 @@ def env(tmp_path):
 
 def auth(token=TOKEN_ALL):
     return {"Authorization": f"Bearer {token}"}
+
+
+def candidate_payload(title: str, **extra):
+    return {
+        "candidate_title": title,
+        "candidate_content": "When attendance logs are missing, verify the requested date range before retrying.",
+        "content_reviewed_for_sensitive_data": True,
+        **extra,
+    }
 
 
 def seed_suggestion_and_sent_response(db, confirmed=True):
@@ -124,7 +133,7 @@ def test_cannot_create_learning_candidate_from_unconfirmed_suggestion(env):
     response = client.post(
         f"/v1/suggestions/{sugg.id}/learning-candidate",
         headers=auth(TOKEN_ALL),
-        json={"candidate_title": "Attendance date range policy"},
+        json=candidate_payload("Attendance date range policy"),
     )
     assert response.status_code == 400
     assert "unconfirmed" in response.json()["detail"].lower()
@@ -144,10 +153,45 @@ def test_copied_unconfirmed_suggestion_cannot_create_learning_candidate(env):
     response = client.post(
         f"/v1/suggestions/{sugg.id}/learning-candidate",
         headers=auth(TOKEN_ALL),
-        json={"candidate_title": "Attendance date range policy"},
+        json=candidate_payload("Attendance date range policy"),
     )
     assert response.status_code == 400
     assert "unconfirmed" in response.json()["detail"].lower()
+
+
+def test_learning_candidate_requires_reviewed_generalized_content(env):
+    client = env["client"]
+    db = env["session_factory"]()
+    try:
+        sugg = seed_suggestion_and_sent_response(db, confirmed=True)
+    finally:
+        db.close()
+
+    missing_ack = candidate_payload("Unsafe candidate")
+    missing_ack["content_reviewed_for_sensitive_data"] = False
+    assert client.post(
+        f"/v1/suggestions/{sugg.id}/learning-candidate",
+        headers=auth(),
+        json=missing_ack,
+    ).status_code == 422
+
+    sensitive = candidate_payload(
+        "Unsafe candidate",
+        candidate_content="Contact client@example.com or use account 123456789012.",
+    )
+    response = client.post(
+        f"/v1/suggestions/{sugg.id}/learning-candidate",
+        headers=auth(),
+        json=sensitive,
+    )
+    assert response.status_code == 400
+    assert "generalize or redact" in response.json()["detail"].lower()
+
+    db = env["session_factory"]()
+    try:
+        assert db.query(ResponseLearningCandidate).count() == 0
+    finally:
+        db.close()
 
 
 def test_ai_cannot_approve_learning_candidate(env):
@@ -162,7 +206,7 @@ def test_ai_cannot_approve_learning_candidate(env):
     prop_resp = client.post(
         f"/v1/suggestions/{sugg.id}/learning-candidate",
         headers=auth(TOKEN_ALL),
-        json={"candidate_title": "Attendance Policy"},
+        json=candidate_payload("Attendance Policy"),
     )
     candidate_id = prop_resp.json()["id"]
 
@@ -193,15 +237,15 @@ def test_learning_candidate_proposal_and_rejection_lifecycle(env):
     prop_resp = client.post(
         f"/v1/suggestions/{sugg.id}/learning-candidate",
         headers=auth(TOKEN_ALL),
-        json={
-            "candidate_title": "Attendance date range policy",
-            "notes": "Learned from manual resolution.",
-        },
+        json=candidate_payload(
+            "Attendance date range policy",
+            notes="Learned from manual resolution.",
+        ),
     )
     assert prop_resp.status_code == 200, prop_resp.text
     candidate = prop_resp.json()
     assert candidate["lifecycle_status"] == "proposed"
-    assert candidate["candidate_content"] == "Verified reply sent to client with exact date range check."
+    assert candidate["candidate_content"] == "When attendance logs are missing, verify the requested date range before retrying."
 
     # Reject candidate
     rej_resp = client.post(
@@ -221,6 +265,30 @@ def test_learning_candidate_proposal_and_rejection_lifecycle(env):
         db.close()
 
 
+def test_repeated_identical_learning_proposal_is_idempotent(env):
+    client = env["client"]
+    db = env["session_factory"]()
+    try:
+        sugg = seed_suggestion_and_sent_response(db, confirmed=True)
+    finally:
+        db.close()
+    payload = candidate_payload("Attendance policy")
+    first = client.post(
+        f"/v1/suggestions/{sugg.id}/learning-candidate", headers=auth(), json=payload
+    )
+    second = client.post(
+        f"/v1/suggestions/{sugg.id}/learning-candidate", headers=auth(), json=payload
+    )
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json()["id"] == first.json()["id"]
+    db = env["session_factory"]()
+    try:
+        assert db.query(ResponseLearningCandidate).count() == 1
+    finally:
+        db.close()
+
+
 def test_learning_candidate_approval_creates_immutable_knowledge_version_idempotently(env):
     client = env["client"]
     db = env["session_factory"]()
@@ -232,10 +300,10 @@ def test_learning_candidate_approval_creates_immutable_knowledge_version_idempot
     prop_resp = client.post(
         f"/v1/suggestions/{sugg.id}/learning-candidate",
         headers=auth(TOKEN_ALL),
-        json={
-            "candidate_title": "Attendance Policy Resolution",
-            "target_stable_key": "learned-attendance-policy",
-        },
+        json=candidate_payload(
+            "Attendance Policy Resolution",
+            target_stable_key="learned-attendance-policy",
+        ),
     )
     candidate_id = prop_resp.json()["id"]
 
@@ -277,7 +345,7 @@ def test_learning_candidate_approval_creates_immutable_knowledge_version_idempot
         version = db.query(KnowledgeArticleVersion).filter_by(id=body["resulting_article_version_id"]).first()
         assert version is not None
         assert version.approval_state == "approved"
-        assert "Verified reply sent to client" in version.immutable_content
+        assert "verify the requested date range" in version.immutable_content
     finally:
         db.close()
 
@@ -305,10 +373,10 @@ def test_learning_candidate_approval_updates_existing_article_version(env):
     prop_resp = client.post(
         f"/v1/suggestions/{sugg.id}/learning-candidate",
         headers=auth(TOKEN_ALL),
-        json={
-            "candidate_title": "Existing Policy Update",
-            "target_article_id": existing_art.id,
-        },
+        json=candidate_payload(
+            "Existing Policy Update",
+            target_article_id=existing_art.id,
+        ),
     )
     assert prop_resp.status_code == 200
     candidate_data = prop_resp.json()
@@ -331,7 +399,7 @@ def test_learning_candidate_approval_updates_existing_article_version(env):
         v2 = db.query(KnowledgeArticleVersion).filter_by(id=body["resulting_article_version_id"]).one()
         assert v2.version == 2
         assert v2.approval_state == "approved"
-        assert "Verified reply sent to client" in v2.immutable_content
+        assert "verify the requested date range" in v2.immutable_content
     finally:
         db.close()
 
@@ -352,7 +420,9 @@ def test_detailed_health_reporting_and_secret_redaction(env):
     )
 
     client = env["client"]
-    resp = client.get("/v1/health/detailed")
+    assert client.get("/v1/health/detailed").status_code == 401
+    assert client.get("/v1/health/detailed", headers=auth(TOKEN_READ_ONLY)).status_code == 403
+    resp = client.get("/v1/health/detailed", headers=auth())
     assert resp.status_code == 200
     data = resp.json()
 
@@ -428,3 +498,15 @@ def test_retrieval_evaluation_runner(env, tmp_path):
         assert "empty" in str(exc.value).lower()
     finally:
         db.close()
+
+
+def test_versioned_synthetic_retrieval_fixture_is_reproducible():
+    report = evaluate_synthetic_fixture(
+        "support_copilot/evaluation/retrieval_cases.json",
+        "support_copilot/evaluation/retrieval_knowledge.json",
+    )
+    assert report.total_cases == 5
+    assert report.recall_at_1 == 1.0
+    assert report.recall_at_3 == 1.0
+    assert report.mean_reciprocal_rank == 1.0
+    assert report.failed_case_ids == []

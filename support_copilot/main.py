@@ -69,6 +69,7 @@ def create_app(
     screen_analysis_provider: Optional[ScreenAnalysisProvider] = None,
     verify_schema: bool = True,
     verify_auth: bool = True,
+    dispose_engine_on_shutdown: bool = False,
 ) -> FastAPI:
     if settings is None:
         settings = get_settings()
@@ -103,6 +104,9 @@ def create_app(
     app.state.session_factory = session_factory
     app.state.ai_provider = ai_provider
     app.state.screen_analysis_provider = screen_analysis_provider
+
+    if dispose_engine_on_shutdown:
+        app.router.add_event_handler("shutdown", engine.dispose)
 
     def get_db() -> Session:
         db = session_factory()
@@ -183,9 +187,13 @@ def create_app(
         }
 
     @app.get("/v1/health/detailed", response_model=DetailedHealthResponse)
-    async def detailed_health(db: Session = Depends(get_db)):
+    async def detailed_health(
+        db: Session = Depends(get_db),
+        caller: AuthenticatedCaller = Depends(require_capability("operations:read")),
+    ):
         from sqlalchemy import text
         from pathlib import Path
+        from .database import CURRENT_SCHEMA_REVISION, REQUIRED_TABLES_CURRENT
 
         db_connected = True
         integrity_ok = True
@@ -197,12 +205,14 @@ def create_app(
             db_connected = False
             integrity_ok = False
 
-        # Schema revision
-        schema_revision = "005_phase7"
+        schema_revision = "unknown"
+        schema_ready = False
         try:
             row = db.execute(text("SELECT version_num FROM alembic_version;")).first()
             if row:
                 schema_revision = str(row[0])
+            verify_schema_readiness(engine, required_tables=REQUIRED_TABLES_CURRENT)
+            schema_ready = schema_revision == CURRENT_SCHEMA_REVISION
         except Exception:
             pass
 
@@ -210,7 +220,7 @@ def create_app(
         writable = os.access(data_dir, os.W_OK) if data_dir.exists() else False
 
         # Provider mode without revealing keys
-        ai_configured = bool(settings.gemini_api_key)
+        ai_configured = settings.ai_provider == "disabled" or bool(settings.gemini_api_key)
         ai_mode = settings.ai_provider
 
         # Check latest backup
@@ -226,11 +236,13 @@ def create_app(
                 except Exception:
                     pass
 
-        telegram_status = "configured" if getattr(settings, "telegram_bot_token", None) else "not_configured"
+        # The Telegram adapter is a separate process and exposes no reliable
+        # heartbeat yet.  Do not infer runtime state from this API process.
+        telegram_status = "external_adapter_unreported"
         n8n_configured = bool(settings.n8n_shared_secret)
 
         # Status calculation
-        if not db_connected or not integrity_ok or not writable:
+        if not db_connected or not integrity_ok or not writable or not schema_ready:
             overall = "unhealthy"
         elif not ai_configured:
             overall = "degraded"
@@ -243,7 +255,7 @@ def create_app(
             database={
                 "connected": db_connected,
                 "schema_revision": schema_revision,
-                "schema_ready": True,
+                "schema_ready": schema_ready,
                 "integrity_check": "ok" if integrity_ok else "failed",
                 "data_dir_writable": writable,
             },
@@ -255,7 +267,7 @@ def create_app(
                 "last_backup_timestamp": last_backup,
             },
             retention={
-                "status": "active",
+                "status": "manual_cleanup_available",
             },
             telegram={
                 "status": telegram_status,
@@ -1228,6 +1240,8 @@ def create_app(
                 db=db,
                 suggestion_id=suggestion_id,
                 candidate_title=payload.candidate_title,
+                candidate_content=payload.candidate_content,
+                content_reviewed_for_sensitive_data=payload.content_reviewed_for_sensitive_data,
                 actor=caller.token_name,
                 target_stable_key=payload.target_stable_key,
                 target_article_id=payload.target_article_id,
@@ -1284,6 +1298,17 @@ def create_production_app() -> FastAPI:
     if not os.access(db_dir, os.W_OK):
         raise RuntimeError(f"Database directory '{db_dir}' is not writable.")
 
+    # The public factory is also used by unit tests with intentionally minimal
+    # schemas. Production startup must independently prove the complete current
+    # migrated schema, including the FTS5 virtual table.
+    production_engine = create_db_engine(settings.db_path)
+    from .database import REQUIRED_TABLES_CURRENT
+    try:
+        verify_schema_readiness(production_engine, required_tables=REQUIRED_TABLES_CURRENT)
+    except Exception:
+        production_engine.dispose()
+        raise
+
     provider: Optional[AIProvider] = None
     screen_provider: Optional[ScreenAnalysisProvider] = None
     if settings.ai_provider == "gemini":
@@ -1296,10 +1321,16 @@ def create_production_app() -> FastAPI:
             model=settings.gemini_model,
         )
 
-    return create_app(
-        settings=settings,
-        ai_provider=provider,
-        screen_analysis_provider=screen_provider,
-        verify_schema=True,
-        verify_auth=True,
-    )
+    try:
+        return create_app(
+            settings=settings,
+            engine=production_engine,
+            ai_provider=provider,
+            screen_analysis_provider=screen_provider,
+            verify_schema=True,
+            verify_auth=True,
+            dispose_engine_on_shutdown=True,
+        )
+    except Exception:
+        production_engine.dispose()
+        raise
